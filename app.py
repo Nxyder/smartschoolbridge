@@ -20,17 +20,33 @@ class InlineCredentials(Credentials):
     def username(self):
         return self._username
 
+    @username.setter
+    def username(self, value):
+        self._username = value
+
     @property
     def password(self):
         return self._password
+
+    @password.setter
+    def password(self, value):
+        self._password = value
 
     @property
     def main_url(self):
         return self._main_url
 
+    @main_url.setter
+    def main_url(self, value):
+        self._main_url = value
+
     @property
     def mfa(self):
         return self._mfa
+
+    @mfa.setter
+    def mfa(self, value):
+        self._mfa = value
 
 
 @app.route('/')
@@ -40,17 +56,14 @@ def index():
 
 @app.route('/planner', methods=['GET'])
 def get_planner():
-    # Credentials uit URL-parameters
     username = request.args.get('username')
     password = request.args.get('password')
     main_url = request.args.get('main_url')
     mfa = request.args.get('mfa')
 
-    # Datum range (optioneel, met defaults)
     start = request.args.get('start', '2026-09-27')
     end = request.args.get('end', '2026-10-31')
 
-    # Validatie
     if not all([username, password, main_url, mfa]):
         return jsonify({
             "status": "error",
