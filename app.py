@@ -1,4 +1,5 @@
 import os
+import re
 from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 from smartschool import Smartschool, Credentials, PlannedElements
@@ -49,6 +50,33 @@ class InlineCredentials(Credentials):
         self._mfa = value
 
 
+def strip_html(html):
+    """Verwijder HTML-tags voor plain-text weergave."""
+    if not html:
+        return ""
+    text = re.sub(r'<br\s*/?>', '\n', html, flags=re.IGNORECASE)
+    text = re.sub(r'</p>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
+    text = text.replace('&quot;', '"').replace('&#39;', "'").replace('&nbsp;', ' ')
+    return text.strip()
+
+
+def get_detail(session, element):
+    """Haal de volledige beschrijving op van een gepland element."""
+    if element.planned_element_type == "planned-to-dos":
+        url = f"/planner/api/v1/planned-to-dos/{element.platform_id}/{element.id}"
+    elif element.planned_element_type == "planned-assignments":
+        url = f"/planner/api/v1/planned-assignments/{element.platform_id}/{element.id}"
+    else:
+        return None
+
+    try:
+        return session.json(url)
+    except Exception:
+        return None
+
+
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -60,9 +88,6 @@ def get_planner():
     password = request.args.get('password')
     main_url = request.args.get('main_url')
     mfa = request.args.get('mfa')
-
-    start = request.args.get('start', '2026-09-27')
-    end = request.args.get('end', '2026-10-31')
 
     if not all([username, password, main_url, mfa]):
         return jsonify({
@@ -81,10 +106,37 @@ def get_planner():
 
         items = []
         for element in PlannedElements(session):
+            detail = get_detail(session, element)
+
+            beschrijving = ""
+            bijlagen = []
+            links = []
+
+            if detail:
+                raw_info = detail.get('publicInfo') or ""
+                beschrijving = strip_html(raw_info)
+
+                for att in detail.get('attachments') or []:
+                    bijlagen.append({
+                        "naam": att.get('name') or att.get('fileName') or 'bijlage',
+                        "url": att.get('url') or att.get('downloadUrl') or ''
+                    })
+
+                for link in detail.get('weblinks') or []:
+                    links.append({
+                        "naam": link.get('name') or link.get('title') or '',
+                        "url": link.get('url') or link.get('href') or ''
+                    })
+
             items.append({
                 "naam": element.name,
                 "vakken": [c.name for c in element.courses],
-                "deadline": element.period.date_time_to.isoformat()
+                "deadline": element.period.date_time_to.isoformat(),
+                "type": element.planned_element_type,
+                "beschrijving": beschrijving,
+                "beschrijving_html": (detail.get('publicInfo') if detail else "") or "",
+                "bijlagen": bijlagen,
+                "links": links,
             })
 
         return jsonify({
