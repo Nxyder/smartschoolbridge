@@ -242,7 +242,6 @@ def _cleanup_old_uploads():
 def _save_local_upload(filename, content):
     """Sla een bestand lokaal op. Retourneert publieke URL via /files/<name>."""
     _cleanup_old_uploads()
-    # Unieke naam om collisions te vermijden
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", filename)
     token = secrets.token_hex(8)
     stored_name = f"{token}_{safe}"
@@ -251,8 +250,6 @@ def _save_local_upload(filename, content):
     with open(filepath, "wb") as f:
         f.write(content)
 
-    # Publieke URL — Render serveert via /files/<name>
-    # (we gebruiken een absoluut pad door request.host_url te pakken)
     try:
         host = request.host_url.rstrip("/")
     except Exception:
@@ -320,12 +317,11 @@ def upload_file(_session=None, _creds=None):
                     "mime": mime, "size": len(content),
                     "is_image": is_image, "storage": "catbox",
                 })
-        # catbox faalde of gaf rare response → fallback
         print(f"[upload] catbox faalde: status={r.status_code}, body={r.text[:100]!r}")
     except Exception as e:
         print(f"[upload] catbox exception: {type(e).__name__}: {e}")
 
-    # Poging 2: lokale server opslag (24u TTL)
+    # Poging 2: lokale server opslag
     try:
         result = _save_local_upload(f.filename, content)
         result["mime"] = mime
@@ -353,8 +349,7 @@ def upload_file_alias(_session=None, _creds=None):
 @app.post("/api/upload-smartschool")
 @with_session
 def upload_smartschool(_session=None, _creds=None):
-    """Upload naar Smartschool's eigen /TinyMCE/Upload endpoint.
-    Dit wordt door Smartschool zelf gebruikt voor inline afbeeldingen."""
+    """Upload naar Smartschool's eigen /TinyMCE/Upload endpoint."""
     if "file" not in request.files:
         return jsonify({"error": "geen 'file'"}), 400
     f = request.files["file"]
@@ -365,7 +360,6 @@ def upload_smartschool(_session=None, _creds=None):
     if len(content) > 512 * 1024 * 1024:
         return jsonify({"error": "bestand > 512MB"}), 400
 
-    # Genereer unique_id zoals Smartschool doet
     prefix = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(10))
     unique_id = f"{prefix}_{int(time.time() * 1000)}"
 
@@ -387,15 +381,11 @@ def upload_smartschool(_session=None, _creds=None):
 
         if r.status_code not in (200, 201):
             print(f"[upload-smartschool] status {r.status_code}: {r.text[:200]!r}")
-            return jsonify({
-                "error": f"Smartschool status {r.status_code}",
-                "body": r.text[:200],
-            }), 502
+            return _upload_fallback(f.filename, content, mime)
 
         try:
             resp_data = r.json()
         except Exception:
-            # Geen JSON: probeer fallback naar catbox/lokaal
             print(f"[upload-smartschool] geen JSON: {r.text[:200]!r}")
             return _upload_fallback(f.filename, content, mime)
 
@@ -749,6 +739,7 @@ def _get_draft_tokens(session, base, draft_id):
     r = session.request("GET", url)
     html = r.text
 
+    # Tokens uit <input> velden
     fields = {}
     for m in re.finditer(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>', html):
         fields[m.group(1)] = m.group(2)
@@ -768,31 +759,44 @@ def _get_draft_tokens(session, base, draft_id):
 
     # Ontvangers parsen uit receiverSpan elementen
     receivers = {"to": [], "cc": [], "bcc": []}
-    for rm in re.finditer(
-        r'<div[^>]*class="[^"]*receiverSpan[^"]*"[^>]*>',
-        html, re.IGNORECASE
-    ):
-        tag = rm.group(0)
-        real_id_m = re.search(r'realuserid="(\d+)"', tag)
-        userlt_m = re.search(r'userltatt="(\d+)"', tag)
-        typeatt_m = re.search(r'typeatt="(\d+)"', tag)
-        ssid_m = re.search(r'ssidatt="(\d+)"', tag)
+    pattern = re.compile(
+        r'<div[^>]*class="[^"]*receiverSpan[^"]*"[^>]*>'
+        r'(.*?)'
+        r'(?=<div[^>]*class="[^"]*receiverSpan|$)',
+        re.DOTALL | re.IGNORECASE
+    )
 
-        start = rm.end()
-        name_match = re.search(r'<div[^>]*class="receiverSpanName[^"]*"[^>]*>(.*?)</div>',
-                               html[start:start + 500], re.DOTALL | re.IGNORECASE)
-        name = ""
-        if name_match:
-            name = name_match.group(1)
-            name = re.sub(r"<[^>]+>", "", name).strip()
+    for rm in pattern.finditer(html):
+        full_match = rm.group(0)
+        open_tag_end = full_match.find(">")
+        open_tag = full_match[:open_tag_end + 1]
+
+        real_id_m = re.search(r'\brealuserid="(\d+)"', open_tag)
+        idatt_m = re.search(r'\bidatt="([^"]*)"', open_tag)
+        userlt_m = re.search(r'\buserltatt="(\d+)"', open_tag)
+        typeatt_m = re.search(r'\btypeatt="(\d+)"', open_tag)
+        ssid_m = re.search(r'\bssidatt="(\d+)"', open_tag)
 
         if not real_id_m:
             continue
 
+        # Naam (accepteer " en ' als quote)
+        name = ""
+        name_match = re.search(
+            r"""<div[^>]*class=["']receiverSpanName[^"']*["'][^>]*>(.*?)</div>""",
+            full_match,
+            re.DOTALL | re.IGNORECASE
+        )
+        if name_match:
+            name = name_match.group(1)
+            name = re.sub(r"<[^>]+>", "", name).strip()
+
         real_id = real_id_m.group(1)
+        idatt = idatt_m.group(1) if idatt_m else ""
         userlt = userlt_m.group(1) if userlt_m else "0"
         typeatt = typeatt_m.group(1) if typeatt_m else "0"
         ssid = ssid_m.group(1) if ssid_m else "455"
+
         is_co = (userlt == "2") or typeatt in ("1", "4", "5")
 
         if typeatt in ("0", "1"):
@@ -806,11 +810,13 @@ def _get_draft_tokens(session, base, draft_id):
 
         receivers[role].append({
             "user_id": real_id,
-            "name": f"Co: {name}" if is_co else name,
+            "idatt": idatt,
+            "name": name,
             "display_name": name,
             "is_co_account": is_co,
             "user_lt": userlt,
             "ss_id": ssid,
+            "typeatt": typeatt,
             "type_label": "ouder" if is_co else "leerling",
         })
 
@@ -1035,11 +1041,7 @@ def messages_search_users(_session=None, _creds=None):
 @app.post("/api/messages/send")
 @with_session
 def messages_send(_session=None, _creds=None):
-    """Verzend bericht. message_html wordt ONGEWIJZIGD doorgestuurd.
-
-    Optioneel: draft_id → als aanwezig, gebruik draft-tokens en
-    overschrijf/verwijder het concept na verzenden.
-    """
+    """Verzend bericht. message_html wordt ONGEWIJZIGD doorgestuurd."""
     data = request.get_json(force=True, silent=True) or {}
     subject = data.get("subject")
     message_html = data.get("message_html")
