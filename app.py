@@ -1,7 +1,7 @@
 """
 Smartschool API — Flask app (stateless, multi-user, CORS)
 
-Credentials worden PER REQUEST meegestuurd via header:
+Credentials per request via header:
   X-SS-Creds: base64(json({"username":..,"password":..,"main_url":..,"mfa":..}))
 """
 
@@ -16,6 +16,7 @@ from datetime import datetime
 from functools import wraps
 from io import BytesIO
 
+import requests as _requests
 from flask import Flask, jsonify, request, send_file
 from requests_toolbelt.multipart.encoder import MultipartEncoder
 from smartschool import (
@@ -70,7 +71,7 @@ def add_cors(response):
 
 
 # ============================================================
-# CREDENTIALS — per request uit header
+# CREDENTIALS
 # ============================================================
 def _decode_creds(header_value: str) -> dict:
     try:
@@ -92,8 +93,6 @@ def _decode_creds(header_value: str) -> dict:
 
 
 class _Creds(Credentials):
-    """In-memory credentials object dat de Credentials interface erft
-    (nodig voor de interne validate() call in smartschool lib)."""
     def __init__(self, u, p, m, mfa):
         self._u, self._p, self._m, self._mfa = u, p, m, mfa
 
@@ -203,6 +202,72 @@ def auth_login(_session=None, _creds=None):
     return jsonify({"ok": True,
                     "username": _creds["username"],
                     "main_url": _creds["main_url"]})
+
+
+# ============================================================
+# FILE UPLOAD (naar catbox.moe) — werkt voor ELK bestandstype
+# ============================================================
+@app.post("/api/upload")
+@with_session
+def upload_file(_session=None, _creds=None):
+    """Upload elk bestandstype naar catbox.moe.
+    Retourneert publieke URL die in berichten of als link gebruikt kan worden."""
+    if "file" not in request.files:
+        return jsonify({"error": "geen 'file' in multipart body"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "lege filename"}), 400
+
+    content = f.read()
+    if len(content) > 200 * 1024 * 1024:
+        return jsonify({"error": "bestand > 200MB"}), 400
+
+    try:
+        r = _requests.post(
+            "https://catbox.moe/user/api.php",
+            data={"reqtype": "fileupload"},
+            files={"fileToUpload": (f.filename, content,
+                                    f.mimetype or "application/octet-stream")},
+            timeout=120,
+        )
+        if r.status_code != 200:
+            return jsonify({"error": f"catbox status {r.status_code}",
+                            "body": r.text[:200]}), 502
+
+        url = r.text.strip()
+        if not url.startswith("http"):
+            return jsonify({"error": "catbox gaf geen URL terug",
+                            "body": url[:200]}), 502
+
+        mime = f.mimetype or ""
+        is_image = mime.startswith("image/")
+
+        return jsonify({
+            "ok": True,
+            "url": url,
+            "filename": f.filename,
+            "mime": mime,
+            "size": len(content),
+            "is_image": is_image,
+            "inline_html": (f'<img src="{url}" border="0" alt="{f.filename}">'
+                            if is_image else ""),
+            "link_html": f'<a href="{url}" target="_blank">{f.filename}</a>',
+        })
+    except Exception as e:
+        return jsonify({"error": f"upload mislukt: {type(e).__name__}: {e}"}), 500
+
+
+# Aliases — hetzelfde endpoint onder verschillende namen
+@app.post("/api/upload-image")
+@with_session
+def upload_image(_session=None, _creds=None):
+    return upload_file(_session=_session, _creds=_creds)
+
+
+@app.post("/api/upload-file")
+@with_session
+def upload_file_alias(_session=None, _creds=None):
+    return upload_file(_session=_session, _creds=_creds)
 
 
 # ============================================================
@@ -428,8 +493,9 @@ def _parse_full_message(xml_text):
     except ET.ParseError as e:
         return {"error": f"XML parse error: {e}"}
 
-    result = {"id": "", "subject": "", "sender": "", "to": "", "cc": "",
-              "date": "", "body_html": "", "body_text": "", "attachments": []}
+    result = {"id": "", "subject": "", "sender": "", "to": "", "cc": "", "bcc": "",
+              "date": "", "body_html": "", "body_text": "",
+              "attachments": [], "inline_images": []}
     msg = root.find(".//message")
     if msg is not None:
         result["id"] = msg.findtext("id", "")
@@ -438,6 +504,7 @@ def _parse_full_message(xml_text):
         result["sender"] = msg.findtext("from", "")
         result["to"] = msg.findtext("to", "")
         result["cc"] = msg.findtext("cc", "")
+        result["bcc"] = msg.findtext("bcc", "")
         for tag in ["body", "messageBody", "content", "htmlBody"]:
             b = msg.find(tag)
             if b is not None:
@@ -464,6 +531,10 @@ def _parse_full_message(xml_text):
             "mime": att.findtext("mime", ""),
             "size": att.findtext("size", ""),
         })
+
+    for m in re.finditer(r'<img[^>]+src=["\']([^"\']+)["\']', result["body_html"], re.IGNORECASE):
+        result["inline_images"].append({"src": m.group(1)})
+
     return result
 
 
@@ -618,16 +689,51 @@ def messages_search_users(_session=None, _creds=None):
 @app.post("/api/messages/send")
 @with_session
 def messages_send(_session=None, _creds=None):
+    """Verzend bericht met volledige HTML body, BCC, en optionele bijlagen.
+
+    Body:
+    {
+      "subject": "...",
+      "message_html": "<p>...</p>",       # HTML met optioneel <img src="...">
+      "message": "plain text fallback",
+      "to": [{user_id, ss_id, is_co_account}, ...],
+      "cc": [...],
+      "bcc": [...],
+      "attachments": [{url, filename, ...}],  # externe URLs, als links in body
+      "send_date": "YYYY-MM-DD HH:MM"
+    }
+    """
     data = request.get_json(force=True, silent=True) or {}
     subject = data.get("subject")
-    message = data.get("message")
+    message_html = data.get("message_html")
+    message_plain = data.get("message") or ""
     to_users = data.get("to") or []
     cc_users = data.get("cc") or []
     bcc_users = data.get("bcc") or []
+    attachments = data.get("attachments") or []
     send_date = data.get("send_date") or ""
 
-    if not subject or not message or not to_users:
-        return jsonify({"error": "subject, message en to zijn verplicht"}), 400
+    if not subject or not to_users:
+        return jsonify({"error": "subject en to zijn verplicht"}), 400
+
+    # Body: gebruik HTML, anders plain text
+    if message_html:
+        body = message_html
+    elif message_plain:
+        body = f"<p>{message_plain}</p>"
+    else:
+        return jsonify({"error": "message_html of message verplicht"}), 400
+
+    # Voeg bijlagen als download-links onderaan de body
+    if attachments:
+        body += '<hr style="border:none;border-top:1px solid #ccc;margin:16px 0">'
+        body += '<p><b>📎 Bijlagen:</b></p><ul>'
+        for att in attachments:
+            url = att.get("url")
+            fn = att.get("filename", "bestand")
+            if url:
+                body += f'<li><a href="{url}" target="_blank">{fn}</a></li>'
+        body += '</ul>'
 
     base = _base_url(_creds)
     tokens = _get_compose_tokens(_session, base)
@@ -648,8 +754,9 @@ def messages_send(_session=None, _creds=None):
         "randomDir": tokens["random_dir"], "uniqueUsc": tokens["unique_usc"],
         "showTab": "tab1Container", "delFile": "0", "composeType": "0",
         "msgID": "0", "msgFormSelectedTab": "", "sendDate": send_date,
-        "subject": subject, "bcc": "0",
-        "message": f"<p>{message}</p>",
+        "subject": subject,
+        "bcc": "1" if bcc_users else "0",
+        "message": body,
         "encryptedSender": tokens["encrypted_sender"],
     }
     if to_users:
@@ -668,9 +775,14 @@ def messages_send(_session=None, _creds=None):
                  "Referer": base + "/"},
         allow_redirects=True,
     )
-    return jsonify({"ok": r.status_code == 200,
-                    "status": r.status_code,
-                    "scheduled": bool(send_date)})
+    return jsonify({
+        "ok": r.status_code == 200,
+        "status": r.status_code,
+        "scheduled": bool(send_date),
+        "has_bcc": bool(bcc_users),
+        "attachments_linked": len(attachments),
+        "body_preview": body[:300],
+    })
 
 
 # ============================================================
