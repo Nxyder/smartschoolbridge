@@ -1,5 +1,5 @@
 """
-Planner endpoints — volledig.
+Planner endpoints — webversie.
 
 API structuur:
   GET  /api/planner                     → compact: uren + items
@@ -16,20 +16,20 @@ Query params (GET /api/planner):
   limit=N                max items (default: 500, hard cap: 2000)
   compact=1              1 = enkel essentiële velden (default), 0 = volledig
   hours=1                1 = uren meesturen (default: 1)
+  placeholders=0         1 = placeholders meesturen (default: 0 = verbergen)
 
-Bandwidth optimalisaties:
-  - Compact formaat: ~250 bytes/item i.p.v. ~2KB
-  - Korte veldnamen (i, n, t, df, dt, wd, dl, c, l, te, ab, col, st)
-  - Unix ms i.p.v. ISO strings
-  - Server-side type filter
-  - In-memory cache (30s TTL) per user
-  - Hard cap op range en item-aantal
+Belangrijke fix t.o.v. eerdere versies:
+  - URL-encoding van +02:00 in from/to ISO strings (quote)
+    Zonder encoding wordt + een spatie → Smartschool negeert de range
+  - Unicode unescape van Homepage HTML (\\u0022 → ")
+  - Placeholders standaard verborgen
 """
 
 import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 from flask import Blueprint, jsonify, request
 
@@ -77,9 +77,6 @@ def _unescape_html(html):
     """
     Smartschool stuurt JSON-encoded HTML met \\uXXXX escapes.
     Zet die om naar echte karakters voor regex matching.
-
-    Bv:  \\u0022authenticatedUser\\u0022\\u003A\\u007B\\u0022id\\u0022
-    →    "authenticatedUser":{"id"
     """
     if not html:
         return html
@@ -91,22 +88,18 @@ def _unescape_html(html):
 
 
 # ============================================================
-# USER ID — meerdere strategieën, unescape-aware
+# USER ID
 # ============================================================
 def _find_user_id(session, base):
     """
     Zoek user_id via Homepage HTML.
-    Retourneert het numerieke user_id (int) of None.
-
-    Smartschool stuurt de HTML met \\uXXXX escapes, dus we
-    proberen zowel de raw als de unescaped versie.
+    Werkt met zowel escaped als unescaped HTML.
     """
     try:
         r = session.request("GET", "/?module=Homepage",
                             headers={"Referer": base + "/"})
         html = r.text
 
-        # Redirect = sessie verlopen
         if r.status_code in (301, 302, 303, 307, 308):
             print("[planner] Homepage redirect — sessie verlopen?",
                   file=sys.stderr)
@@ -120,11 +113,8 @@ def _find_user_id(session, base):
         html_clean = _unescape_html(html)
 
         patterns = [
-            # authenticatedUser.id = "P_U_Z"
             r'"authenticatedUser"\s*:\s*\{[^}]*"id"\s*:\s*"(\d+)_(\d+)_',
-            # userIdentifier = "P_U_Z"
             r'"userIdentifier"\s*:\s*"(\d+)_(\d+)_',
-            # userId = "P_U_Z"
             r'"userId"\s*:\s*"(\d+)_(\d+)_(\d+)"',
         ]
 
@@ -134,18 +124,16 @@ def _find_user_id(session, base):
                 if m:
                     return int(m.group(2))
 
-        # Laatste fallback: met platform_id uit sessie
+        # Fallback met platform_id
         platform = getattr(session, "platform_id", None)
         if platform:
-            m = re.search(rf'{platform}_(\d+)_0', html_clean)
-            if m:
-                return int(m.group(1))
-            m = re.search(rf'{platform}_(\d+)_0', html)
-            if m:
-                return int(m.group(1))
+            for source in (html_clean, html):
+                m = re.search(rf'{platform}_(\d+)_0', source)
+                if m:
+                    return int(m.group(1))
 
-        print("[planner] geen user_id patroon in Homepage HTML "
-              f"(html length: {len(html)})", file=sys.stderr)
+        print(f"[planner] geen user_id in Homepage HTML "
+              f"(len={len(html)})", file=sys.stderr)
         return None
 
     except Exception as e:
@@ -167,7 +155,7 @@ def _get_uid(session, base):
 # HOURS
 # ============================================================
 def _get_hours(session):
-    """Haal lesuren op. Retourneert compacte lijst."""
+    """Haal lesuren op (7 slots: 08:25 - 15:30)."""
     try:
         from smartschool import SmartschoolHours
         return [
@@ -182,14 +170,25 @@ def _get_hours(session):
 
 # ============================================================
 # PLANNER ITEMS — via JSON API
+# ⭐ URL-ENCODING IS CRUCIAAL VOOR from/to
 # ============================================================
 def _fetch_planned_elements(session, base, uid, from_iso, to_iso):
-    """Haal alle planner items op (lessen + taken)."""
+    """
+    Haal alle planner items op (lessen + taken + activiteiten).
+
+    ⭐ CRUCIAAL: URL-encode de + in +02:00.
+    Zonder encoding wordt + een spatie → Smartschool negeert de range
+    en geeft altijd dezelfde (huidige) week terug.
+    """
+    from_enc = quote(from_iso, safe='')
+    to_enc = quote(to_iso, safe='')
+
     path = (
         f"/planner/api/v1/planned-elements/user/{uid}"
-        f"?from={from_iso}&to={to_iso}"
+        f"?from={from_enc}&to={to_enc}"
         f"&includes=icon,courses,locations,upload-folders"
     )
+
     try:
         r = session.request("GET", path, headers={
             "Accept": "*/*",
@@ -221,9 +220,7 @@ def _to_ms(iso):
 
 
 def _compact_item(it):
-    """
-    Volledig item (~2KB) → compact item (~250 bytes).
-    """
+    """Volledig item (~2KB) → compact item (~250 bytes)."""
     period = it.get("period") or {}
     courses = it.get("courses") or []
     locations = it.get("locations") or []
@@ -301,6 +298,17 @@ def _parse_range():
 
 
 # ============================================================
+# FILTERS
+# ============================================================
+def _filter_placeholders(raw, include=False):
+    """Verberg planned-placeholders (lege tijdsloten) standaard."""
+    if include:
+        return raw
+    return [it for it in raw
+            if it.get("plannedElementType") != "planned-placeholders"]
+
+
+# ============================================================
 # ROUTES
 # ============================================================
 @bp.get("")
@@ -316,6 +324,7 @@ def planner_list(_session=None, _creds=None):
       limit=N              (default: 500, max: 2000)
       compact=0|1          (default: 1)
       hours=0|1            (default: 1)
+      placeholders=0|1     (default: 0 = verbergen)
     """
     base = base_url(_creds)
     uid = _get_uid(_session, base)
@@ -333,6 +342,7 @@ def planner_list(_session=None, _creds=None):
         limit = 500
     compact = request.args.get("compact", "1") == "1"
     include_hours = request.args.get("hours", "1") == "1"
+    include_placeholders = request.args.get("placeholders", "0") == "1"
 
     from_iso = from_dt.strftime("%Y-%m-%dT%H:%M:%S+02:00")
     to_iso = to_dt.strftime("%Y-%m-%dT%H:%M:%S+02:00")
@@ -344,6 +354,9 @@ def planner_list(_session=None, _creds=None):
         raw = _fetch_planned_elements(_session, base, uid,
                                       from_iso, to_iso)
         _cache_set(uid, raw_key, raw)
+
+    # Filter placeholders
+    raw = _filter_placeholders(raw, include_placeholders)
 
     # Filter op type
     if types_filter == "lessons":
@@ -388,7 +401,8 @@ def planner_week(_session=None, _creds=None):
     Alleen deze week (maandag t/m zondag). Extra compact.
 
     Query params:
-      offset=0  0 = deze week, -1 = vorige, +1 = volgende
+      offset=0            0 = deze week, -1 = vorige, +1 = volgende
+      placeholders=0|1    (default: 0 = verbergen)
     """
     base = base_url(_creds)
     uid = _get_uid(_session, base)
@@ -399,6 +413,8 @@ def planner_week(_session=None, _creds=None):
         offset = int(request.args.get("offset", "0"))
     except ValueError:
         offset = 0
+
+    include_placeholders = request.args.get("placeholders", "0") == "1"
 
     tz = timezone(timedelta(hours=2))
     now = datetime.now(tz)
@@ -418,6 +434,9 @@ def planner_week(_session=None, _creds=None):
                                       from_iso, to_iso)
         _cache_set(uid, raw_key, raw)
 
+    # Filter placeholders
+    raw = _filter_placeholders(raw, include_placeholders)
+
     raw.sort(key=lambda x: (x.get("period") or {}).get("dateTimeFrom") or "")
     items = [_compact_item(it) for it in raw]
 
@@ -426,6 +445,10 @@ def planner_week(_session=None, _creds=None):
         "week_end": sunday.strftime("%Y-%m-%d"),
         "hours": _get_hours(_session),
         "items": items,
+        "meta": {
+            "user_id": uid,
+            "count": len(items),
+        },
     })
 
 
@@ -603,15 +626,12 @@ def planner_create_todo(_session=None, _creds=None):
 
 
 # ============================================================
-# DEBUG — diagnose user_id probleem
+# DEBUG
 # ============================================================
 @bp.get("/debug-userid")
 @with_session
 def debug_userid(_session=None, _creds=None):
-    """
-    Diagnose endpoint: laat zien wat de Homepage HTML bevat
-    en welke patronen matchen.
-    """
+    """Diagnose: toon Homepage HTML + user_id patronen."""
     base = base_url(_creds)
     platform = getattr(_session, "platform_id", None)
 
@@ -628,10 +648,8 @@ def debug_userid(_session=None, _creds=None):
         result["html_length"] = len(html)
         result["final_url"] = getattr(r, "url", None)
 
-        # Unescape voor de zekerheid
         html_clean = _unescape_html(html)
 
-        # Test patronen op beide versies
         hits = {}
         patterns = {
             "authenticatedUser_id":
@@ -654,17 +672,80 @@ def debug_userid(_session=None, _creds=None):
         result["_find_user_id_result"] = _find_user_id(_session, base)
         result["_get_uid_result"] = _get_uid(_session, base)
 
-        # Snippets van rond user voorkomens
-        snippets = []
-        for m in re.finditer(
-            r'.{0,60}(authenticatedUser|userIdentifier|userId)'
-            r'.{0,120}', html_clean):
-            snippets.append(m.group(0)[:200])
-            if len(snippets) >= 5:
-                break
-        result["snippets"] = snippets
-
     except Exception as e:
         result["error"] = f"{type(e).__name__}: {e}"
 
     return jsonify(result)
+
+
+@bp.get("/debug-fetch")
+@with_session
+def debug_fetch(_session=None, _creds=None):
+    """
+    Test of from/to werkt bij Smartschool.
+    Vergelijkt raw vs URL-encoded variant.
+    """
+    base = base_url(_creds)
+    uid = _get_uid(_session, base)
+    if not uid:
+        return jsonify({"error": "geen uid"}), 500
+
+    tz = timezone(timedelta(hours=2))
+    now = datetime.now(tz)
+
+    results = {}
+    for label, offset_days in [("verleden", -30), ("vandaag", 0),
+                                ("toekomst", 30)]:
+        from_dt = (now + timedelta(days=offset_days)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        to_dt = (now + timedelta(days=offset_days + 7)).replace(
+            hour=23, minute=59, second=59)
+        from_iso = from_dt.strftime("%Y-%m-%dT%H:%M:%S+02:00")
+        to_iso = to_dt.strftime("%Y-%m-%dT%H:%M:%S+02:00")
+
+        # Variant A: raw (met +)
+        path_a = (
+            f"/planner/api/v1/planned-elements/user/{uid}"
+            f"?from={from_iso}&to={to_iso}"
+            f"&includes=icon,courses,locations,upload-folders"
+        )
+        # Variant B: encoded (met %2B)
+        from_enc = quote(from_iso, safe='')
+        to_enc = quote(to_iso, safe='')
+        path_b = (
+            f"/planner/api/v1/planned-elements/user/{uid}"
+            f"?from={from_enc}&to={to_enc}"
+            f"&includes=icon,courses,locations,upload-folders"
+        )
+
+        variants = {}
+        for variant_label, path in [("raw", path_a),
+                                     ("encoded", path_b)]:
+            try:
+                r = _session.request("GET", path, headers={
+                    "Accept": "*/*",
+                    "Content-Type": "application/json",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Origin": base,
+                    "Referer": base + "/",
+                })
+                data = r.json() if r.status_code == 200 else []
+                datums = {}
+                if isinstance(data, list):
+                    for it in data:
+                        p = (it.get("period") or {}).get(
+                            "dateTimeFrom") or ""
+                        d = p[:10]
+                        if d:
+                            datums[d] = datums.get(d, 0) + 1
+                variants[variant_label] = {
+                    "status": r.status_code,
+                    "count": len(data) if isinstance(data, list) else 0,
+                    "datums": datums,
+                }
+            except Exception as e:
+                variants[variant_label] = {"error": str(e)}
+
+        results[label] = variants
+
+    return jsonify(results)
