@@ -9,15 +9,18 @@ import base64
 import json
 import os
 import re
+import secrets
+import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime
 from functools import wraps
 from io import BytesIO
+from pathlib import Path
 
 import requests as _requests
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, request, send_file, send_from_directory
 from requests_toolbelt.multipart.encoder import MultipartEncoder
 from smartschool import (
     Smartschool, Credentials, EnvCredentials, PlannedElements,
@@ -28,6 +31,11 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 DEFAULT_MAIN_URL = os.environ.get("SMARTSCHOOL_MAIN_URL", "")
 RESULTS_BASE = "/results/api/v1"
+
+# Lokale opslag voor fallback uploads
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/tmp/smartschool-uploads"))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_TTL = 24 * 60 * 60  # 24 uur
 
 
 # ============================================================
@@ -215,11 +223,74 @@ def auth_login(_session=None, _creds=None):
 
 
 # ============================================================
-# FILE UPLOAD
+# UPLOAD — lokale cleanup + fallback server
+# ============================================================
+def _cleanup_old_uploads():
+    """Verwijder lokale uploads ouder dan 24 uur."""
+    try:
+        now = time.time()
+        for f in UPLOAD_DIR.iterdir():
+            if f.is_file() and (now - f.stat().st_mtime) > UPLOAD_TTL:
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _save_local_upload(filename, content):
+    """Sla een bestand lokaal op. Retourneert publieke URL via /files/<name>."""
+    _cleanup_old_uploads()
+    # Unieke naam om collisions te vermijden
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", filename)
+    token = secrets.token_hex(8)
+    stored_name = f"{token}_{safe}"
+
+    filepath = UPLOAD_DIR / stored_name
+    with open(filepath, "wb") as f:
+        f.write(content)
+
+    # Publieke URL — Render serveert via /files/<name>
+    # (we gebruiken een absoluut pad door request.host_url te pakken)
+    try:
+        host = request.host_url.rstrip("/")
+    except Exception:
+        host = ""
+    return {
+        "ok": True,
+        "url": f"{host}/files/{stored_name}",
+        "path": f"/files/{stored_name}",
+        "filename": filename,
+        "stored_name": stored_name,
+        "size": len(content),
+        "storage": "local",
+        "ttl_hours": 24,
+    }
+
+
+@app.get("/files/<path:name>")
+def serve_local_file(name):
+    """Serveer een lokaal opgeslagen bestand (24u TTL)."""
+    _cleanup_old_uploads()
+    safe = re.sub(r"[^A-Za-z0-9._-]", "", name)
+    if safe != name or ".." in name:
+        return jsonify({"error": "ongeldige naam"}), 400
+
+    filepath = UPLOAD_DIR / safe
+    if not filepath.is_file():
+        return jsonify({"error": "bestand niet gevonden of verlopen"}), 404
+
+    return send_from_directory(str(UPLOAD_DIR), safe, as_attachment=False)
+
+
+# ============================================================
+# UPLOAD — catbox met fallback naar lokale server
 # ============================================================
 @app.post("/api/upload")
 @with_session
 def upload_file(_session=None, _creds=None):
+    """Upload bestand: probeert catbox.moe, valt terug op lokale opslag."""
     if "file" not in request.files:
         return jsonify({"error": "geen 'file'"}), 400
     f = request.files["file"]
@@ -230,28 +301,38 @@ def upload_file(_session=None, _creds=None):
     if len(content) > 200 * 1024 * 1024:
         return jsonify({"error": "bestand > 200MB"}), 400
 
+    mime = f.mimetype or "application/octet-stream"
+    is_image = mime.startswith("image/")
+
+    # Poging 1: catbox
     try:
         r = _requests.post(
             "https://catbox.moe/user/api.php",
             data={"reqtype": "fileupload"},
-            files={"fileToUpload": (f.filename, content,
-                                    f.mimetype or "application/octet-stream")},
-            timeout=120,
+            files={"fileToUpload": (f.filename, content, mime)},
+            timeout=60,
         )
-        if r.status_code != 200:
-            return jsonify({"error": f"catbox {r.status_code}",
-                            "body": r.text[:200]}), 502
-        url = r.text.strip()
-        if not url.startswith("http"):
-            return jsonify({"error": "geen URL", "body": url[:200]}), 502
-        mime = f.mimetype or ""
-        return jsonify({
-            "ok": True, "url": url, "filename": f.filename,
-            "mime": mime, "size": len(content),
-            "is_image": mime.startswith("image/"),
-        })
+        if r.status_code == 200:
+            url = r.text.strip()
+            if url.startswith("http"):
+                return jsonify({
+                    "ok": True, "url": url, "filename": f.filename,
+                    "mime": mime, "size": len(content),
+                    "is_image": is_image, "storage": "catbox",
+                })
+        # catbox faalde of gaf rare response → fallback
+        print(f"[upload] catbox faalde: status={r.status_code}, body={r.text[:100]!r}")
     except Exception as e:
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        print(f"[upload] catbox exception: {type(e).__name__}: {e}")
+
+    # Poging 2: lokale server opslag (24u TTL)
+    try:
+        result = _save_local_upload(f.filename, content)
+        result["mime"] = mime
+        result["is_image"] = is_image
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": f"lokale opslag mislukt: {type(e).__name__}: {e}"}), 500
 
 
 @app.post("/api/upload-image")
@@ -264,6 +345,111 @@ def upload_image(_session=None, _creds=None):
 @with_session
 def upload_file_alias(_session=None, _creds=None):
     return upload_file(_session=_session, _creds=_creds)
+
+
+# ============================================================
+# UPLOAD — Smartschool eigen endpoint
+# ============================================================
+@app.post("/api/upload-smartschool")
+@with_session
+def upload_smartschool(_session=None, _creds=None):
+    """Upload naar Smartschool's eigen /TinyMCE/Upload endpoint.
+    Dit wordt door Smartschool zelf gebruikt voor inline afbeeldingen."""
+    if "file" not in request.files:
+        return jsonify({"error": "geen 'file'"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "lege filename"}), 400
+
+    content = f.read()
+    if len(content) > 512 * 1024 * 1024:
+        return jsonify({"error": "bestand > 512MB"}), 400
+
+    # Genereer unique_id zoals Smartschool doet
+    prefix = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(10))
+    unique_id = f"{prefix}_{int(time.time() * 1000)}"
+
+    mime = f.mimetype or "application/octet-stream"
+    base = _base_url(_creds)
+
+    try:
+        r = _session.request(
+            "POST", "/TinyMCE/Upload",
+            files={"file": (f.filename, content, mime)},
+            data={"unique_id": unique_id},
+            headers={
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": base,
+                "Referer": base + "/",
+            },
+        )
+
+        if r.status_code not in (200, 201):
+            print(f"[upload-smartschool] status {r.status_code}: {r.text[:200]!r}")
+            return jsonify({
+                "error": f"Smartschool status {r.status_code}",
+                "body": r.text[:200],
+            }), 502
+
+        try:
+            resp_data = r.json()
+        except Exception:
+            # Geen JSON: probeer fallback naar catbox/lokaal
+            print(f"[upload-smartschool] geen JSON: {r.text[:200]!r}")
+            return _upload_fallback(f.filename, content, mime)
+
+        location = resp_data.get("location")
+        if not location:
+            return jsonify({"error": "geen location in response",
+                            "body": resp_data}), 502
+
+        full_url = location if location.startswith("http") else base + location
+
+        return jsonify({
+            "ok": True,
+            "location": location,
+            "url": full_url,
+            "filename": f.filename,
+            "size": len(content),
+            "mime": mime,
+            "is_image": mime.startswith("image/"),
+            "unique_id": unique_id,
+            "storage": "smartschool",
+        })
+    except Exception as e:
+        print(f"[upload-smartschool] exception: {type(e).__name__}: {e}")
+        return _upload_fallback(f.filename, content, mime)
+
+
+def _upload_fallback(filename, content, mime):
+    """Fallback: probeer catbox, anders lokale opslag."""
+    try:
+        r = _requests.post(
+            "https://catbox.moe/user/api.php",
+            data={"reqtype": "fileupload"},
+            files={"fileToUpload": (filename, content, mime)},
+            timeout=60,
+        )
+        if r.status_code == 200:
+            url = r.text.strip()
+            if url.startswith("http"):
+                return jsonify({
+                    "ok": True, "url": url, "filename": filename,
+                    "mime": mime, "size": len(content),
+                    "is_image": mime.startswith("image/"),
+                    "storage": "catbox-fallback",
+                })
+    except Exception as e:
+        print(f"[upload-fallback] catbox faalde: {e}")
+
+    try:
+        result = _save_local_upload(filename, content)
+        result["mime"] = mime
+        result["is_image"] = mime.startswith("image/")
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": f"alle uploads mislukt: {e}"}), 500
 
 
 # ============================================================
@@ -557,7 +743,7 @@ def message_read(msg_id, _session=None, _creds=None):
 # DRAFTS (concepten)
 # ============================================================
 def _get_draft_tokens(session, base, draft_id):
-    """Haal tokens + inhoud op uit een specifieke draft-pagina."""
+    """Haal tokens, inhoud én ontvangers op uit een specifieke draft-pagina."""
     url = (f"/?module=Messages&file=composeMessage"
            f"&boxType=draft&composeType=5&msgID={draft_id}")
     r = session.request("GET", url)
@@ -567,16 +753,66 @@ def _get_draft_tokens(session, base, draft_id):
     for m in re.finditer(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>', html):
         fields[m.group(1)] = m.group(2)
 
+    # Body uit de textarea name="message"
     body = ""
     m = re.search(r'<textarea[^>]*name="message"[^>]*>(.*?)</textarea>',
                   html, re.DOTALL | re.IGNORECASE)
     if m:
         body = m.group(1)
 
+    # Decodeer HTML entities (&lt;p&gt; → <p>)
     if body:
         body = (body.replace("&lt;", "<").replace("&gt;", ">")
                     .replace("&quot;", '"').replace("&#39;", "'")
                     .replace("&amp;", "&").replace("&nbsp;", " "))
+
+    # Ontvangers parsen uit receiverSpan elementen
+    receivers = {"to": [], "cc": [], "bcc": []}
+    for rm in re.finditer(
+        r'<div[^>]*class="[^"]*receiverSpan[^"]*"[^>]*>',
+        html, re.IGNORECASE
+    ):
+        tag = rm.group(0)
+        real_id_m = re.search(r'realuserid="(\d+)"', tag)
+        userlt_m = re.search(r'userltatt="(\d+)"', tag)
+        typeatt_m = re.search(r'typeatt="(\d+)"', tag)
+        ssid_m = re.search(r'ssidatt="(\d+)"', tag)
+
+        start = rm.end()
+        name_match = re.search(r'<div[^>]*class="receiverSpanName[^"]*"[^>]*>(.*?)</div>',
+                               html[start:start + 500], re.DOTALL | re.IGNORECASE)
+        name = ""
+        if name_match:
+            name = name_match.group(1)
+            name = re.sub(r"<[^>]+>", "", name).strip()
+
+        if not real_id_m:
+            continue
+
+        real_id = real_id_m.group(1)
+        userlt = userlt_m.group(1) if userlt_m else "0"
+        typeatt = typeatt_m.group(1) if typeatt_m else "0"
+        ssid = ssid_m.group(1) if ssid_m else "455"
+        is_co = (userlt == "2") or typeatt in ("1", "4", "5")
+
+        if typeatt in ("0", "1"):
+            role = "to"
+        elif typeatt in ("2", "4"):
+            role = "cc"
+        elif typeatt in ("3", "5"):
+            role = "bcc"
+        else:
+            role = "to"
+
+        receivers[role].append({
+            "user_id": real_id,
+            "name": f"Co: {name}" if is_co else name,
+            "display_name": name,
+            "is_co_account": is_co,
+            "user_lt": userlt,
+            "ss_id": ssid,
+            "type_label": "ouder" if is_co else "leerling",
+        })
 
     return {
         "draft_id": draft_id,
@@ -586,6 +822,7 @@ def _get_draft_tokens(session, base, draft_id):
         "random_dir": fields.get("randomDir", ""),
         "unique_usc": fields.get("uniqueUsc", ""),
         "encrypted_sender": fields.get("encryptedSender", ""),
+        "receivers": receivers,
     }
 
 
