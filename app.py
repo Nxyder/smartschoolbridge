@@ -1,8 +1,5 @@
 """
 Smartschool API — Flask app (stateless, multi-user, CORS)
-
-Credentials per request via header:
-  X-SS-Creds: base64(json({"username":..,"password":..,"main_url":..,"mfa":..}))
 """
 
 import base64
@@ -179,11 +176,7 @@ def clean_html(text: str) -> str:
 # ============================================================
 @app.get("/")
 def index():
-    return jsonify({
-        "service": "smartschool-api",
-        "status": "ok",
-        "auth": "stuur X-SS-Creds header (base64 JSON) bij elk request",
-    })
+    return jsonify({"service": "smartschool-api", "status": "ok"})
 
 
 @app.get("/ping")
@@ -205,15 +198,13 @@ def auth_login(_session=None, _creds=None):
 
 
 # ============================================================
-# FILE UPLOAD (naar catbox.moe) — werkt voor ELK bestandstype
+# FILE UPLOAD
 # ============================================================
 @app.post("/api/upload")
 @with_session
 def upload_file(_session=None, _creds=None):
-    """Upload elk bestandstype naar catbox.moe.
-    Retourneert publieke URL die in berichten of als link gebruikt kan worden."""
     if "file" not in request.files:
-        return jsonify({"error": "geen 'file' in multipart body"}), 400
+        return jsonify({"error": "geen 'file'"}), 400
     f = request.files["file"]
     if not f.filename:
         return jsonify({"error": "lege filename"}), 400
@@ -231,33 +222,21 @@ def upload_file(_session=None, _creds=None):
             timeout=120,
         )
         if r.status_code != 200:
-            return jsonify({"error": f"catbox status {r.status_code}",
+            return jsonify({"error": f"catbox {r.status_code}",
                             "body": r.text[:200]}), 502
-
         url = r.text.strip()
         if not url.startswith("http"):
-            return jsonify({"error": "catbox gaf geen URL terug",
-                            "body": url[:200]}), 502
-
+            return jsonify({"error": "geen URL", "body": url[:200]}), 502
         mime = f.mimetype or ""
-        is_image = mime.startswith("image/")
-
         return jsonify({
-            "ok": True,
-            "url": url,
-            "filename": f.filename,
-            "mime": mime,
-            "size": len(content),
-            "is_image": is_image,
-            "inline_html": (f'<img src="{url}" border="0" alt="{f.filename}">'
-                            if is_image else ""),
-            "link_html": f'<a href="{url}" target="_blank">{f.filename}</a>',
+            "ok": True, "url": url, "filename": f.filename,
+            "mime": mime, "size": len(content),
+            "is_image": mime.startswith("image/"),
         })
     except Exception as e:
-        return jsonify({"error": f"upload mislukt: {type(e).__name__}: {e}"}), 500
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 
-# Aliases — hetzelfde endpoint onder verschillende namen
 @app.post("/api/upload-image")
 @with_session
 def upload_image(_session=None, _creds=None):
@@ -612,7 +591,17 @@ def _get_compose_tokens(session, base):
     }
 
 
-def _search_users(session, base, query, unique_usc, search_type=0):
+# --- Gebruikers zoeken ---
+# Search types in Smartschool:
+#   0 = leerlingen (hoofd)
+#   1 = CO van leerling (ouder/voogd)
+#   2 = CC leerlingen
+#   3 = BCC leerlingen
+#   4 = CC CO
+#   5 = BCC CO
+
+def _search_users_single(session, base, query, unique_usc, search_type):
+    """Één search_type query."""
     parent = f"insertSearchFieldContainer_{search_type}_0"
     r = session.request(
         "POST", "/?module=Messages&file=searchUsers",
@@ -631,21 +620,74 @@ def _search_users(session, base, query, unique_usc, search_type=0):
         if not uid:
             continue
         name = clean_html(_extract_tag(block, "value"))
-        co = clean_html(_extract_tag(block, "coaccountname"))
+        co_name = clean_html(_extract_tag(block, "coaccountname"))
+        user_type = _extract_tag(block, "userType", "U")
+        user_lt = _extract_tag(block, "userLT", "0")
+        selectable = _extract_tag(block, "selectable", "on")
+        ss_id = _extract_tag(block, "ssID", "455")
+        classname = _extract_tag(block, "classname", "")
+
+        is_co = (user_lt == "2") or bool(co_name)
+
+        if is_co and co_name:
+            display = co_name + (f" (via {name})" if name else "")
+        else:
+            display = name
+
+        if is_co:
+            type_label = "ouder/voogd"
+        elif user_type == "U":
+            type_label = f"leerling - {classname}" if classname else "leerling"
+        elif user_type == "T":
+            type_label = "leerkracht"
+        elif user_type == "G":
+            type_label = "groep"
+        else:
+            type_label = user_type
+
         users.append({
-            "user_id": uid, "name": name,
-            "coaccount_name": co, "is_co_account": bool(co),
-            "ss_id": _extract_tag(block, "ssID", "455"),
+            "user_id": uid,
+            "name": display,
+            "raw_name": name,
+            "coaccount_name": co_name,
+            "is_co_account": is_co,
+            "user_type": user_type,
+            "user_lt": user_lt,
+            "selectable": selectable,
+            "ss_id": ss_id,
+            "classname": classname,
+            "type_label": type_label,
+            "found_via_type": search_type,
         })
     return users
 
 
+def _search_users(session, base, query, unique_usc, search_type=None):
+    """Zoek gebruikers. Als search_type None → doorzoek alle types."""
+    if search_type is None or search_type == "all":
+        all_users = []
+        seen = set()
+        for st in [0, 1, 2, 3, 4, 5]:
+            try:
+                for u in _search_users_single(session, base, query, unique_usc, st):
+                    key = (u["user_id"], u["is_co_account"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    all_users.append(u)
+            except Exception:
+                continue
+        return all_users
+    else:
+        return _search_users_single(session, base, query, unique_usc, int(search_type))
+
+
 def _add_user_to_selected(session, base, user_id, unique_usc, dropped_type,
-                          ssid="455", userlt="0"):
+                          ssid="455", userlt="0", type_id="users"):
     parent = f"insertSearchFieldContainer_{dropped_type}_0"
     return session.request(
         "POST", "/?module=Messages&file=searchUsers&function=addUserToSelected",
-        data={"id": user_id, "typeId": "users", "type": str(dropped_type),
+        data={"id": user_id, "typeId": type_id, "type": str(dropped_type),
               "parentNodeId": parent, "ssid": ssid, "userlt": userlt,
               "uniqueUsc": unique_usc},
         headers={"Content-Type": "application/x-www-form-urlencoded",
@@ -655,6 +697,7 @@ def _add_user_to_selected(session, base, user_id, unique_usc, dropped_type,
 
 
 def _build_receiver_xml(users, receiver_type):
+    """Bouw receiverPart XML. CO-accounts krijgen 'U' prefix + userlt=2."""
     xml = "<results>"
     for u in users:
         uid = u["user_id"]
@@ -678,30 +721,23 @@ def _build_receiver_xml(users, receiver_type):
 @with_session
 def messages_search_users(_session=None, _creds=None):
     q = request.args.get("q", "").strip()
-    st = int(request.args.get("type", 0))
+    st_raw = request.args.get("type", "all")
     if not q:
         return jsonify({"error": "q verplicht"}), 400
+
+    st = "all" if st_raw == "all" else int(st_raw)
     base = _base_url(_creds)
     tokens = _get_compose_tokens(_session, base)
-    return jsonify({"query": q, "users": _search_users(_session, base, q, tokens["unique_usc"], st)})
+    users = _search_users(_session, base, q, tokens["unique_usc"], st)
+    return jsonify({"query": q, "type": st_raw, "users": users})
 
 
 @app.post("/api/messages/send")
 @with_session
 def messages_send(_session=None, _creds=None):
-    """Verzend bericht met volledige HTML body, BCC, en optionele bijlagen.
-
-    Body:
-    {
-      "subject": "...",
-      "message_html": "<p>...</p>",       # HTML met optioneel <img src="...">
-      "message": "plain text fallback",
-      "to": [{user_id, ss_id, is_co_account}, ...],
-      "cc": [...],
-      "bcc": [...],
-      "attachments": [{url, filename, ...}],  # externe URLs, als links in body
-      "send_date": "YYYY-MM-DD HH:MM"
-    }
+    """Verzend bericht met HTML body, BCC, bijlagen.
+    
+    message_html wordt ONGEWIJZIGD doorgestuurd — dus <b>, <i>, <img>, etc. blijven.
     """
     data = request.get_json(force=True, silent=True) or {}
     subject = data.get("subject")
@@ -716,18 +752,18 @@ def messages_send(_session=None, _creds=None):
     if not subject or not to_users:
         return jsonify({"error": "subject en to zijn verplicht"}), 400
 
-    # Body: gebruik HTML, anders plain text
-    if message_html:
+    # BELANGRIJK: gebruik HTML direct, geen wrap!
+    if message_html and message_html.strip():
         body = message_html
     elif message_plain:
+        # Alleen fallback als er geen HTML is
         body = f"<p>{message_plain}</p>"
     else:
-        return jsonify({"error": "message_html of message verplicht"}), 400
+        body = "<p></p>"
 
-    # Voeg bijlagen als download-links onderaan de body
+    # Voeg bijlagen als download-links onderaan
     if attachments:
-        body += '<hr style="border:none;border-top:1px solid #ccc;margin:16px 0">'
-        body += '<p><b>📎 Bijlagen:</b></p><ul>'
+        body += '<hr><p><b>📎 Bijlagen:</b></p><ul>'
         for att in attachments:
             url = att.get("url")
             fn = att.get("filename", "bestand")
@@ -740,11 +776,14 @@ def messages_send(_session=None, _creds=None):
     if not tokens["random_dir"]:
         return jsonify({"error": "kon tokens niet ophalen"}), 500
 
+    # Registreer ontvangers — nu met correcte CO-afhandeling
     for role_idx, user_list in [(0, to_users), (1, cc_users), (2, bcc_users)]:
         for u in user_list:
             is_co = u.get("is_co_account", False)
             dropped = DROPPED_TYPE[(role_idx, is_co)]
             userlt = "2" if is_co else "0"
+            # Bij CO-accounts: user_id heeft geen U-prefix meer nodig hier,
+            # _add_user_to_selected werkt met originele id + userlt=2
             _add_user_to_selected(_session, base, u["user_id"], tokens["unique_usc"],
                                   dropped, ssid=u.get("ss_id", "455"),
                                   userlt=userlt)
@@ -780,8 +819,10 @@ def messages_send(_session=None, _creds=None):
         "status": r.status_code,
         "scheduled": bool(send_date),
         "has_bcc": bool(bcc_users),
-        "attachments_linked": len(attachments),
-        "body_preview": body[:300],
+        "to_count": len(to_users),
+        "cc_count": len(cc_users),
+        "bcc_count": len(bcc_users),
+        "body_length": len(body),
     })
 
 
