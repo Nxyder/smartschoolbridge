@@ -3,23 +3,6 @@ Smartschool API — Flask app (stateless, multi-user, CORS)
 
 Credentials worden PER REQUEST meegestuurd via header:
   X-SS-Creds: base64(json({"username":..,"password":..,"main_url":..,"mfa":..}))
-
-Endpoints:
-  POST   /api/auth/login
-  GET    /api/health
-  GET    /api/grades?detail=0|1
-  GET    /api/grades/evaluation/<id>
-  GET    /api/messages?box=inbox|outbox|trash|archive
-  GET    /api/messages/<id>?box=inbox
-  GET    /api/messages/<id>/attachment/<file_id>
-  POST   /api/messages/<id>/action
-  GET    /api/messages/search-users?q=...&type=0
-  POST   /api/messages/send
-  GET    /api/profile
-  PATCH  /api/profile
-  GET    /api/planner?detail=0|1
-  POST   /api/planner/<platform_id>/<element_id>/<action>
-  POST   /api/planner/todo
 """
 
 import base64
@@ -36,7 +19,7 @@ from io import BytesIO
 from flask import Flask, jsonify, request, send_file
 from requests_toolbelt.multipart.encoder import MultipartEncoder
 from smartschool import (
-    Smartschool, EnvCredentials, PlannedElements,
+    Smartschool, Credentials, EnvCredentials, PlannedElements,
     MarkMessageUnread, MessageMoveToArchive, MessageMoveToTrash,
     AdjustMessageLabel, MessageLabel,
 )
@@ -55,16 +38,10 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 @app.before_request
 def handle_preflight():
-    """Vang ALLE OPTIONS requests af vóór Flask routing.
-    Flask geeft anders 405 terug voor OPTIONS op bestaande POST/GET routes,
-    wat de browser als CORS-fout interpreteert."""
     if request.method == "OPTIONS":
         response = app.make_default_options_response()
         origin = request.headers.get("Origin")
-        if origin:
-            response.headers["Access-Control-Allow-Origin"] = origin
-        else:
-            response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Origin"] = origin or "*"
         response.headers["Access-Control-Allow-Methods"] = (
             "GET, POST, PATCH, PUT, DELETE, OPTIONS"
         )
@@ -80,10 +57,7 @@ def handle_preflight():
 @app.after_request
 def add_cors(response):
     origin = request.headers.get("Origin")
-    if origin:
-        response.headers["Access-Control-Allow-Origin"] = origin
-    else:
-        response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Origin"] = origin or "*"
     response.headers["Access-Control-Allow-Methods"] = (
         "GET, POST, PATCH, PUT, DELETE, OPTIONS"
     )
@@ -117,27 +91,34 @@ def _decode_creds(header_value: str) -> dict:
             "main_url": main_url, "mfa": mfa}
 
 
-def _session_from_creds(creds: dict) -> Smartschool:
-    class _Creds:
-        def __init__(self, u, p, m, mfa):
-            self._u, self._p, self._m, self._mfa = u, p, m, mfa
-        @property
-        def username(self): return self._u
-        @username.setter
-        def username(self, v): self._u = v
-        @property
-        def password(self): return self._p
-        @password.setter
-        def password(self, v): self._p = v
-        @property
-        def main_url(self): return self._m
-        @main_url.setter
-        def main_url(self, v): self._m = v
-        @property
-        def mfa(self): return self._mfa
-        @mfa.setter
-        def mfa(self, v): self._mfa = v
+class _Creds(Credentials):
+    """In-memory credentials object dat de Credentials interface erft
+    (nodig voor de interne validate() call in smartschool lib)."""
+    def __init__(self, u, p, m, mfa):
+        self._u, self._p, self._m, self._mfa = u, p, m, mfa
 
+    @property
+    def username(self): return self._u
+    @username.setter
+    def username(self, v): self._u = v
+
+    @property
+    def password(self): return self._p
+    @password.setter
+    def password(self, v): self._p = v
+
+    @property
+    def main_url(self): return self._m
+    @main_url.setter
+    def main_url(self, v): self._m = v
+
+    @property
+    def mfa(self): return self._mfa
+    @mfa.setter
+    def mfa(self, v): self._mfa = v
+
+
+def _session_from_creds(creds: dict) -> Smartschool:
     s = Smartschool(_Creds(creds["username"], creds["password"],
                            creds["main_url"], creds["mfa"]))
     _ = s.platform_id
@@ -195,7 +176,7 @@ def clean_html(text: str) -> str:
 
 
 # ============================================================
-# ROOT + AUTH TEST
+# ROOT + AUTH
 # ============================================================
 @app.get("/")
 def index():
@@ -203,23 +184,12 @@ def index():
         "service": "smartschool-api",
         "status": "ok",
         "auth": "stuur X-SS-Creds header (base64 JSON) bij elk request",
-        "endpoints": [
-            "POST /api/auth/login",
-            "GET  /api/grades?detail=0|1",
-            "GET  /api/grades/evaluation/<id>",
-            "GET  /api/messages?box=inbox|outbox|trash|archive",
-            "GET  /api/messages/<id>?box=inbox",
-            "GET  /api/messages/<id>/attachment/<file_id>",
-            "POST /api/messages/<id>/action",
-            "GET  /api/messages/search-users?q=...&type=0",
-            "POST /api/messages/send",
-            "GET  /api/profile",
-            "PATCH /api/profile",
-            "GET  /api/planner?detail=0|1",
-            "POST /api/planner/<platform_id>/<element_id>/<action>",
-            "POST /api/planner/todo",
-        ],
     })
+
+
+@app.get("/ping")
+def ping():
+    return jsonify({"status": "ok"})
 
 
 @app.get("/api/health")
@@ -236,7 +206,7 @@ def auth_login(_session=None, _creds=None):
 
 
 # ============================================================
-# /api/grades
+# GRADES
 # ============================================================
 def _rget(session, base, path):
     r = session.request(
@@ -375,7 +345,7 @@ def grade_detail(identifier, _session=None, _creds=None):
 
 
 # ============================================================
-# /api/messages
+# MESSAGES
 # ============================================================
 DROPPED_TYPE = {
     (0, False): 0, (1, False): 2, (2, False): 3,
@@ -704,7 +674,7 @@ def messages_send(_session=None, _creds=None):
 
 
 # ============================================================
-# /api/profile
+# PROFILE
 # ============================================================
 PROFILE_PATH = "/?module=Profile&file=personalia&function=personalia"
 
@@ -783,7 +753,7 @@ def profile_update(_session=None, _creds=None):
 
 
 # ============================================================
-# /api/planner
+# PLANNER
 # ============================================================
 def _element_dict(el):
     p = el.period
