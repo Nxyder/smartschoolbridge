@@ -1,21 +1,22 @@
 """
-Smartschool API — Flask app (single file)
+Smartschool API — Flask app (single file, met CORS)
 
 Endpoints:
   GET    /                                    → health/info
-  GET    /api/grades                          → alle cijfers (?detail=1)
-  GET    /api/grades/evaluation/<id>          → detail van 1 evaluatie
-  GET    /api/messages?box=inbox              → lijst (inbox|outbox|trash|archive)
-  GET    /api/messages/<id>?box=inbox         → bericht lezen
-  GET    /api/messages/<id>/attachment/<fid>  → bijlage downloaden
-  POST   /api/messages/<id>/action            → {action: unread|archive|trash|label, label?}
-  GET    /api/messages/search-users?q=...     → gebruikers zoeken
-  POST   /api/messages/send                   → {subject, message, to, cc?, bcc?, send_date?}
-  GET    /api/profile                         → persoonlijke gegevens
-  PATCH  /api/profile                         → {changes: {veld: waarde}}
-  GET    /api/planner                         → planner items (?detail=1)
-  POST   /api/planner/<pid>/<eid>/<action>    → resolve|unresolve|trash
-  POST   /api/planner/todo                    → nieuwe to-do
+  GET    /ui                                  → frontend
+  GET    /api/grades?detail=0|1
+  GET    /api/grades/evaluation/<id>
+  GET    /api/messages?box=inbox|outbox|trash|archive
+  GET    /api/messages/<id>?box=inbox
+  GET    /api/messages/<id>/attachment/<file_id>
+  POST   /api/messages/<id>/action
+  GET    /api/messages/search-users?q=...&type=0
+  POST   /api/messages/send
+  GET    /api/profile
+  PATCH  /api/profile
+  GET    /api/planner?detail=0|1
+  POST   /api/planner/<platform_id>/<element_id>/<action>
+  POST   /api/planner/todo
 """
 
 import os
@@ -26,7 +27,7 @@ from collections import defaultdict
 from datetime import datetime
 from io import BytesIO
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, request, send_file, render_template
 from requests_toolbelt.multipart.encoder import MultipartEncoder
 from smartschool import (
     Smartschool, EnvCredentials, PlannedElements,
@@ -49,7 +50,6 @@ if not all([USERNAME, PASSWORD, MAIN_URL, MFA]):
         "SMARTSCHOOL_MAIN_URL, SMARTSCHOOL_MFA"
     )
 
-# De smartschool library leest deze env vars via EnvCredentials
 os.environ["SMARTSCHOOL_USERNAME"] = USERNAME
 os.environ["SMARTSCHOOL_PASSWORD"] = PASSWORD
 os.environ["SMARTSCHOOL_MAIN_URL"] = MAIN_URL
@@ -100,11 +100,41 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 
+# ============================================================
+# CORS — volledig open
+# ============================================================
+@app.after_request
+def add_cors(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
+    response.headers["Access-Control-Max-Age"] = "86400"
+    return response
+
+
+@app.route("/<path:_any>", methods=["OPTIONS"])
+@app.route("/", methods=["OPTIONS"])
+def cors_preflight(_any=None):
+    return ("", 204)
+
+
+# ============================================================
+# UI
+# ============================================================
+@app.get("/ui")
+def ui():
+    return render_template("index.html")
+
+
+# ============================================================
+# HEALTH
+# ============================================================
 @app.get("/")
 def index():
     return jsonify({
         "service": "smartschool-api",
         "status": "ok",
+        "ui": "/ui",
         "endpoints": [
             "GET  /api/grades?detail=0|1",
             "GET  /api/grades/evaluation/<id>",
