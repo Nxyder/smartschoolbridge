@@ -5,7 +5,7 @@ Credentials worden PER REQUEST meegestuurd via header:
   X-SS-Creds: base64(json({"username":..,"password":..,"main_url":..,"mfa":..}))
 
 Endpoints:
-  POST   /api/auth/login                       → test login (geeft niets terug behalve ok)
+  POST   /api/auth/login
   GET    /api/health
   GET    /api/grades?detail=0|1
   GET    /api/grades/evaluation/<id>
@@ -53,6 +53,30 @@ app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 
+@app.before_request
+def handle_preflight():
+    """Vang ALLE OPTIONS requests af vóór Flask routing.
+    Flask geeft anders 405 terug voor OPTIONS op bestaande POST/GET routes,
+    wat de browser als CORS-fout interpreteert."""
+    if request.method == "OPTIONS":
+        response = app.make_default_options_response()
+        origin = request.headers.get("Origin")
+        if origin:
+            response.headers["Access-Control-Allow-Origin"] = origin
+        else:
+            response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = (
+            "GET, POST, PATCH, PUT, DELETE, OPTIONS"
+        )
+        response.headers["Access-Control-Allow-Headers"] = (
+            request.headers.get("Access-Control-Request-Headers")
+            or "Content-Type, Authorization, X-Requested-With, X-SS-Creds"
+        )
+        response.headers["Access-Control-Max-Age"] = "86400"
+        response.headers["Vary"] = "Origin"
+        return response
+
+
 @app.after_request
 def add_cors(response):
     origin = request.headers.get("Origin")
@@ -60,7 +84,9 @@ def add_cors(response):
         response.headers["Access-Control-Allow-Origin"] = origin
     else:
         response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = (
+        "GET, POST, PATCH, PUT, DELETE, OPTIONS"
+    )
     response.headers["Access-Control-Allow-Headers"] = (
         "Content-Type, Authorization, X-Requested-With, X-SS-Creds"
     )
@@ -69,17 +95,10 @@ def add_cors(response):
     return response
 
 
-@app.route("/<path:_any>", methods=["OPTIONS"])
-@app.route("/", methods=["OPTIONS"])
-def cors_preflight(_any=None):
-    return ("", 204)
-
-
 # ============================================================
 # CREDENTIALS — per request uit header
 # ============================================================
 def _decode_creds(header_value: str) -> dict:
-    """Decodeer base64 JSON header naar creds dict."""
     try:
         raw = base64.b64decode(header_value).decode("utf-8")
         data = json.loads(raw)
@@ -99,11 +118,6 @@ def _decode_creds(header_value: str) -> dict:
 
 
 def _session_from_creds(creds: dict) -> Smartschool:
-    """Bouw een verse Smartschool sessie. Thread-safe: gebruikt os.environ lokaal
-    binnen een lock-vrije flow omdat EnvCredentials de waarden bij constructie leest."""
-    # BELANGRIJK: we zetten env vars, EnvCredentials leest ze direct hierna.
-    # Om race-conditions te vermijden bij gelijktijdige requests gebruiken we
-    # een eigen Credentials-implementatie i.p.v. EnvCredentials.
     class _Creds:
         def __init__(self, u, p, m, mfa):
             self._u, self._p, self._m, self._mfa = u, p, m, mfa
@@ -126,13 +140,11 @@ def _session_from_creds(creds: dict) -> Smartschool:
 
     s = Smartschool(_Creds(creds["username"], creds["password"],
                            creds["main_url"], creds["mfa"]))
-    _ = s.platform_id  # forceert login
+    _ = s.platform_id
     return s
 
 
 def with_session(fn):
-    """Decorator: decodeert creds uit header, maakt sessie, injecteert als 1e arg
-    na eventuele path-args? Nee — we injecteren via kwargs `_session` en `_creds`."""
     @wraps(fn)
     def wrapper(*args, **kwargs):
         header = request.headers.get("X-SS-Creds")
@@ -218,7 +230,6 @@ def health():
 @app.post("/api/auth/login")
 @with_session
 def auth_login(_session=None, _creds=None):
-    """Test of de credentials werken. Body wordt genegeerd — creds komen uit header."""
     return jsonify({"ok": True,
                     "username": _creds["username"],
                     "main_url": _creds["main_url"]})
@@ -545,7 +556,6 @@ def message_action(msg_id, _session=None, _creds=None):
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 
-# --- verzenden ---
 def _get_compose_tokens(session, base):
     r = session.request(
         "GET",
