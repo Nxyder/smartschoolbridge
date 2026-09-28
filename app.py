@@ -1,5 +1,8 @@
 """
 Smartschool API — Flask app (stateless, multi-user, CORS)
+
+Credentials per request via header:
+  X-SS-Creds: base64(json({"username":..,"password":..,"main_url":..,"mfa":..}))
 """
 
 import base64
@@ -154,28 +157,34 @@ def strip_html(html: str) -> str:
         return ""
     text = re.sub(r"<br\s*/?>", "\n", html, flags=re.IGNORECASE)
     text = re.sub(r"</(p|div|li)>", "\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"<[^>]+>", "", text)
-    for a, b in [("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'),
-                 ("&#39;", "'"), ("&nbsp;", " "), ("&#8364;", "€")]:
-        text = text.replace(a, b)
+    for _ in range(3):
+        before = text
+        text = re.sub(r"<[^>]+>", "", text)
+        for a, b in [("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+                     ("&quot;", '"'), ("&#39;", "'"), ("&nbsp;", " "),
+                     ("&#8364;", "€"), ("&apos;", "'")]:
+            text = text.replace(a, b)
+        if text == before:
+            break
+    text = re.sub(r"searchDivHighlight", "", text, flags=re.IGNORECASE)
     return text.strip()
 
 
 def clean_html(text: str) -> str:
-    """Strip ALLE HTML tags (inclusief <span class="searchDivHighlight">)
-    en decodeer HTML entities."""
     if not text:
         return ""
-    # Eerst eventuele CDATA rommel eruit
     text = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", text, flags=re.DOTALL)
-    # Verwijder alle tags
-    text = re.sub(r"<[^>]+>", "", text)
-    # Decodeer entities
-    text = (text.replace("&lt;", "<").replace("&gt;", ">")
-                .replace("&quot;", '"').replace("&#39;", "'")
-                .replace("&amp;", "&").replace("&nbsp;", " ")
-                .replace("&apos;", "'").replace("&#8211;", "–"))
-    # Witruimte normaliseren
+    for _ in range(3):
+        before = text
+        text = re.sub(r"<[^>]+>", "", text)
+        text = (text.replace("&lt;", "<").replace("&gt;", ">")
+                    .replace("&quot;", '"').replace("&#39;", "'")
+                    .replace("&amp;", "&").replace("&nbsp;", " ")
+                    .replace("&apos;", "'").replace("&#8211;", "-")
+                    .replace("&#8364;", "€"))
+        if text == before:
+            break
+    text = re.sub(r"searchDivHighlight", "", text, flags=re.IGNORECASE)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -452,14 +461,18 @@ def _get_message_list(session, base, box_type="inbox", box_id="0"):
         return []
     out = []
     for msg in root.findall(".//message"):
+        mid = msg.findtext("id", "")
+        if not mid:
+            continue
         out.append({
-            "id": msg.findtext("id", ""),
+            "id": mid,
             "from": msg.findtext("from", ""),
             "subject": msg.findtext("subject", ""),
             "date": msg.findtext("date", ""),
             "attachment": msg.findtext("attachment", "") == "1",
             "unread": msg.findtext("unread", "") == "1",
-            "real_box": msg.findtext("realBox", ""),
+            "real_box": msg.findtext("realBox", "") or box_type,
+            "is_draft": (msg.findtext("realBox", "") == "draft") or (box_type == "draft"),
         })
     return out
 
@@ -540,6 +553,53 @@ def message_read(msg_id, _session=None, _creds=None):
     return jsonify(_parse_full_message(xml_text))
 
 
+# ============================================================
+# DRAFTS (concepten)
+# ============================================================
+def _get_draft_tokens(session, base, draft_id):
+    """Haal tokens + inhoud op uit een specifieke draft-pagina."""
+    url = (f"/?module=Messages&file=composeMessage"
+           f"&boxType=draft&composeType=5&msgID={draft_id}")
+    r = session.request("GET", url)
+    html = r.text
+
+    fields = {}
+    for m in re.finditer(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>', html):
+        fields[m.group(1)] = m.group(2)
+
+    body = ""
+    m = re.search(r'<textarea[^>]*name="message"[^>]*>(.*?)</textarea>',
+                  html, re.DOTALL | re.IGNORECASE)
+    if m:
+        body = m.group(1)
+
+    if body:
+        body = (body.replace("&lt;", "<").replace("&gt;", ">")
+                    .replace("&quot;", '"').replace("&#39;", "'")
+                    .replace("&amp;", "&").replace("&nbsp;", " "))
+
+    return {
+        "draft_id": draft_id,
+        "orig_msg_id": fields.get("origMsgID", draft_id),
+        "subject": fields.get("subject", ""),
+        "body": body.strip(),
+        "random_dir": fields.get("randomDir", ""),
+        "unique_usc": fields.get("uniqueUsc", ""),
+        "encrypted_sender": fields.get("encryptedSender", ""),
+    }
+
+
+@app.get("/api/messages/draft/<draft_id>")
+@with_session
+def get_draft(draft_id, _session=None, _creds=None):
+    base = _base_url(_creds)
+    try:
+        data = _get_draft_tokens(_session, base, draft_id)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+
 @app.get("/api/messages/<msg_id>/attachment/<file_id>")
 @with_session
 def message_attachment(msg_id, file_id, _session=None, _creds=None):
@@ -599,7 +659,6 @@ def _get_compose_tokens(session, base):
     }
 
 
-# --- Gebruikers zoeken ---
 def _search_users_single(session, base, query, unique_usc, search_type):
     parent = f"insertSearchFieldContainer_{search_type}_0"
     r = session.request(
@@ -620,9 +679,6 @@ def _search_users_single(session, base, query, unique_usc, search_type):
         if not uid:
             continue
 
-        # BELANGRIJK: altijd clean_html() toepassen — verwijdert
-        # <span class="searchDivHighlight">...</span> die Smartschool
-        # toevoegt rond het zoekwoord.
         name = clean_html(_extract_tag(block, "value"))
         co_name = clean_html(_extract_tag(block, "coaccountname"))
         user_type = _extract_tag(block, "userType", "U")
@@ -633,7 +689,6 @@ def _search_users_single(session, base, query, unique_usc, search_type):
 
         is_co = (user_lt == "2") or bool(co_name)
 
-        # Naam opbouwen
         if is_co and co_name:
             display_name = co_name
             if name and name.lower() != co_name.lower():
@@ -641,10 +696,8 @@ def _search_users_single(session, base, query, unique_usc, search_type):
         else:
             display_name = name
 
-        # Volledige naam met "Co:" prefix voor CO-accounts
         full_name = f"Co: {display_name}" if is_co else display_name
 
-        # Type label
         if is_co:
             type_label = "ouder"
         elif user_type == "U":
@@ -658,10 +711,10 @@ def _search_users_single(session, base, query, unique_usc, search_type):
 
         users.append({
             "user_id": uid,
-            "name": full_name,               # "Co: Anke Rasmussen (via Bontemps Odne)"
-            "display_name": display_name,    # "Anke Rasmussen (via Bontemps Odne)"
-            "raw_name": name,                # "Anke Rasmussen"
-            "coaccount_name": co_name,       # "Anke Rasmussen"
+            "name": full_name,
+            "display_name": display_name,
+            "raw_name": name,
+            "coaccount_name": co_name,
             "is_co_account": is_co,
             "user_type": user_type,
             "user_lt": user_lt,
@@ -675,7 +728,6 @@ def _search_users_single(session, base, query, unique_usc, search_type):
 
 
 def _search_users(session, base, query, unique_usc, search_type=None):
-    """Zoek gebruikers. None of 'all' → doorzoek alle 6 types."""
     if search_type is None or search_type == "all":
         all_users = []
         seen = set()
@@ -709,7 +761,6 @@ def _add_user_to_selected(session, base, user_id, unique_usc, dropped_type,
 
 
 def _build_receiver_xml(users, receiver_type):
-    """Bouw receiverPart XML. CO-accounts krijgen 'U' prefix + userlt=2."""
     xml = "<results>"
     for u in users:
         uid = u["user_id"]
@@ -747,7 +798,11 @@ def messages_search_users(_session=None, _creds=None):
 @app.post("/api/messages/send")
 @with_session
 def messages_send(_session=None, _creds=None):
-    """Verzend bericht. message_html wordt ONGEWIJZIGD doorgestuurd."""
+    """Verzend bericht. message_html wordt ONGEWIJZIGD doorgestuurd.
+
+    Optioneel: draft_id → als aanwezig, gebruik draft-tokens en
+    overschrijf/verwijder het concept na verzenden.
+    """
     data = request.get_json(force=True, silent=True) or {}
     subject = data.get("subject")
     message_html = data.get("message_html")
@@ -757,6 +812,7 @@ def messages_send(_session=None, _creds=None):
     bcc_users = data.get("bcc") or []
     attachments = data.get("attachments") or []
     send_date = data.get("send_date") or ""
+    draft_id = data.get("draft_id") or ""
 
     if not subject or not to_users:
         return jsonify({"error": "subject en to zijn verplicht"}), 400
@@ -778,8 +834,12 @@ def messages_send(_session=None, _creds=None):
         body += '</ul>'
 
     base = _base_url(_creds)
-    tokens = _get_compose_tokens(_session, base)
-    if not tokens["random_dir"]:
+    if draft_id:
+        tokens = _get_draft_tokens(_session, base, draft_id)
+    else:
+        tokens = _get_compose_tokens(_session, base)
+
+    if not tokens.get("random_dir"):
         return jsonify({"error": "kon tokens niet ophalen"}), 500
 
     for role_idx, user_list in [(0, to_users), (1, cc_users), (2, bcc_users)]:
@@ -792,10 +852,17 @@ def messages_send(_session=None, _creds=None):
                                   userlt=userlt)
 
     fields = {
-        "send": "send", "origMsgID": "0", "composeAction": "0",
-        "randomDir": tokens["random_dir"], "uniqueUsc": tokens["unique_usc"],
-        "showTab": "tab1Container", "delFile": "0", "composeType": "0",
-        "msgID": "0", "msgFormSelectedTab": "", "sendDate": send_date,
+        "send": "send",
+        "origMsgID": tokens.get("orig_msg_id", "0") if draft_id else "0",
+        "composeAction": "5" if draft_id else "0",
+        "randomDir": tokens["random_dir"],
+        "uniqueUsc": tokens["unique_usc"],
+        "showTab": "tab1Container",
+        "delFile": "0",
+        "composeType": "5" if draft_id else "0",
+        "msgID": draft_id if draft_id else "0",
+        "msgFormSelectedTab": "",
+        "sendDate": send_date,
         "subject": subject,
         "bcc": "1" if bcc_users else "0",
         "message": body,
@@ -821,6 +888,7 @@ def messages_send(_session=None, _creds=None):
         "ok": r.status_code == 200,
         "status": r.status_code,
         "scheduled": bool(send_date),
+        "draft_id": draft_id or None,
         "has_bcc": bool(bcc_users),
         "to_count": len(to_users),
         "cc_count": len(cc_users),
@@ -986,7 +1054,10 @@ def planner_item_action(platform_id, element_id, action, _session=None, _creds=N
     if not target:
         return jsonify({"error": "element niet gevonden"}), 404
     ok = _planner_action(_session, target, action)
-    return jsonify({"ok": ok, "action": action})
+    if not ok:
+        return jsonify({"error": f"Smartschool weigerde actie '{action}'",
+                        "ok": False}), 502
+    return jsonify({"ok": True, "action": action})
 
 
 @app.post("/api/planner/todo")
