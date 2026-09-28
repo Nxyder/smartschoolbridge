@@ -162,12 +162,20 @@ def strip_html(html: str) -> str:
 
 
 def clean_html(text: str) -> str:
+    """Strip ALLE HTML tags (inclusief <span class="searchDivHighlight">)
+    en decodeer HTML entities."""
     if not text:
         return ""
+    # Eerst eventuele CDATA rommel eruit
+    text = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", text, flags=re.DOTALL)
+    # Verwijder alle tags
     text = re.sub(r"<[^>]+>", "", text)
-    text = text.replace("&lt;", "<").replace("&gt;", ">")
-    text = text.replace("&quot;", '"').replace("&#39;", "'")
-    text = text.replace("&amp;", "&").replace("&nbsp;", " ")
+    # Decodeer entities
+    text = (text.replace("&lt;", "<").replace("&gt;", ">")
+                .replace("&quot;", '"').replace("&#39;", "'")
+                .replace("&amp;", "&").replace("&nbsp;", " ")
+                .replace("&apos;", "'").replace("&#8211;", "–"))
+    # Witruimte normaliseren
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -592,16 +600,7 @@ def _get_compose_tokens(session, base):
 
 
 # --- Gebruikers zoeken ---
-# Search types in Smartschool:
-#   0 = leerlingen (hoofd)
-#   1 = CO van leerling (ouder/voogd)
-#   2 = CC leerlingen
-#   3 = BCC leerlingen
-#   4 = CC CO
-#   5 = BCC CO
-
 def _search_users_single(session, base, query, unique_usc, search_type):
-    """Één search_type query."""
     parent = f"insertSearchFieldContainer_{search_type}_0"
     r = session.request(
         "POST", "/?module=Messages&file=searchUsers",
@@ -613,12 +612,17 @@ def _search_users_single(session, base, query, unique_usc, search_type):
                  "X-Requested-With": "XMLHttpRequest",
                  "Origin": base, "Referer": base + "/"},
     )
+
     users = []
     for um in re.finditer(r"<user>(.*?)</user>", r.text, re.DOTALL):
         block = um.group(1)
         uid = _extract_tag(block, "userID")
         if not uid:
             continue
+
+        # BELANGRIJK: altijd clean_html() toepassen — verwijdert
+        # <span class="searchDivHighlight">...</span> die Smartschool
+        # toevoegt rond het zoekwoord.
         name = clean_html(_extract_tag(block, "value"))
         co_name = clean_html(_extract_tag(block, "coaccountname"))
         user_type = _extract_tag(block, "userType", "U")
@@ -629,13 +633,20 @@ def _search_users_single(session, base, query, unique_usc, search_type):
 
         is_co = (user_lt == "2") or bool(co_name)
 
+        # Naam opbouwen
         if is_co and co_name:
-            display = co_name + (f" (via {name})" if name else "")
+            display_name = co_name
+            if name and name.lower() != co_name.lower():
+                display_name = f"{co_name} (via {name})"
         else:
-            display = name
+            display_name = name
 
+        # Volledige naam met "Co:" prefix voor CO-accounts
+        full_name = f"Co: {display_name}" if is_co else display_name
+
+        # Type label
         if is_co:
-            type_label = "ouder/voogd"
+            type_label = "ouder"
         elif user_type == "U":
             type_label = f"leerling - {classname}" if classname else "leerling"
         elif user_type == "T":
@@ -647,9 +658,10 @@ def _search_users_single(session, base, query, unique_usc, search_type):
 
         users.append({
             "user_id": uid,
-            "name": display,
-            "raw_name": name,
-            "coaccount_name": co_name,
+            "name": full_name,               # "Co: Anke Rasmussen (via Bontemps Odne)"
+            "display_name": display_name,    # "Anke Rasmussen (via Bontemps Odne)"
+            "raw_name": name,                # "Anke Rasmussen"
+            "coaccount_name": co_name,       # "Anke Rasmussen"
             "is_co_account": is_co,
             "user_type": user_type,
             "user_lt": user_lt,
@@ -663,7 +675,7 @@ def _search_users_single(session, base, query, unique_usc, search_type):
 
 
 def _search_users(session, base, query, unique_usc, search_type=None):
-    """Zoek gebruikers. Als search_type None → doorzoek alle types."""
+    """Zoek gebruikers. None of 'all' → doorzoek alle 6 types."""
     if search_type is None or search_type == "all":
         all_users = []
         seen = set()
@@ -735,10 +747,7 @@ def messages_search_users(_session=None, _creds=None):
 @app.post("/api/messages/send")
 @with_session
 def messages_send(_session=None, _creds=None):
-    """Verzend bericht met HTML body, BCC, bijlagen.
-    
-    message_html wordt ONGEWIJZIGD doorgestuurd — dus <b>, <i>, <img>, etc. blijven.
-    """
+    """Verzend bericht. message_html wordt ONGEWIJZIGD doorgestuurd."""
     data = request.get_json(force=True, silent=True) or {}
     subject = data.get("subject")
     message_html = data.get("message_html")
@@ -752,16 +761,13 @@ def messages_send(_session=None, _creds=None):
     if not subject or not to_users:
         return jsonify({"error": "subject en to zijn verplicht"}), 400
 
-    # BELANGRIJK: gebruik HTML direct, geen wrap!
     if message_html and message_html.strip():
         body = message_html
     elif message_plain:
-        # Alleen fallback als er geen HTML is
         body = f"<p>{message_plain}</p>"
     else:
         body = "<p></p>"
 
-    # Voeg bijlagen als download-links onderaan
     if attachments:
         body += '<hr><p><b>📎 Bijlagen:</b></p><ul>'
         for att in attachments:
@@ -776,14 +782,11 @@ def messages_send(_session=None, _creds=None):
     if not tokens["random_dir"]:
         return jsonify({"error": "kon tokens niet ophalen"}), 500
 
-    # Registreer ontvangers — nu met correcte CO-afhandeling
     for role_idx, user_list in [(0, to_users), (1, cc_users), (2, bcc_users)]:
         for u in user_list:
             is_co = u.get("is_co_account", False)
             dropped = DROPPED_TYPE[(role_idx, is_co)]
             userlt = "2" if is_co else "0"
-            # Bij CO-accounts: user_id heeft geen U-prefix meer nodig hier,
-            # _add_user_to_selected werkt met originele id + userlt=2
             _add_user_to_selected(_session, base, u["user_id"], tokens["unique_usc"],
                                   dropped, ssid=u.get("ss_id", "455"),
                                   userlt=userlt)
