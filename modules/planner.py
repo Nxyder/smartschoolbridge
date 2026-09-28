@@ -1,28 +1,33 @@
 """
-Planner endpoints.
+Planner endpoints — volledig.
 
 API structuur:
-  GET  /api/planner                 → compact: uren + items, standaard range = 14d terug / 30d vooruit
-  GET  /api/planner/week            → enkel deze week (ma-zo), compact, gecached
-  GET  /api/planner/item/<id>       → detail van 1 item (lazy loaded)
-  POST /api/planner/<pid>/<eid>/<action>  → resolve | unresolve | trash
-  POST /api/planner/todo            → nieuwe to-do
+  GET  /api/planner                     → compact: uren + items
+  GET  /api/planner/week?offset=0       → deze/vorige/volgende week
+  GET  /api/planner/item/<id>?type=...  → detail van 1 item
+  POST /api/planner/<pid>/<eid>/<action>?type=...  → resolve | unresolve | trash
+  POST /api/planner/todo                → nieuwe to-do
+  GET  /api/planner/debug-userid        → diagnose user_id probleem
 
-Query params (alle optioneel):
+Query params (GET /api/planner):
   from=YYYY-MM-DD        startdatum (default: vandaag - 14d)
   to=YYYY-MM-DD          einddatum (default: vandaag + 30d)
   types=lessons|tasks|all  filter (default: all)
   limit=N                max items (default: 500, hard cap: 2000)
-  compact=1              1 = enkel de essentiële velden (default), 0 = volledig
+  compact=1              1 = enkel essentiële velden (default), 0 = volledig
+  hours=1                1 = uren meesturen (default: 1)
 
 Bandwidth optimalisaties:
-  - Geen includes=icon,courses,locations,upload-folders tenzij nodig
-  - Enkel velden die frontend gebruikt
-  - Standaard korte range (14d terug, 30d vooruit)
-  - Server-side filter op type
-  - 'compact' formaat scheelt 60-70% bytes
+  - Compact formaat: ~250 bytes/item i.p.v. ~2KB
+  - Korte veldnamen (i, n, t, df, dt, wd, dl, c, l, te, ab, col, st)
+  - Unix ms i.p.v. ISO strings
+  - Server-side type filter
+  - In-memory cache (30s TTL) per user
+  - Hard cap op range en item-aantal
 """
 
+import re
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -37,9 +42,8 @@ bp = Blueprint("planner", __name__, url_prefix="/api/planner")
 # ============================================================
 # CACHE — in-memory per user, korte TTL
 # ============================================================
-# Key: user_id → {timestamp, range_key, items}
 _CACHE = {}
-_CACHE_TTL = 30   # seconden — kort genoeg voor actualiteit, lang genoeg voor pagina-loads
+_CACHE_TTL = 30  # seconden
 
 
 def _cache_get(uid, range_key):
@@ -67,38 +71,67 @@ def _cache_invalidate(uid):
 
 
 # ============================================================
-# USER ID
+# USER ID — zelfde aanpak als je werkende lokale script
 # ============================================================
-def _get_user_id(session, base):
-    """Haal het user_id op via Homepage HTML (SMSC.authenticatedUser)."""
-    import re
+def _find_user_id(session, base):
+    """
+    Zoek user_id via Homepage HTML.
+    Retourneert het numerieke user_id (int) of None.
+    """
     try:
         r = session.request("GET", "/?module=Homepage",
                             headers={"Referer": base + "/"})
+        html = r.text
+
+        if r.status_code in (301, 302, 303, 307, 308):
+            print("[planner] Homepage redirect — sessie verlopen?",
+                  file=sys.stderr)
+            return None
+
         for pat in [
             r'"authenticatedUser"\s*:\s*\{[^}]*"id"\s*:\s*"(\d+)_(\d+)_',
             r'"userIdentifier"\s*:\s*"(\d+)_(\d+)_',
         ]:
-            m = re.search(pat, r.text)
+            m = re.search(pat, html)
             if m:
-                return f"{m.group(1)}_{m.group(2)}_0"
-    except Exception:
-        pass
-    return None
+                return int(m.group(2))
+
+        # Fallbacks
+        m = re.search(r'"userId"\s*:\s*"(\d+)_(\d+)_(\d+)"', html)
+        if m:
+            return int(m.group(2))
+
+        print("[planner] geen user_id patroon in Homepage HTML",
+              file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"[planner] _find_user_id fout: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return None
+
+
+def _get_uid(session, base):
+    """Bouw volledige uid: 'platform_userid_0'."""
+    platform = getattr(session, "platform_id", None)
+    user_num = _find_user_id(session, base)
+    if not user_num:
+        return None
+    return f"{platform}_{user_num}_0"
 
 
 # ============================================================
 # HOURS
 # ============================================================
 def _get_hours(session):
-    """Haal lesuren op (08:25 - 15:30 etc.). 7 items, klein."""
+    """Haal lesuren op. Retourneert compacte lijst."""
     try:
         from smartschool import SmartschoolHours
         return [
             {"id": h.hour_id, "s": h.start, "e": h.end, "t": h.title}
             for h in SmartschoolHours(session)
         ]
-    except Exception:
+    except Exception as e:
+        print(f"[planner] hours fout: {e}", file=sys.stderr)
         return []
 
 
@@ -110,6 +143,7 @@ def _fetch_planned_elements(session, base, uid, from_iso, to_iso):
     path = (
         f"/planner/api/v1/planned-elements/user/{uid}"
         f"?from={from_iso}&to={to_iso}"
+        f"&includes=icon,courses,locations,upload-folders"
     )
     try:
         r = session.request("GET", path, headers={
@@ -121,18 +155,29 @@ def _fetch_planned_elements(session, base, uid, from_iso, to_iso):
         })
         data = r.json()
         return data if isinstance(data, list) else []
-    except Exception:
+    except Exception as e:
+        print(f"[planner] fetch fout: {type(e).__name__}: {e}",
+              file=sys.stderr)
         return []
 
 
 # ============================================================
 # COMPACT FORMAT
 # ============================================================
+def _to_ms(iso):
+    """ISO string → unix ms (compact)."""
+    if not iso:
+        return None
+    try:
+        return int(datetime.fromisoformat(
+            iso.replace("Z", "+00:00")).timestamp() * 1000)
+    except Exception:
+        return None
+
+
 def _compact_item(it):
     """
-    Zet een volledig item om naar een compacte dict.
-    Volledig: ~2KB per item
-    Compact:  ~250 bytes per item (8x kleiner)
+    Volledig item (~2KB) → compact item (~250 bytes).
     """
     period = it.get("period") or {}
     courses = it.get("courses") or []
@@ -140,36 +185,28 @@ def _compact_item(it):
     organisers = (it.get("organisers") or {}).get("users") or []
     atype = it.get("assignmentType") or {}
 
-    # Eén teacher naam (compact)
     teacher = ""
     if organisers:
         t = organisers[0].get("name") or {}
-        teacher = t.get("startingWithLastName") or t.get("startingWithFirstName") or ""
+        teacher = (t.get("startingWithLastName")
+                   or t.get("startingWithFirstName")
+                   or "")
 
-    # Één course
     course = courses[0] if courses else {}
     course_name = course.get("name", "")
 
-    # Één location
     location = ""
     if locations:
-        location = locations[0].get("title") or locations[0].get("number") or ""
-
-    # Tijden als unix-achtige ms (compact) i.p.v. ISO strings
-    def to_ms(iso):
-        if not iso:
-            return None
-        try:
-            return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1000)
-        except Exception:
-            return None
+        location = (locations[0].get("title")
+                    or locations[0].get("number")
+                    or "")
 
     return {
         "i": it.get("id", ""),
-        "n": it.get("name", "")[:200],     # afkappen op 200 chars
+        "n": (it.get("name", "") or "")[:200],
         "t": it.get("plannedElementType", ""),
-        "df": to_ms(period.get("dateTimeFrom")),
-        "dt": to_ms(period.get("dateTimeTo")),
+        "df": _to_ms(period.get("dateTimeFrom")),
+        "dt": _to_ms(period.get("dateTimeTo")),
         "wd": 1 if period.get("wholeDay") else 0,
         "dl": 1 if period.get("deadline") else 0,
         "c": course_name,
@@ -185,10 +222,7 @@ def _compact_item(it):
 # RANGE PARSING
 # ============================================================
 def _parse_range():
-    """
-    Parse from/to uit query params.
-    Default: 14 dagen terug, 30 dagen vooruit.
-    """
+    """Parse from/to uit query params. Default: 14d terug, 30d vooruit."""
     tz = timezone(timedelta(hours=2))
     now = datetime.now(tz)
 
@@ -199,19 +233,22 @@ def _parse_range():
         try:
             from_dt = datetime.fromisoformat(from_s).replace(tzinfo=tz)
         except Exception:
-            from_dt = (now - timedelta(days=14)).replace(hour=0, minute=0, second=0, microsecond=0)
+            from_dt = (now - timedelta(days=14)).replace(
+                hour=0, minute=0, second=0, microsecond=0)
     else:
-        from_dt = (now - timedelta(days=14)).replace(hour=0, minute=0, second=0, microsecond=0)
+        from_dt = (now - timedelta(days=14)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
 
     if to_s:
         try:
             to_dt = datetime.fromisoformat(to_s).replace(tzinfo=tz)
         except Exception:
-            to_dt = (now + timedelta(days=30)).replace(hour=23, minute=59, second=59, microsecond=0)
+            to_dt = (now + timedelta(days=30)).replace(
+                hour=23, minute=59, second=59, microsecond=0)
     else:
-        to_dt = (now + timedelta(days=30)).replace(hour=23, minute=59, second=59, microsecond=0)
+        to_dt = (now + timedelta(days=30)).replace(
+            hour=23, minute=59, second=59, microsecond=0)
 
-    # Hard cap: max 1 jaar om misbruik te voorkomen
     if (to_dt - from_dt).days > 366:
         to_dt = from_dt + timedelta(days=366)
 
@@ -233,44 +270,51 @@ def planner_list(_session=None, _creds=None):
       types=lessons|tasks|all  (default: all)
       limit=N              (default: 500, max: 2000)
       compact=0|1          (default: 1)
-      hours=0|1            (default: 1) — uren meesturen
+      hours=0|1            (default: 1)
     """
     base = base_url(_creds)
-    uid = _get_user_id(_session, base)
+    uid = _get_uid(_session, base)
     if not uid:
-        return jsonify({"error": "kon user_id niet vinden"}), 500
+        return jsonify({
+            "error": "kon user_id niet vinden",
+            "hint": "check /api/planner/debug-userid voor diagnose",
+        }), 500
 
     from_dt, to_dt = _parse_range()
     types_filter = request.args.get("types", "all")
-    limit = min(int(request.args.get("limit", "500")), 2000)
+    try:
+        limit = min(int(request.args.get("limit", "500")), 2000)
+    except ValueError:
+        limit = 500
     compact = request.args.get("compact", "1") == "1"
     include_hours = request.args.get("hours", "1") == "1"
 
     from_iso = from_dt.strftime("%Y-%m-%dT%H:%M:%S+02:00")
     to_iso = to_dt.strftime("%Y-%m-%dT%H:%M:%S+02:00")
 
-    range_key = f"{from_iso}|{to_iso}"
+    range_key = f"{from_iso}|{to_iso}|{types_filter}"
 
-    # Cache check
-    raw = _cache_get(uid, range_key)
+    # Cache — bewaar raw (pre-filter) onder een aparte key
+    raw_key = f"{from_iso}|{to_iso}|raw"
+    raw = _cache_get(uid, raw_key)
     if raw is None:
-        raw = _fetch_planned_elements(_session, base, uid, from_iso, to_iso)
-        _cache_set(uid, range_key, raw)
+        raw = _fetch_planned_elements(_session, base, uid,
+                                      from_iso, to_iso)
+        _cache_set(uid, raw_key, raw)
 
     # Filter op type
     if types_filter == "lessons":
-        raw = [it for it in raw if it.get("plannedElementType") == "planned-lessons"]
+        raw = [it for it in raw
+               if it.get("plannedElementType") == "planned-lessons"]
     elif types_filter == "tasks":
-        raw = [it for it in raw if it.get("plannedElementType") != "planned-lessons"]
+        raw = [it for it in raw
+               if it.get("plannedElementType") != "planned-lessons"]
 
-    # Sort op starttijd
     raw.sort(key=lambda x: (x.get("period") or {}).get("dateTimeFrom") or "")
 
-    # Limit
     total_before_limit = len(raw)
     raw = raw[:limit]
 
-    # Compact of volledig
     if compact:
         items = [_compact_item(it) for it in raw]
     else:
@@ -298,33 +342,37 @@ def planner_list(_session=None, _creds=None):
 @with_session
 def planner_week(_session=None, _creds=None):
     """
-    Alleen deze week (maandag t/m zondag).
-    Extra compact — geen meta, geen opties.
+    Alleen deze week (maandag t/m zondag). Extra compact.
 
     Query params:
-      offset=0            0 = deze week, -1 = vorige week, +1 = volgende week
+      offset=0  0 = deze week, -1 = vorige, +1 = volgende
     """
     base = base_url(_creds)
-    uid = _get_user_id(_session, base)
+    uid = _get_uid(_session, base)
     if not uid:
         return jsonify({"error": "kon user_id niet vinden"}), 500
 
-    offset = int(request.args.get("offset", "0"))
+    try:
+        offset = int(request.args.get("offset", "0"))
+    except ValueError:
+        offset = 0
+
     tz = timezone(timedelta(hours=2))
     now = datetime.now(tz)
-    day = now.weekday()  # 0=ma
+    day = now.weekday()  # 0 = maandag
     monday = (now - timedelta(days=day) + timedelta(weeks=offset)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    sunday = (monday + timedelta(days=6)).replace(hour=23, minute=59, second=59, microsecond=0)
+        hour=0, minute=0, second=0, microsecond=0)
+    sunday = (monday + timedelta(days=6)).replace(
+        hour=23, minute=59, second=59, microsecond=0)
 
     from_iso = monday.strftime("%Y-%m-%dT%H:%M:%S+02:00")
     to_iso = sunday.strftime("%Y-%m-%dT%H:%M:%S+02:00")
 
-    range_key = f"{from_iso}|{to_iso}"
+    range_key = f"{from_iso}|{to_iso}|raw"
     raw = _cache_get(uid, range_key)
     if raw is None:
-        raw = _fetch_planned_elements(_session, base, uid, from_iso, to_iso)
+        raw = _fetch_planned_elements(_session, base, uid,
+                                      from_iso, to_iso)
         _cache_set(uid, range_key, raw)
 
     raw.sort(key=lambda x: (x.get("period") or {}).get("dateTimeFrom") or "")
@@ -343,7 +391,6 @@ def planner_week(_session=None, _creds=None):
 def planner_item_detail(element_id, _session=None, _creds=None):
     """
     Detail van 1 item. Lazy loaded.
-    Gebruikt het juiste sub-endpoint op basis van het element type.
 
     Query params:
       type=planned-to-dos|planned-assignments|planned-lessons
@@ -351,14 +398,14 @@ def planner_item_detail(element_id, _session=None, _creds=None):
     element_type = request.args.get("type", "")
     platform_id = _session.platform_id
 
-    # Bepaal sub-endpoint
     if element_type == "planned-to-dos":
         prefix = "planned-to-dos"
     elif element_type == "planned-assignments":
         prefix = "planned-assignments"
     else:
-        # Voor planned-lessons: haal uit volledige lijst
-        return jsonify({"error": "detail niet beschikbaar voor dit type"}), 400
+        return jsonify({
+            "error": f"detail niet beschikbaar voor type '{element_type}'"
+        }), 400
 
     path = f"/planner/api/v1/{prefix}/{platform_id}/{element_id}"
     try:
@@ -371,7 +418,8 @@ def planner_item_detail(element_id, _session=None, _creds=None):
         "type": element_type,
         "public_info": strip_html(data.get("publicInfo") or ""),
         "attachments": [
-            {"name": a.get("name", ""), "file_id": a.get("fileID") or a.get("id")}
+            {"name": a.get("name", ""),
+             "file_id": a.get("fileID") or a.get("id")}
             for a in (data.get("attachments") or [])
         ],
         "weblinks": [
@@ -387,12 +435,11 @@ def planner_item_detail(element_id, _session=None, _creds=None):
 def planner_item_action(platform_id, element_id, action,
                         _session=None, _creds=None):
     """
-    Voer een actie uit op een planner item.
-
+    Actie op een planner item.
     Actions: resolve | unresolve | trash
 
     Query params:
-      type=planned-to-dos|planned-assignments (verplicht, of 'auto')
+      type=planned-to-dos|planned-assignments (verplicht)
     """
     if action not in ("resolve", "unresolve", "trash"):
         return jsonify({"error": "ongeldige actie"}), 400
@@ -406,9 +453,12 @@ def planner_item_action(platform_id, element_id, action,
     elif element_type == "planned-assignments":
         prefix = "planned-assignments"
     else:
-        return jsonify({"error": f"actie niet ondersteund voor {element_type}"}), 400
+        return jsonify({
+            "error": f"actie niet ondersteund voor {element_type}"
+        }), 400
 
-    path = f"/planner/api/v1/{prefix}/{platform_id}/{element_id}/{action}"
+    path = (f"/planner/api/v1/{prefix}/{platform_id}/"
+            f"{element_id}/{action}")
     try:
         r = _session.request("POST", path)
     except Exception as e:
@@ -416,9 +466,9 @@ def planner_item_action(platform_id, element_id, action,
 
     ok = r.status_code in (200, 204)
 
-    # Invalideer cache voor deze user (data is gewijzigd)
+    # Invalideer cache
     base = base_url(_creds)
-    uid = _get_user_id(_session, base)
+    uid = _get_uid(_session, base)
     if uid:
         _cache_invalidate(uid)
 
@@ -456,18 +506,27 @@ def planner_create_todo(_session=None, _creds=None):
     color = data.get("color", "tangerine-200")
     icon = data.get("icon", "icon_fill_flag")
 
+    tz = timezone(timedelta(hours=2))
+
     dt_from_s = data.get("date_from")
     dt_to_s = data.get("date_to")
 
-    tz = timezone(timedelta(hours=2))
-
     if dt_from_s:
-        dt_from = datetime.fromisoformat(dt_from_s).replace(tzinfo=tz)
+        try:
+            dt_from = datetime.fromisoformat(dt_from_s).replace(tzinfo=tz)
+        except Exception:
+            dt_from = datetime.now(tz).replace(
+                hour=0, minute=0, second=0, microsecond=0)
     else:
-        dt_from = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+        dt_from = datetime.now(tz).replace(
+            hour=0, minute=0, second=0, microsecond=0)
 
     if dt_to_s:
-        dt_to = datetime.fromisoformat(dt_to_s).replace(tzinfo=tz, hour=23, minute=59, second=59)
+        try:
+            dt_to = datetime.fromisoformat(dt_to_s).replace(
+                tzinfo=tz, hour=23, minute=59, second=59)
+        except Exception:
+            dt_to = dt_from.replace(hour=23, minute=59, second=59)
     else:
         dt_to = dt_from.replace(hour=23, minute=59, second=59)
 
@@ -484,13 +543,13 @@ def planner_create_todo(_session=None, _creds=None):
     }
 
     try:
-        r = _session.request("POST", "/planner/api/v1/planned-to-dos/", json=body)
+        r = _session.request("POST", "/planner/api/v1/planned-to-dos/",
+                             json=body)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    # Invalideer cache
     base = base_url(_creds)
-    uid = _get_user_id(_session, base)
+    uid = _get_uid(_session, base)
     if uid:
         _cache_invalidate(uid)
 
@@ -499,3 +558,63 @@ def planner_create_todo(_session=None, _creds=None):
         "status": r.status_code,
         "response": r.text[:500],
     })
+
+
+# ============================================================
+# DEBUG — diagnose user_id probleem
+# ============================================================
+@bp.get("/debug-userid")
+@with_session
+def debug_userid(_session=None, _creds=None):
+    """
+    Diagnose endpoint: laat zien wat de Homepage HTML bevat
+    en welke patronen matchen.
+    """
+    base = base_url(_creds)
+    platform = getattr(_session, "platform_id", None)
+
+    result = {
+        "platform_id": platform,
+        "base_url": base,
+    }
+
+    try:
+        r = _session.request("GET", "/?module=Homepage",
+                             headers={"Referer": base + "/"})
+        html = r.text
+        result["status_code"] = r.status_code
+        result["html_length"] = len(html)
+        result["final_url"] = getattr(r, "url", None)
+
+        # Alle patronen testen
+        hits = {}
+        for name, pat in {
+            "authenticatedUser_id":
+                r'"authenticatedUser"\s*:\s*\{[^}]*"id"\s*:\s*"([^"]+)"',
+            "userIdentifier": r'"userIdentifier"\s*:\s*"([^"]+)"',
+            "userId_full": r'"userId"\s*:\s*"(\d+_\d+_\d+)"',
+            "userId_simple": r'"userId"\s*:\s*"?(\d+)"?',
+            "platformId": r'"platformId"\s*:\s*"?(\d+)"?',
+        }.items():
+            m = re.search(pat, html, re.IGNORECASE | re.DOTALL)
+            hits[name] = m.group(1) if m else None
+
+        result["hits"] = hits
+
+        # Wat onze _find_user_id vindt
+        result["_find_user_id_result"] = _find_user_id(_session, base)
+        result["_get_uid_result"] = _get_uid(_session, base)
+
+        # Snippet van rond "user" voorkomens
+        snippets = []
+        for m in re.finditer(r'.{0,60}(authenticatedUser|userIdentifier|userId)'
+                             r'.{0,120}', html):
+            snippets.append(m.group(0)[:200])
+            if len(snippets) >= 5:
+                break
+        result["snippets"] = snippets
+
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+
+    return jsonify(result)
