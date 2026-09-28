@@ -638,7 +638,7 @@ def _get_message_list(session, base, box_type="inbox", box_id="0"):
             "subject": msg.findtext("subject", ""),
             "date": msg.findtext("date", ""),
             "attachment": msg.findtext("attachment", "") == "1",
-            "unread": msg.findtext("unread", "") == "1",
+            "unread": msg.findtext("unread", "") == "0",
             "real_box": msg.findtext("realBox", "") or box_type,
             "is_draft": (msg.findtext("realBox", "") == "draft") or (box_type == "draft"),
         })
