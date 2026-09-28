@@ -1,9 +1,12 @@
 """
-Smartschool API — Flask app (single file, met CORS)
+Smartschool API — Flask app (stateless, multi-user, CORS)
+
+Credentials worden PER REQUEST meegestuurd via header:
+  X-SS-Creds: base64(json({"username":..,"password":..,"main_url":..,"mfa":..}))
 
 Endpoints:
-  GET    /                                    → health/info
-  GET    /ui                                  → frontend
+  POST   /api/auth/login                       → test login (geeft niets terug behalve ok)
+  GET    /api/health
   GET    /api/grades?detail=0|1
   GET    /api/grades/evaluation/<id>
   GET    /api/messages?box=inbox|outbox|trash|archive
@@ -19,15 +22,18 @@ Endpoints:
   POST   /api/planner/todo
 """
 
+import base64
+import json
 import os
 import re
 import urllib.parse
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime
+from functools import wraps
 from io import BytesIO
 
-from flask import Flask, jsonify, request, send_file, render_template
+from flask import Flask, jsonify, request, send_file
 from requests_toolbelt.multipart.encoder import MultipartEncoder
 from smartschool import (
     Smartschool, EnvCredentials, PlannedElements,
@@ -36,36 +42,119 @@ from smartschool import (
 )
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-# ============================================================
-# CONFIG — via Render Environment Variables
-# ============================================================
-USERNAME = os.environ.get("SMARTSCHOOL_USERNAME")
-PASSWORD = os.environ.get("SMARTSCHOOL_PASSWORD")
-MAIN_URL = os.environ.get("SMARTSCHOOL_MAIN_URL")
-MFA      = os.environ.get("SMARTSCHOOL_MFA")
-
-if not all([USERNAME, PASSWORD, MAIN_URL, MFA]):
-    raise RuntimeError(
-        "Ontbrekende env vars: SMARTSCHOOL_USERNAME, SMARTSCHOOL_PASSWORD, "
-        "SMARTSCHOOL_MAIN_URL, SMARTSCHOOL_MFA"
-    )
-
-os.environ["SMARTSCHOOL_USERNAME"] = USERNAME
-os.environ["SMARTSCHOOL_PASSWORD"] = PASSWORD
-os.environ["SMARTSCHOOL_MAIN_URL"] = MAIN_URL
-os.environ["SMARTSCHOOL_MFA"] = MFA
-
-BASE_URL = MAIN_URL if MAIN_URL.startswith("http") else f"https://{MAIN_URL}"
+DEFAULT_MAIN_URL = os.environ.get("SMARTSCHOOL_MAIN_URL", "")
 RESULTS_BASE = "/results/api/v1"
 
 
 # ============================================================
-# SESSION
+# APP + CORS
 # ============================================================
-def new_session() -> Smartschool:
-    s = Smartschool(EnvCredentials())
+app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+
+@app.after_request
+def add_cors(response):
+    origin = request.headers.get("Origin")
+    if origin:
+        response.headers["Access-Control-Allow-Origin"] = origin
+    else:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = (
+        "Content-Type, Authorization, X-Requested-With, X-SS-Creds"
+    )
+    response.headers["Access-Control-Max-Age"] = "86400"
+    response.headers["Vary"] = "Origin"
+    return response
+
+
+@app.route("/<path:_any>", methods=["OPTIONS"])
+@app.route("/", methods=["OPTIONS"])
+def cors_preflight(_any=None):
+    return ("", 204)
+
+
+# ============================================================
+# CREDENTIALS — per request uit header
+# ============================================================
+def _decode_creds(header_value: str) -> dict:
+    """Decodeer base64 JSON header naar creds dict."""
+    try:
+        raw = base64.b64decode(header_value).decode("utf-8")
+        data = json.loads(raw)
+    except Exception as e:
+        raise ValueError(f"Ongeldige X-SS-Creds header: {e}")
+
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    main_url = (data.get("main_url") or DEFAULT_MAIN_URL).strip()
+    mfa = (data.get("mfa") or "").strip()
+
+    if not all([username, password, main_url, mfa]):
+        raise ValueError("username, password, main_url en mfa zijn verplicht")
+
+    return {"username": username, "password": password,
+            "main_url": main_url, "mfa": mfa}
+
+
+def _session_from_creds(creds: dict) -> Smartschool:
+    """Bouw een verse Smartschool sessie. Thread-safe: gebruikt os.environ lokaal
+    binnen een lock-vrije flow omdat EnvCredentials de waarden bij constructie leest."""
+    # BELANGRIJK: we zetten env vars, EnvCredentials leest ze direct hierna.
+    # Om race-conditions te vermijden bij gelijktijdige requests gebruiken we
+    # een eigen Credentials-implementatie i.p.v. EnvCredentials.
+    class _Creds:
+        def __init__(self, u, p, m, mfa):
+            self._u, self._p, self._m, self._mfa = u, p, m, mfa
+        @property
+        def username(self): return self._u
+        @username.setter
+        def username(self, v): self._u = v
+        @property
+        def password(self): return self._p
+        @password.setter
+        def password(self, v): self._p = v
+        @property
+        def main_url(self): return self._m
+        @main_url.setter
+        def main_url(self, v): self._m = v
+        @property
+        def mfa(self): return self._mfa
+        @mfa.setter
+        def mfa(self, v): self._mfa = v
+
+    s = Smartschool(_Creds(creds["username"], creds["password"],
+                           creds["main_url"], creds["mfa"]))
     _ = s.platform_id  # forceert login
     return s
+
+
+def with_session(fn):
+    """Decorator: decodeert creds uit header, maakt sessie, injecteert als 1e arg
+    na eventuele path-args? Nee — we injecteren via kwargs `_session` en `_creds`."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        header = request.headers.get("X-SS-Creds")
+        if not header:
+            return jsonify({"error": "X-SS-Creds header ontbreekt"}), 401
+        try:
+            creds = _decode_creds(header)
+            session = _session_from_creds(creds)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        except Exception as e:
+            return jsonify({"error": f"Login mislukt: {type(e).__name__}: {e}"}), 401
+
+        kwargs["_session"] = session
+        kwargs["_creds"] = creds
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def _base_url(creds: dict) -> str:
+    mu = creds["main_url"]
+    return mu if mu.startswith("http") else f"https://{mu}"
 
 
 # ============================================================
@@ -94,48 +183,16 @@ def clean_html(text: str) -> str:
 
 
 # ============================================================
-# APP
-# ============================================================
-app = Flask(__name__)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
-
-
-# ============================================================
-# CORS — volledig open
-# ============================================================
-@app.after_request
-def add_cors(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, PUT, DELETE, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With"
-    response.headers["Access-Control-Max-Age"] = "86400"
-    return response
-
-
-@app.route("/<path:_any>", methods=["OPTIONS"])
-@app.route("/", methods=["OPTIONS"])
-def cors_preflight(_any=None):
-    return ("", 204)
-
-
-# ============================================================
-# UI
-# ============================================================
-@app.get("/ui")
-def ui():
-    return render_template("index.html")
-
-
-# ============================================================
-# HEALTH
+# ROOT + AUTH TEST
 # ============================================================
 @app.get("/")
 def index():
     return jsonify({
         "service": "smartschool-api",
         "status": "ok",
-        "ui": "/ui",
+        "auth": "stuur X-SS-Creds header (base64 JSON) bij elk request",
         "endpoints": [
+            "POST /api/auth/login",
             "GET  /api/grades?detail=0|1",
             "GET  /api/grades/evaluation/<id>",
             "GET  /api/messages?box=inbox|outbox|trash|archive",
@@ -153,22 +210,36 @@ def index():
     })
 
 
+@app.get("/api/health")
+def health():
+    return jsonify({"ok": True})
+
+
+@app.post("/api/auth/login")
+@with_session
+def auth_login(_session=None, _creds=None):
+    """Test of de credentials werken. Body wordt genegeerd — creds komen uit header."""
+    return jsonify({"ok": True,
+                    "username": _creds["username"],
+                    "main_url": _creds["main_url"]})
+
+
 # ============================================================
 # /api/grades
 # ============================================================
-def _rget(session, path):
+def _rget(session, base, path):
     r = session.request(
         "GET", path,
         headers={"Accept": "*/*", "Content-Type": "application/json",
-                 "Referer": BASE_URL + "/"},
+                 "Referer": base + "/"},
     )
     return r.json()
 
 
-def _fetch_all_evals(session):
+def _fetch_all_evals(session, base):
     items, page = [], 1
     while True:
-        batch = _rget(session, f"{RESULTS_BASE}/evaluations/?pageNumber={page}&itemsOnPage=200")
+        batch = _rget(session, base, f"{RESULTS_BASE}/evaluations/?pageNumber={page}&itemsOnPage=200")
         if not batch:
             break
         items.extend(batch)
@@ -178,9 +249,9 @@ def _fetch_all_evals(session):
     return items
 
 
-def _fetch_eval_detail(session, identifier):
+def _fetch_eval_detail(session, base, identifier):
     try:
-        return _rget(session, f"{RESULTS_BASE}/evaluations/{identifier}/")
+        return _rget(session, base, f"{RESULTS_BASE}/evaluations/{identifier}/")
     except Exception:
         return None
 
@@ -241,12 +312,13 @@ def _eval_summary(e, full=None):
 
 
 @app.get("/api/grades")
-def grades():
+@with_session
+def grades(_session=None, _creds=None):
+    base = _base_url(_creds)
     with_detail = request.args.get("detail", "0") == "1"
-    session = new_session()
 
-    courses = _rget(session, f"{RESULTS_BASE}/courses/")
-    evals = _fetch_all_evals(session)
+    courses = _rget(_session, base, f"{RESULTS_BASE}/courses/")
+    evals = _fetch_all_evals(_session, base)
     course_names = {c["id"]: c["name"] for c in courses if c.get("name") != "Totaal"}
 
     per_course = defaultdict(list)
@@ -264,7 +336,7 @@ def grades():
                  "course_name": course_names.get(cid, f"Vak {cid}"),
                  "evaluations": []}
         for e in sorted(items, key=lambda x: x.get("date", ""), reverse=True):
-            full = _fetch_eval_detail(session, e["identifier"]) if with_detail else None
+            full = _fetch_eval_detail(_session, base, e["identifier"]) if with_detail else None
             entry["evaluations"].append(_eval_summary(e, full))
         result["courses"].append(entry)
 
@@ -272,9 +344,10 @@ def grades():
 
 
 @app.get("/api/grades/evaluation/<identifier>")
-def grade_detail(identifier):
-    session = new_session()
-    full = _fetch_eval_detail(session, identifier)
+@with_session
+def grade_detail(identifier, _session=None, _creds=None):
+    base = _base_url(_creds)
+    full = _fetch_eval_detail(_session, base, identifier)
     if not full:
         return jsonify({"error": "niet gevonden"}), 404
     g = full.get("graphic", {})
@@ -314,15 +387,15 @@ def _build_command_xml(commands):
     return "\n".join(lines)
 
 
-def _dispatch(session, commands):
+def _dispatch(session, base, commands):
     xml = _build_command_xml(commands)
     encoded = urllib.parse.quote(xml, safe="")
     headers = {
         "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         "X-Requested-With": "XMLHttpRequest",
         "Accept": "*/*",
-        "Origin": BASE_URL,
-        "Referer": BASE_URL + "/",
+        "Origin": base,
+        "Referer": base + "/",
     }
     return session.request("POST", "/?module=Messages&file=dispatcher",
                            data=f"command={encoded}", headers=headers)
@@ -333,8 +406,8 @@ def _extract_tag(block, tag, default=""):
     return m.group(1).strip() if m else default
 
 
-def _get_message_list(session, box_type="inbox", box_id="0"):
-    r = _dispatch(session, [{
+def _get_message_list(session, base, box_type="inbox", box_id="0"):
+    r = _dispatch(session, base, [{
         "subsystem": "postboxes", "action": "message list",
         "params": {"boxType": box_type, "boxID": box_id,
                    "sortField": "date", "sortKey": "desc",
@@ -358,8 +431,8 @@ def _get_message_list(session, box_type="inbox", box_id="0"):
     return out
 
 
-def _get_message_full_xml(session, msg_id, box_type="inbox"):
-    r = _dispatch(session, [
+def _get_message_full_xml(session, base, msg_id, box_type="inbox"):
+    r = _dispatch(session, base, [
         {"subsystem": "postboxes", "action": "show message",
          "params": {"msgID": msg_id, "boxType": box_type, "limitList": "true"}},
         {"subsystem": "postboxes", "action": "attachment list",
@@ -414,27 +487,28 @@ def _parse_full_message(xml_text):
 
 
 @app.get("/api/messages")
-def messages_list():
+@with_session
+def messages_list(_session=None, _creds=None):
     box = request.args.get("box", "inbox")
-    session = new_session()
-    return jsonify({"box": box, "messages": _get_message_list(session, box)})
+    return jsonify({"box": box, "messages": _get_message_list(_session, _base_url(_creds), box)})
 
 
 @app.get("/api/messages/<msg_id>")
-def message_read(msg_id):
+@with_session
+def message_read(msg_id, _session=None, _creds=None):
     box = request.args.get("box", "inbox")
-    session = new_session()
-    xml_text = _get_message_full_xml(session, msg_id, box)
+    xml_text = _get_message_full_xml(_session, _base_url(_creds), msg_id, box)
     return jsonify(_parse_full_message(xml_text))
 
 
 @app.get("/api/messages/<msg_id>/attachment/<file_id>")
-def message_attachment(msg_id, file_id):
-    session = new_session()
+@with_session
+def message_attachment(msg_id, file_id, _session=None, _creds=None):
+    base = _base_url(_creds)
     url = f"/?module=Messages&file=download&fileID={file_id}&target=0"
-    r = session.request("GET", url,
-                        headers={"Referer": BASE_URL + "/"},
-                        allow_redirects=True)
+    r = _session.request("GET", url,
+                         headers={"Referer": base + "/"},
+                         allow_redirects=True)
     if r.status_code != 200:
         return jsonify({"error": f"status {r.status_code}"}), 502
     return send_file(BytesIO(r.content), as_attachment=True,
@@ -443,17 +517,17 @@ def message_attachment(msg_id, file_id):
 
 
 @app.post("/api/messages/<msg_id>/action")
-def message_action(msg_id):
+@with_session
+def message_action(msg_id, _session=None, _creds=None):
     data = request.get_json(force=True, silent=True) or {}
     action = data.get("action")
-    session = new_session()
     try:
         if action == "unread":
-            list(MarkMessageUnread(session, msg_id=int(msg_id)))
+            list(MarkMessageUnread(_session, msg_id=int(msg_id)))
         elif action == "archive":
-            list(MessageMoveToArchive(session, msg_id=int(msg_id)))
+            list(MessageMoveToArchive(_session, msg_id=int(msg_id)))
         elif action == "trash":
-            list(MessageMoveToTrash(session, msg_id=int(msg_id)))
+            list(MessageMoveToTrash(_session, msg_id=int(msg_id)))
         elif action == "label":
             label_map = {"red": MessageLabel.RED_FLAG,
                          "green": MessageLabel.GREEN_FLAG,
@@ -463,7 +537,7 @@ def message_action(msg_id):
             label = label_map.get(data.get("label", "none"))
             if not label:
                 return jsonify({"error": "onbekend label"}), 400
-            list(AdjustMessageLabel(session, msg_id=int(msg_id), label=label))
+            list(AdjustMessageLabel(_session, msg_id=int(msg_id), label=label))
         else:
             return jsonify({"error": "onbekende actie"}), 400
         return jsonify({"ok": True, "action": action})
@@ -472,7 +546,7 @@ def message_action(msg_id):
 
 
 # --- verzenden ---
-def _get_compose_tokens(session):
+def _get_compose_tokens(session, base):
     r = session.request(
         "GET",
         "/?module=Messages&file=composeMessage&boxType=inbox&composeType=0&msgID=undefined",
@@ -487,7 +561,7 @@ def _get_compose_tokens(session):
     }
 
 
-def _search_users(session, query, unique_usc, search_type=0):
+def _search_users(session, base, query, unique_usc, search_type=0):
     parent = f"insertSearchFieldContainer_{search_type}_0"
     r = session.request(
         "POST", "/?module=Messages&file=searchUsers",
@@ -497,7 +571,7 @@ def _search_users(session, query, unique_usc, search_type=0):
               "uniqueUsc": unique_usc},
         headers={"Content-Type": "application/x-www-form-urlencoded",
                  "X-Requested-With": "XMLHttpRequest",
-                 "Origin": BASE_URL, "Referer": BASE_URL + "/"},
+                 "Origin": base, "Referer": base + "/"},
     )
     users = []
     for um in re.finditer(r"<user>(.*?)</user>", r.text, re.DOTALL):
@@ -515,7 +589,7 @@ def _search_users(session, query, unique_usc, search_type=0):
     return users
 
 
-def _add_user_to_selected(session, user_id, unique_usc, dropped_type,
+def _add_user_to_selected(session, base, user_id, unique_usc, dropped_type,
                           ssid="455", userlt="0"):
     parent = f"insertSearchFieldContainer_{dropped_type}_0"
     return session.request(
@@ -525,7 +599,7 @@ def _add_user_to_selected(session, user_id, unique_usc, dropped_type,
               "uniqueUsc": unique_usc},
         headers={"Content-Type": "application/x-www-form-urlencoded",
                  "X-Requested-With": "XMLHttpRequest",
-                 "Origin": BASE_URL, "Referer": BASE_URL + "/"},
+                 "Origin": base, "Referer": base + "/"},
     ).text
 
 
@@ -550,18 +624,20 @@ def _build_receiver_xml(users, receiver_type):
 
 
 @app.get("/api/messages/search-users")
-def messages_search_users():
+@with_session
+def messages_search_users(_session=None, _creds=None):
     q = request.args.get("q", "").strip()
     st = int(request.args.get("type", 0))
     if not q:
         return jsonify({"error": "q verplicht"}), 400
-    session = new_session()
-    tokens = _get_compose_tokens(session)
-    return jsonify({"query": q, "users": _search_users(session, q, tokens["unique_usc"], st)})
+    base = _base_url(_creds)
+    tokens = _get_compose_tokens(_session, base)
+    return jsonify({"query": q, "users": _search_users(_session, base, q, tokens["unique_usc"], st)})
 
 
 @app.post("/api/messages/send")
-def messages_send():
+@with_session
+def messages_send(_session=None, _creds=None):
     data = request.get_json(force=True, silent=True) or {}
     subject = data.get("subject")
     message = data.get("message")
@@ -573,8 +649,8 @@ def messages_send():
     if not subject or not message or not to_users:
         return jsonify({"error": "subject, message en to zijn verplicht"}), 400
 
-    session = new_session()
-    tokens = _get_compose_tokens(session)
+    base = _base_url(_creds)
+    tokens = _get_compose_tokens(_session, base)
     if not tokens["random_dir"]:
         return jsonify({"error": "kon tokens niet ophalen"}), 500
 
@@ -583,7 +659,7 @@ def messages_send():
             is_co = u.get("is_co_account", False)
             dropped = DROPPED_TYPE[(role_idx, is_co)]
             userlt = "2" if is_co else "0"
-            _add_user_to_selected(session, u["user_id"], tokens["unique_usc"],
+            _add_user_to_selected(_session, base, u["user_id"], tokens["unique_usc"],
                                   dropped, ssid=u.get("ss_id", "455"),
                                   userlt=userlt)
 
@@ -604,12 +680,12 @@ def messages_send():
         fields["receiverPart2"] = _build_receiver_xml(bcc_users, 2)
 
     m = MultipartEncoder(fields=fields)
-    r = session.request(
+    r = _session.request(
         "POST",
         "/?module=Messages&file=composeMessage&boxType=inbox&composeType=0&msgID=undefined",
         data=m,
-        headers={"Content-Type": m.content_type, "Origin": BASE_URL,
-                 "Referer": BASE_URL + "/"},
+        headers={"Content-Type": m.content_type, "Origin": base,
+                 "Referer": base + "/"},
         allow_redirects=True,
     )
     return jsonify({"ok": r.status_code == 200,
@@ -644,9 +720,9 @@ def _get_profile(session):
 
 
 @app.get("/api/profile")
-def profile_read():
-    session = new_session()
-    fields = _get_profile(session)
+@with_session
+def profile_read(_session=None, _creds=None):
+    fields = _get_profile(_session)
     return jsonify({
         "fields": {k: {"value": v["value"], "readonly": v["readonly"], "type": v["type"]}
                    for k, v in fields.items() if not k.startswith("_")}
@@ -654,14 +730,15 @@ def profile_read():
 
 
 @app.patch("/api/profile")
-def profile_update():
+@with_session
+def profile_update(_session=None, _creds=None):
     data = request.get_json(force=True, silent=True) or {}
     changes = data.get("changes") or {}
     if not changes:
         return jsonify({"error": "changes verplicht"}), 400
 
-    session = new_session()
-    fields = _get_profile(session)
+    base = _base_url(_creds)
+    fields = _get_profile(_session)
 
     form = {"action": "store"}
     for name, info in fields.items():
@@ -676,14 +753,14 @@ def profile_update():
             continue
         form[k] = v
 
-    r = session.request(
+    r = _session.request(
         "POST", PROFILE_PATH, data=form,
         headers={"Content-Type": "application/x-www-form-urlencoded",
-                 "Origin": BASE_URL, "Referer": BASE_URL + PROFILE_PATH},
+                 "Origin": base, "Referer": base + PROFILE_PATH},
         allow_redirects=True,
     )
 
-    new_fields = _get_profile(session)
+    new_fields = _get_profile(_session)
     applied = {k: v for k, v in changes.items()
                if new_fields.get(k, {}).get("value") == v}
 
@@ -742,15 +819,15 @@ def _planner_action(session, el, action):
 
 
 @app.get("/api/planner")
-def planner_list():
+@with_session
+def planner_list(_session=None, _creds=None):
     with_detail = request.args.get("detail", "0") == "1"
-    session = new_session()
-    elements = list(PlannedElements(session))
+    elements = list(PlannedElements(_session))
     out = []
     for el in elements:
         d = _element_dict(el)
         if with_detail:
-            detail = _planner_detail(session, el) or {}
+            detail = _planner_detail(_session, el) or {}
             d["info"] = strip_html(detail.get("publicInfo") or "")
             d["attachments"] = [{"name": a.get("name")}
                                 for a in (detail.get("attachments") or [])]
@@ -760,11 +837,11 @@ def planner_list():
 
 
 @app.post("/api/planner/<platform_id>/<element_id>/<action>")
-def planner_item_action(platform_id, element_id, action):
+@with_session
+def planner_item_action(platform_id, element_id, action, _session=None, _creds=None):
     if action not in ("resolve", "unresolve", "trash"):
         return jsonify({"error": "ongeldige actie"}), 400
-    session = new_session()
-    elements = list(PlannedElements(session))
+    elements = list(PlannedElements(_session))
     target = None
     for el in elements:
         if str(el.platform_id) == str(platform_id) and str(el.id) == str(element_id):
@@ -772,12 +849,13 @@ def planner_item_action(platform_id, element_id, action):
             break
     if not target:
         return jsonify({"error": "element niet gevonden"}), 404
-    ok = _planner_action(session, target, action)
+    ok = _planner_action(_session, target, action)
     return jsonify({"ok": ok, "action": action})
 
 
 @app.post("/api/planner/todo")
-def planner_create_todo():
+@with_session
+def planner_create_todo(_session=None, _creds=None):
     data = request.get_json(force=True, silent=True) or {}
     name = data.get("name")
     if not name:
@@ -806,9 +884,8 @@ def planner_create_todo():
             "wholeDay": data.get("whole_day", True),
         },
     }
-    session = new_session()
     try:
-        r = session.request("POST", "/planner/api/v1/planned-to-dos/", json=body)
+        r = _session.request("POST", "/planner/api/v1/planned-to-dos/", json=body)
         return jsonify({"ok": r.status_code in (200, 201),
                         "status": r.status_code,
                         "response": r.text[:500]})
@@ -826,4 +903,4 @@ def on_error(e):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
