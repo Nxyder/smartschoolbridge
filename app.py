@@ -226,7 +226,6 @@ def auth_login(_session=None, _creds=None):
 # UPLOAD — lokale cleanup + fallback server
 # ============================================================
 def _cleanup_old_uploads():
-    """Verwijder lokale uploads ouder dan 24 uur."""
     try:
         now = time.time()
         for f in UPLOAD_DIR.iterdir():
@@ -240,7 +239,6 @@ def _cleanup_old_uploads():
 
 
 def _save_local_upload(filename, content):
-    """Sla een bestand lokaal op. Retourneert publieke URL via /files/<name>."""
     _cleanup_old_uploads()
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", filename)
     token = secrets.token_hex(8)
@@ -268,7 +266,6 @@ def _save_local_upload(filename, content):
 
 @app.get("/files/<path:name>")
 def serve_local_file(name):
-    """Serveer een lokaal opgeslagen bestand (24u TTL)."""
     _cleanup_old_uploads()
     safe = re.sub(r"[^A-Za-z0-9._-]", "", name)
     if safe != name or ".." in name:
@@ -287,7 +284,6 @@ def serve_local_file(name):
 @app.post("/api/upload")
 @with_session
 def upload_file(_session=None, _creds=None):
-    """Upload bestand: probeert catbox.moe, valt terug op lokale opslag."""
     if "file" not in request.files:
         return jsonify({"error": "geen 'file'"}), 400
     f = request.files["file"]
@@ -301,7 +297,6 @@ def upload_file(_session=None, _creds=None):
     mime = f.mimetype or "application/octet-stream"
     is_image = mime.startswith("image/")
 
-    # Poging 1: catbox
     try:
         r = _requests.post(
             "https://catbox.moe/user/api.php",
@@ -321,7 +316,6 @@ def upload_file(_session=None, _creds=None):
     except Exception as e:
         print(f"[upload] catbox exception: {type(e).__name__}: {e}")
 
-    # Poging 2: lokale server opslag
     try:
         result = _save_local_upload(f.filename, content)
         result["mime"] = mime
@@ -349,7 +343,6 @@ def upload_file_alias(_session=None, _creds=None):
 @app.post("/api/upload-smartschool")
 @with_session
 def upload_smartschool(_session=None, _creds=None):
-    """Upload naar Smartschool's eigen /TinyMCE/Upload endpoint."""
     if "file" not in request.files:
         return jsonify({"error": "geen 'file'"}), 400
     f = request.files["file"]
@@ -413,7 +406,6 @@ def upload_smartschool(_session=None, _creds=None):
 
 
 def _upload_fallback(filename, content, mime):
-    """Fallback: probeer catbox, anders lokale opslag."""
     try:
         r = _requests.post(
             "https://catbox.moe/user/api.php",
@@ -729,6 +721,33 @@ def message_read(msg_id, _session=None, _creds=None):
     return jsonify(_parse_full_message(xml_text))
 
 
+@app.post("/api/messages/<msg_id>/read")
+@with_session
+def message_mark_read(msg_id, _session=None, _creds=None):
+    """Markeer een bericht als gelezen (action 'mark message read')."""
+    base = _base_url(_creds)
+    box = request.args.get("box", "inbox")
+    try:
+        r = _dispatch(_session, base, [{
+            "subsystem": "postboxes",
+            "action": "mark message read",
+            "params": {
+                "msgID": msg_id,
+                "boxType": box,
+                "limitList": "true",
+            },
+        }])
+        body = r.text
+        ok = "<status>ok</status>" in body
+        return jsonify({
+            "ok": ok,
+            "status": r.status_code,
+            "response": body[:300],
+        })
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+
 # ============================================================
 # DRAFTS (concepten)
 # ============================================================
@@ -739,25 +758,21 @@ def _get_draft_tokens(session, base, draft_id):
     r = session.request("GET", url)
     html = r.text
 
-    # Tokens uit <input> velden
     fields = {}
     for m in re.finditer(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>', html):
         fields[m.group(1)] = m.group(2)
 
-    # Body uit de textarea name="message"
     body = ""
     m = re.search(r'<textarea[^>]*name="message"[^>]*>(.*?)</textarea>',
                   html, re.DOTALL | re.IGNORECASE)
     if m:
         body = m.group(1)
 
-    # Decodeer HTML entities (&lt;p&gt; → <p>)
     if body:
         body = (body.replace("&lt;", "<").replace("&gt;", ">")
                     .replace("&quot;", '"').replace("&#39;", "'")
                     .replace("&amp;", "&").replace("&nbsp;", " "))
 
-    # Ontvangers parsen uit receiverSpan elementen
     receivers = {"to": [], "cc": [], "bcc": []}
     pattern = re.compile(
         r'<div[^>]*class="[^"]*receiverSpan[^"]*"[^>]*>'
@@ -780,7 +795,6 @@ def _get_draft_tokens(session, base, draft_id):
         if not real_id_m:
             continue
 
-        # Naam (accepteer " en ' als quote)
         name = ""
         name_match = re.search(
             r"""<div[^>]*class=["']receiverSpanName[^"']*["'][^>]*>(.*?)</div>""",
