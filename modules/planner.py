@@ -71,39 +71,83 @@ def _cache_invalidate(uid):
 
 
 # ============================================================
-# USER ID — zelfde aanpak als je werkende lokale script
+# HTML UNESCAPE — Smartschool stuurt \uXXXX escapes
+# ============================================================
+def _unescape_html(html):
+    """
+    Smartschool stuurt JSON-encoded HTML met \\uXXXX escapes.
+    Zet die om naar echte karakters voor regex matching.
+
+    Bv:  \\u0022authenticatedUser\\u0022\\u003A\\u007B\\u0022id\\u0022
+    →    "authenticatedUser":{"id"
+    """
+    if not html:
+        return html
+    return re.sub(
+        r'\\u([0-9a-fA-F]{4})',
+        lambda m: chr(int(m.group(1), 16)),
+        html,
+    )
+
+
+# ============================================================
+# USER ID — meerdere strategieën, unescape-aware
 # ============================================================
 def _find_user_id(session, base):
     """
     Zoek user_id via Homepage HTML.
     Retourneert het numerieke user_id (int) of None.
+
+    Smartschool stuurt de HTML met \\uXXXX escapes, dus we
+    proberen zowel de raw als de unescaped versie.
     """
     try:
         r = session.request("GET", "/?module=Homepage",
                             headers={"Referer": base + "/"})
         html = r.text
 
+        # Redirect = sessie verlopen
         if r.status_code in (301, 302, 303, 307, 308):
             print("[planner] Homepage redirect — sessie verlopen?",
                   file=sys.stderr)
             return None
 
-        for pat in [
+        if not html:
+            print("[planner] Homepage HTML is leeg", file=sys.stderr)
+            return None
+
+        # Probeer zowel unescaped als raw
+        html_clean = _unescape_html(html)
+
+        patterns = [
+            # authenticatedUser.id = "P_U_Z"
             r'"authenticatedUser"\s*:\s*\{[^}]*"id"\s*:\s*"(\d+)_(\d+)_',
+            # userIdentifier = "P_U_Z"
             r'"userIdentifier"\s*:\s*"(\d+)_(\d+)_',
-        ]:
-            m = re.search(pat, html)
+            # userId = "P_U_Z"
+            r'"userId"\s*:\s*"(\d+)_(\d+)_(\d+)"',
+        ]
+
+        for source in (html_clean, html):
+            for pat in patterns:
+                m = re.search(pat, source)
+                if m:
+                    return int(m.group(2))
+
+        # Laatste fallback: met platform_id uit sessie
+        platform = getattr(session, "platform_id", None)
+        if platform:
+            m = re.search(rf'{platform}_(\d+)_0', html_clean)
             if m:
-                return int(m.group(2))
+                return int(m.group(1))
+            m = re.search(rf'{platform}_(\d+)_0', html)
+            if m:
+                return int(m.group(1))
 
-        # Fallbacks
-        m = re.search(r'"userId"\s*:\s*"(\d+)_(\d+)_(\d+)"', html)
-        if m:
-            return int(m.group(2))
-
-        print("[planner] geen user_id patroon in Homepage HTML",
-              file=sys.stderr)
+        print("[planner] geen user_id patroon in Homepage HTML "
+              f"(html length: {len(html)})", file=sys.stderr)
         return None
+
     except Exception as e:
         print(f"[planner] _find_user_id fout: {type(e).__name__}: {e}",
               file=sys.stderr)
@@ -114,7 +158,7 @@ def _get_uid(session, base):
     """Bouw volledige uid: 'platform_userid_0'."""
     platform = getattr(session, "platform_id", None)
     user_num = _find_user_id(session, base)
-    if not user_num:
+    if not user_num or not platform:
         return None
     return f"{platform}_{user_num}_0"
 
@@ -131,7 +175,8 @@ def _get_hours(session):
             for h in SmartschoolHours(session)
         ]
     except Exception as e:
-        print(f"[planner] hours fout: {e}", file=sys.stderr)
+        print(f"[planner] hours fout: {type(e).__name__}: {e}",
+              file=sys.stderr)
         return []
 
 
@@ -202,7 +247,7 @@ def _compact_item(it):
                     or "")
 
     return {
-        "i": it.get("id", ""),
+        "i": str(it.get("id", "") or ""),
         "n": (it.get("name", "") or "")[:200],
         "t": it.get("plannedElementType", ""),
         "df": _to_ms(period.get("dateTimeFrom")),
@@ -292,9 +337,7 @@ def planner_list(_session=None, _creds=None):
     from_iso = from_dt.strftime("%Y-%m-%dT%H:%M:%S+02:00")
     to_iso = to_dt.strftime("%Y-%m-%dT%H:%M:%S+02:00")
 
-    range_key = f"{from_iso}|{to_iso}|{types_filter}"
-
-    # Cache — bewaar raw (pre-filter) onder een aparte key
+    # Cache raw (pre-filter)
     raw_key = f"{from_iso}|{to_iso}|raw"
     raw = _cache_get(uid, raw_key)
     if raw is None:
@@ -368,12 +411,12 @@ def planner_week(_session=None, _creds=None):
     from_iso = monday.strftime("%Y-%m-%dT%H:%M:%S+02:00")
     to_iso = sunday.strftime("%Y-%m-%dT%H:%M:%S+02:00")
 
-    range_key = f"{from_iso}|{to_iso}|raw"
-    raw = _cache_get(uid, range_key)
+    raw_key = f"{from_iso}|{to_iso}|raw"
+    raw = _cache_get(uid, raw_key)
     if raw is None:
         raw = _fetch_planned_elements(_session, base, uid,
                                       from_iso, to_iso)
-        _cache_set(uid, range_key, raw)
+        _cache_set(uid, raw_key, raw)
 
     raw.sort(key=lambda x: (x.get("period") or {}).get("dateTimeFrom") or "")
     items = [_compact_item(it) for it in raw]
@@ -466,7 +509,6 @@ def planner_item_action(platform_id, element_id, action,
 
     ok = r.status_code in (200, 204)
 
-    # Invalideer cache
     base = base_url(_creds)
     uid = _get_uid(_session, base)
     if uid:
@@ -586,29 +628,37 @@ def debug_userid(_session=None, _creds=None):
         result["html_length"] = len(html)
         result["final_url"] = getattr(r, "url", None)
 
-        # Alle patronen testen
+        # Unescape voor de zekerheid
+        html_clean = _unescape_html(html)
+
+        # Test patronen op beide versies
         hits = {}
-        for name, pat in {
+        patterns = {
             "authenticatedUser_id":
                 r'"authenticatedUser"\s*:\s*\{[^}]*"id"\s*:\s*"([^"]+)"',
             "userIdentifier": r'"userIdentifier"\s*:\s*"([^"]+)"',
             "userId_full": r'"userId"\s*:\s*"(\d+_\d+_\d+)"',
             "userId_simple": r'"userId"\s*:\s*"?(\d+)"?',
             "platformId": r'"platformId"\s*:\s*"?(\d+)"?',
-        }.items():
-            m = re.search(pat, html, re.IGNORECASE | re.DOTALL)
-            hits[name] = m.group(1) if m else None
+        }
+
+        for name, pat in patterns.items():
+            m_clean = re.search(pat, html_clean, re.IGNORECASE | re.DOTALL)
+            m_raw = re.search(pat, html, re.IGNORECASE | re.DOTALL)
+            hits[name] = {
+                "unescaped": m_clean.group(1) if m_clean else None,
+                "raw": m_raw.group(1) if m_raw else None,
+            }
 
         result["hits"] = hits
-
-        # Wat onze _find_user_id vindt
         result["_find_user_id_result"] = _find_user_id(_session, base)
         result["_get_uid_result"] = _get_uid(_session, base)
 
-        # Snippet van rond "user" voorkomens
+        # Snippets van rond user voorkomens
         snippets = []
-        for m in re.finditer(r'.{0,60}(authenticatedUser|userIdentifier|userId)'
-                             r'.{0,120}', html):
+        for m in re.finditer(
+            r'.{0,60}(authenticatedUser|userIdentifier|userId)'
+            r'.{0,120}', html_clean):
             snippets.append(m.group(0)[:200])
             if len(snippets) >= 5:
                 break
