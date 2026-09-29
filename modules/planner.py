@@ -4,24 +4,37 @@ Planner endpoints — webversie.
 API structuur:
   GET  /api/planner                     → compact: uren + items
   GET  /api/planner/week?offset=0       → week + aanvulling lege uren
+  GET  /api/planner/todos?scope=open    → enkel taken (snel)
   GET  /api/planner/item/<id>?type=...  → detail van 1 item
   POST /api/planner/<pid>/<eid>/<action>?type=...  → resolve | unresolve | trash
   POST /api/planner/todo                → nieuwe to-do
   GET  /api/planner/my-class            → detecteer klas
 
-Query params (/api/planner/week):
-  offset=0            0 = deze week, -1 = vorige, +1 = volgende
-  placeholders=0      1 = placeholders meesturen
-  fill=1              1 = lege uren opvullen (default)
+Query params (/api/planner):
+  from=YYYY-MM-DD        startdatum (default: vandaag - 14d)
+  to=YYYY-MM-DD          einddatum (default: vandaag + 30d)
+  types=lessons|tasks|all
+  limit=N                (default: 500, max: 2000)
+  compact=0|1            (default: 1)
+  hours=0|1              (default: 1)
+  placeholders=0|1       (default: 0)
 
-Belangrijke features:
+Query params (/api/planner/week):
+  offset=0               0 = deze week, -1 = vorige, +1 = volgende
+  placeholders=0|1
+  fill=0|1               (default: 1)
+
+Query params (/api/planner/todos):
+  scope=open|today|week|month|all   (default: open = 7d terug, 7d vooruit)
+  limit=N                            (default: 100, max: 500)
+
+Features:
   - URL-encoding van +02:00 in from/to ISO strings
   - Unicode unescape van Homepage HTML (\\u0022 → ")
   - Placeholders standaard verborgen
   - Klas-detectie via schoolrooster (gecached 1u)
-  - Aanvulling lege uren uit schoolrooster
-  - Examen-detectie (3 criteria)
-  - Hele-dag activiteiten blokkeren NIET — lessen blijven zichtbaar
+  - Aanvulling lege uren uit schoolrooster (geen blokkade)
+  - Examen-detectie
 """
 
 import json
@@ -526,7 +539,6 @@ def _is_exam_week(items, klas_score, match_ratio):
 
 # ============================================================
 # LEGE UREN OP VULLEN
-# ⭐ Geen blokkade — lessen altijd zichtbaar
 # ============================================================
 def _fill_empty_slots(items, klas_naam, rooster, week_start):
     """
@@ -559,7 +571,6 @@ def _fill_empty_slots(items, klas_naam, rooster, week_start):
     lkr_code_naar_naam = {l.get("Code", ""): l.get("DisplayName", "")
                           for l in rooster.get("Leerkrachten", [])}
 
-    # Bezet door bestaande items
     bezet = set()
     for it in items:
         period = it.get("period") or {}
@@ -620,7 +631,6 @@ def _build_week_response(session, base, uid, monday, include_hours=True,
     from_iso = monday.strftime("%Y-%m-%dT%H:%M:%S+02:00")
     to_iso = sunday.strftime("%Y-%m-%dT%H:%M:%S+02:00")
 
-    # Cache raw
     raw_key = f"{from_iso}|{to_iso}|raw"
     raw = _cache_get(uid, raw_key)
     if raw is None:
@@ -630,7 +640,6 @@ def _build_week_response(session, base, uid, monday, include_hours=True,
 
     filtered = _filter_placeholders(raw, include_placeholders)
 
-    # Klas + rooster
     rooster = _fetch_school_rooster()
     klas = None
     score = 0.0
@@ -639,12 +648,9 @@ def _build_week_response(session, base, uid, monday, include_hours=True,
     examen_reden = ""
 
     if rooster:
-        # ⭐ Gebruik cache — klas 1x detecteren op basis van huidige week
         klas, score = _get_cached_class(session, base, uid)
-
         if klas:
             match_ratio = _planner_matches_rooster(filtered, klas, rooster)
-
         examen, examen_reden = _is_exam_week(filtered, score, match_ratio)
 
         if examen and do_fill:
@@ -654,10 +660,8 @@ def _build_week_response(session, base, uid, monday, include_hours=True,
             else:
                 do_fill = False
 
-    # Compact
     items = [_compact_item(it) for it in filtered]
 
-    # Aanvulling
     filled = []
     if do_fill and klas:
         filled = _fill_empty_slots(filtered, klas, rooster, monday)
@@ -755,14 +759,7 @@ def planner_list(_session=None, _creds=None):
 @bp.get("/week")
 @with_session
 def planner_week(_session=None, _creds=None):
-    """
-    Deze/vorige/volgende week met aanvulling lege uren.
-
-    Query params:
-      offset=0        0 = deze week, -1 = vorige, +1 = volgende
-      placeholders=0  1 = placeholders meesturen
-      fill=1          1 = lege uren opvullen (default)
-    """
+    """Deze/vorige/volgende week met aanvulling."""
     base = base_url(_creds)
     uid = _get_uid(_session, base)
     if not uid:
@@ -789,6 +786,99 @@ def planner_week(_session=None, _creds=None):
         do_fill=do_fill,
     )
     return jsonify(result)
+
+
+# ============================================================
+# ROUTE — TODOS (snel)
+# ============================================================
+@bp.get("/todos")
+@with_session
+def planner_todos(_session=None, _creds=None):
+    """
+    Enkel taken/opdrachten, snel en compact.
+
+    Query params:
+      scope=open|today|week|month|all
+        open  = 7 dagen terug tot 7 dagen vooruit (default)
+        today = vandaag
+        week  = deze week (ma-zo)
+        month = deze maand
+        all   = 30 dagen terug tot 180 dagen vooruit
+      limit=N (default 100, max 500)
+    """
+    base = base_url(_creds)
+    uid = _get_uid(_session, base)
+    if not uid:
+        return jsonify({"error": "kon user_id niet vinden"}), 500
+
+    scope = request.args.get("scope", "open")
+    try:
+        limit = min(int(request.args.get("limit", "100")), 500)
+    except ValueError:
+        limit = 100
+
+    tz = timezone(timedelta(hours=2))
+    now = datetime.now(tz)
+
+    if scope == "today":
+        from_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        to_dt = from_dt + timedelta(days=1)
+    elif scope == "week":
+        from_dt = (now - timedelta(days=now.weekday())).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        to_dt = from_dt + timedelta(days=7)
+    elif scope == "month":
+        from_dt = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        to_dt = from_dt + timedelta(days=31)
+    elif scope == "all":
+        from_dt = (now - timedelta(days=30)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        to_dt = (now + timedelta(days=180)).replace(
+            hour=23, minute=59, second=59, microsecond=0)
+    else:  # open (default) — 7 dagen terug, 7 dagen vooruit
+        from_dt = (now - timedelta(days=7)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        to_dt = (now + timedelta(days=7)).replace(
+            hour=23, minute=59, second=59, microsecond=0)
+
+    from_iso = from_dt.strftime("%Y-%m-%dT%H:%M:%S+02:00")
+    to_iso = to_dt.strftime("%Y-%m-%dT%H:%M:%S+02:00")
+
+    raw_key = f"{from_iso}|{to_iso}|raw"
+    raw = _cache_get(uid, raw_key)
+    if raw is None:
+        raw = _fetch_planned_elements(_session, base, uid,
+                                      from_iso, to_iso)
+        _cache_set(uid, raw_key, raw)
+
+    # Enkel taken (geen lessen/placeholders)
+    tasks = [it for it in raw
+             if it.get("plannedElementType") in
+             ("planned-to-dos", "planned-assignments")]
+
+    items = [_compact_item(it) for it in tasks]
+
+    # Sorteer: open eerst, dan op datum
+    items.sort(key=lambda x: (
+        1 if x["st"] == "resolved" else 0,
+        x["df"] or 0,
+    ))
+
+    items = items[:limit]
+
+    open_count = sum(1 for it in items if it["st"] != "resolved")
+
+    return jsonify({
+        "meta": {
+            "count": len(items),
+            "open_count": open_count,
+            "scope": scope,
+            "from": from_iso,
+            "to": to_iso,
+            "user_id": uid,
+        },
+        "items": items,
+    })
 
 
 # ============================================================
@@ -944,7 +1034,7 @@ def planner_create_todo(_session=None, _creds=None):
 @bp.get("/my-class")
 @with_session
 def planner_my_class(_session=None, _creds=None):
-    """Detecteer de klas via schoolrooster matching."""
+    """Detecteer klas via schoolrooster matching."""
     base = base_url(_creds)
     uid = _get_uid(_session, base)
     if not uid:
@@ -957,7 +1047,6 @@ def planner_my_class(_session=None, _creds=None):
             "score": round(score, 3),
         }), 404
 
-    # Voor match_ratio + examen check
     tz = timezone(timedelta(hours=2))
     now = datetime.now(tz)
     day = now.weekday()
