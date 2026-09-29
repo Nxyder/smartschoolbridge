@@ -3,29 +3,25 @@ Planner endpoints — webversie.
 
 API structuur:
   GET  /api/planner                     → compact: uren + items
-  GET  /api/planner/week?offset=0       → deze/vorige/volgende week + aanvulling
+  GET  /api/planner/week?offset=0       → week + aanvulling lege uren
   GET  /api/planner/item/<id>?type=...  → detail van 1 item
   POST /api/planner/<pid>/<eid>/<action>?type=...  → resolve | unresolve | trash
   POST /api/planner/todo                → nieuwe to-do
   GET  /api/planner/my-class            → detecteer klas
 
-Query params:
-  from=YYYY-MM-DD        startdatum (default: vandaag - 14d)
-  to=YYYY-MM-DD          einddatum (default: vandaag + 30d)
-  types=lessons|tasks|all  filter (default: all)
-  limit=N                max items (default: 500, hard cap: 2000)
-  compact=1              1 = enkel essentiële velden (default), 0 = volledig
-  hours=1                1 = uren meesturen (default: 1)
-  placeholders=0         1 = placeholders meesturen (default: 0)
-  fill=1                 1 = lege uren opvullen uit schoolrooster (default: 1)
+Query params (/api/planner/week):
+  offset=0            0 = deze week, -1 = vorige, +1 = volgende
+  placeholders=0      1 = placeholders meesturen
+  fill=1              1 = lege uren opvullen (default)
 
-Belangrijke fixes:
-  - URL-encoding van +02:00 in from/to ISO strings (quote)
+Belangrijke features:
+  - URL-encoding van +02:00 in from/to ISO strings
   - Unicode unescape van Homepage HTML (\\u0022 → ")
   - Placeholders standaard verborgen
-  - Klas-detectie via schoolrooster matching
-  - Aanvulling lege uren
-  - Examen-detectie
+  - Klas-detectie via schoolrooster (gecached 1u)
+  - Aanvulling lege uren uit schoolrooster
+  - Examen-detectie (3 criteria)
+  - Hele-dag activiteiten blokkeren NIET — lessen blijven zichtbaar
 """
 
 import json
@@ -71,7 +67,7 @@ UUR_TIJDEN = {
 
 
 # ============================================================
-# CACHE — in-memory per user, korte TTL
+# CACHE — items per user, korte TTL
 # ============================================================
 _CACHE = {}
 _CACHE_TTL = 30
@@ -102,14 +98,55 @@ def _cache_invalidate(uid):
 
 
 # ============================================================
-# ROOSTER CACHE — school-breed, langere TTL
+# KLAS CACHE — 1x detecteren per user
 # ============================================================
-_ROOSTER_CACHE = {"data": None, "ts": 0, "url": None}
-_ROOSTER_TTL = 300  # 5 min
+_KLAS_CACHE = {}
+_KLAS_TTL = 3600  # 1 uur
+
+
+def _get_cached_class(session, base, uid):
+    """Detecteer klas op basis van huidige week (gecached)."""
+    now_ts = time.time()
+    entry = _KLAS_CACHE.get(uid)
+    if entry and now_ts - entry["ts"] < _KLAS_TTL:
+        return entry["class"], entry["score"]
+
+    tz = timezone(timedelta(hours=2))
+    now = datetime.now(tz)
+    cur_monday = (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    cur_sunday = cur_monday + timedelta(days=6)
+
+    from_iso = cur_monday.strftime("%Y-%m-%dT%H:%M:%S+02:00")
+    to_iso = cur_sunday.strftime("%Y-%m-%dT%H:%M:%S+02:00")
+
+    items = _fetch_planned_elements(session, base, uid, from_iso, to_iso)
+    items = _filter_placeholders(items, False)
+
+    rooster = _fetch_school_rooster()
+    if not rooster:
+        return None, 0
+
+    klas, score = _detect_class(items, rooster)
+
+    if klas:
+        _KLAS_CACHE[uid] = {
+            "class": klas,
+            "score": score,
+            "ts": now_ts,
+        }
+    return klas, score
+
+
+# ============================================================
+# ROOSTER CACHE — school-breed, 5 min TTL
+# ============================================================
+_ROOSTER_CACHE = {"data": None, "ts": 0}
+_ROOSTER_TTL = 300
 
 
 def _fetch_json_url(url):
-    """Haal JSON op met BOM fix en random cache-buster."""
+    """Haal JSON op met BOM fix + random cache-buster."""
     try:
         req = urllib.request.Request(
             f"{url}?_={random.randint(100000, 999999)}",
@@ -126,7 +163,6 @@ def _fetch_json_url(url):
 
 
 def _fetch_school_rooster():
-    """Haal het gewone schoolrooster op (gecached)."""
     now = time.time()
     if (_ROOSTER_CACHE["data"]
             and now - _ROOSTER_CACHE["ts"] < _ROOSTER_TTL):
@@ -136,13 +172,11 @@ def _fetch_school_rooster():
     if data and "Klassen" in data:
         _ROOSTER_CACHE["data"] = data
         _ROOSTER_CACHE["ts"] = now
-        _ROOSTER_CACHE["url"] = ROOSTER_URL
         return data
     return None
 
 
 def _fetch_examen_rooster():
-    """Probeer examenrooster URL's."""
     for url in EXAMEN_URLS:
         data = _fetch_json_url(url)
         if data and "Klassen" in data:
@@ -492,8 +526,13 @@ def _is_exam_week(items, klas_score, match_ratio):
 
 # ============================================================
 # LEGE UREN OP VULLEN
+# ⭐ Geen blokkade — lessen altijd zichtbaar
 # ============================================================
-def _fill_empty_slots(items, klas_naam, rooster, week_start, block_wholeday=True):
+def _fill_empty_slots(items, klas_naam, rooster, week_start):
+    """
+    Vul lege uren op basis van schoolrooster.
+    Hele-dag activiteiten (sportdag, uitstap) blokkeren NIET.
+    """
     if not rooster or not klas_naam:
         return []
 
@@ -522,8 +561,6 @@ def _fill_empty_slots(items, klas_naam, rooster, week_start, block_wholeday=True
 
     # Bezet door bestaande items
     bezet = set()
-    geblokkeerde_dagen = set()
-
     for it in items:
         period = it.get("period") or {}
         df = period.get("dateTimeFrom") or ""
@@ -533,14 +570,6 @@ def _fill_empty_slots(items, klas_naam, rooster, week_start, block_wholeday=True
             uur = UUR_MAP.get(dt.strftime("%H:%M"))
             if dag and uur:
                 bezet.add((dag, uur))
-
-            # Hele-dag activiteit → blokkeer die dag
-            if block_wholeday:
-                is_whole = (period.get("wholeDay")
-                            or it.get("plannedElementType")
-                            == "planned-school-activities")
-                if is_whole and dag:
-                    geblokkeerde_dagen.add(dag)
         except Exception:
             pass
 
@@ -549,8 +578,6 @@ def _fill_empty_slots(items, klas_naam, rooster, week_start, block_wholeday=True
                   "Vrijdag", "Zaterdag", "Zondag"]
 
     for i, dag in enumerate(alle_dagen):
-        if dag in geblokkeerde_dagen:
-            continue  # sportdag, uitstap, ... → skip
         d = week_start + timedelta(days=i)
         for uur_num in ["1", "2", "3", "4", "5", "6", "7"]:
             if (dag, uur_num) in bezet:
@@ -585,11 +612,10 @@ def _fill_empty_slots(items, klas_naam, rooster, week_start, block_wholeday=True
 
 
 # ============================================================
-# HELPERS VOOR DE ROUTES
+# WEEK RESPONSE BUILDER
 # ============================================================
 def _build_week_response(session, base, uid, monday, include_hours=True,
                           include_placeholders=False, do_fill=True):
-    """Bouw een volledige week-response met aanvulling."""
     sunday = monday + timedelta(days=6)
     from_iso = monday.strftime("%Y-%m-%dT%H:%M:%S+02:00")
     to_iso = sunday.strftime("%Y-%m-%dT%H:%M:%S+02:00")
@@ -602,10 +628,9 @@ def _build_week_response(session, base, uid, monday, include_hours=True,
                                       from_iso, to_iso)
         _cache_set(uid, raw_key, raw)
 
-    # Filter placeholders
     filtered = _filter_placeholders(raw, include_placeholders)
 
-    # Klas + examen
+    # Klas + rooster
     rooster = _fetch_school_rooster()
     klas = None
     score = 0.0
@@ -614,9 +639,12 @@ def _build_week_response(session, base, uid, monday, include_hours=True,
     examen_reden = ""
 
     if rooster:
-        klas, score = _detect_class(filtered, rooster)
+        # ⭐ Gebruik cache — klas 1x detecteren op basis van huidige week
+        klas, score = _get_cached_class(session, base, uid)
+
         if klas:
             match_ratio = _planner_matches_rooster(filtered, klas, rooster)
+
         examen, examen_reden = _is_exam_week(filtered, score, match_ratio)
 
         if examen and do_fill:
@@ -916,16 +944,20 @@ def planner_create_todo(_session=None, _creds=None):
 @bp.get("/my-class")
 @with_session
 def planner_my_class(_session=None, _creds=None):
-    """
-    Detecteer de klas via schoolrooster matching.
-    Retourneert {class, score, match_ratio, exam_week}.
-    """
+    """Detecteer de klas via schoolrooster matching."""
     base = base_url(_creds)
     uid = _get_uid(_session, base)
     if not uid:
         return jsonify({"error": "kon user_id niet vinden"}), 500
 
-    # Haal huidige week items op
+    klas, score = _get_cached_class(_session, base, uid)
+    if not klas:
+        return jsonify({
+            "error": "kon klas niet detecteren",
+            "score": round(score, 3),
+        }), 404
+
+    # Voor match_ratio + examen check
     tz = timezone(timedelta(hours=2))
     now = datetime.now(tz)
     day = now.weekday()
@@ -940,15 +972,7 @@ def planner_my_class(_session=None, _creds=None):
     raw = _filter_placeholders(raw, False)
 
     rooster = _fetch_school_rooster()
-    if not rooster:
-        return jsonify({"error": "kon schoolrooster niet ophalen"}), 502
-
-    klas, score = _detect_class(raw, rooster)
-    if not klas:
-        return jsonify({"error": "kon klas niet detecteren",
-                        "score": round(score, 3)}), 404
-
-    match_ratio = _planner_matches_rooster(raw, klas, rooster)
+    match_ratio = _planner_matches_rooster(raw, klas, rooster) if rooster else 0
     examen, reden = _is_exam_week(raw, score, match_ratio)
 
     return jsonify({
