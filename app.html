@@ -49,7 +49,6 @@
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
   ::-webkit-scrollbar-thumb:hover { background: #333a4d; }
 
-  /* ============ LOGIN ============ */
   #login-screen {
     position: fixed; inset: 0; z-index: 100;
     display: flex; align-items: center; justify-content: center;
@@ -98,7 +97,6 @@
   .login-error { color: var(--red); font-size: 13px; margin-top: 12px; display: none; }
   .login-error.show { display: block; }
 
-  /* ============ APP LAYOUT ============ */
   #app { display: none; height: 100vh; flex-direction: column; }
   #app.ready { display: flex; }
 
@@ -184,7 +182,6 @@
   .grid-2 { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
   .grid-3 { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
 
-  /* Grades */
   .course-card { transition: border-color 0.15s; }
   .course-card:hover { border-color: var(--border); }
   .course-head {
@@ -214,7 +211,6 @@
   .eval-bar { width: 60px; height: 5px; background: var(--bg-3); border-radius: 3px; overflow: hidden; flex-shrink: 0; }
   .eval-bar-fill { height: 100%; border-radius: 3px; }
 
-  /* Planner */
   .planner-nav {
     display: flex; align-items: center; gap: 10px; margin-bottom: 18px;
     flex-wrap: wrap;
@@ -258,7 +254,6 @@
   @media (max-width: 1100px) { .planner-grid { grid-template-columns: repeat(4, 1fr); } }
   @media (max-width: 700px) { .planner-grid { grid-template-columns: 1fr 1fr; } }
 
-  /* Todos */
   .todo-item {
     display: flex; align-items: center; gap: 11px;
     padding: 11px 14px; background: var(--card);
@@ -297,7 +292,6 @@
   .scope-tab:hover { color: var(--text); }
   .scope-tab.active { background: var(--accent); color: white; }
 
-  /* Messages */
   .msg-layout { display: flex; gap: 16px; height: calc(100vh - 140px); min-height: 400px; }
   .msg-list {
     width: 340px; flex-shrink: 0; background: var(--card);
@@ -365,7 +359,6 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   .loading-center { display: flex; align-items: center; justify-content: center; height: 100%; }
 
-  /* Compose modal */
   .modal-bg {
     position: fixed; inset: 0; background: rgba(0,0,0,0.6);
     z-index: 50; display: none; align-items: center; justify-content: center;
@@ -607,23 +600,25 @@
 
 <div class="toast-wrap" id="toasts"></div>
 
-<script src="https://cdn.jsdelivr.net/gh/nxyder/schoolshi/ss3.min.js"></script>
 <script>
 'use strict';
 
 /* ============================================================
-   FAST HELPERS — geen allocations waar mogelijk
+   CONFIG — pas dit aan als je bridge ergens anders draait
+   ============================================================ */
+const API_BASE = 'https://smartschoolbridge.onrender.com';
+
+/* ============================================================
+   FAST HELPERS
    ============================================================ */
 const $  = id => document.getElementById(id);
 const $$ = (sel, root) => (root || document).querySelectorAll(sel);
 
-// Één gecachte HTML-escaper
 const ESC_MAP = { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' };
 const ESC_RE  = /[&<>"']/g;
 const esc = s => {
   if (s == null) return '';
   const str = typeof s === 'string' ? s : String(s);
-  // Snelle check: geen speciale tekens? return direct
   ESC_RE.lastIndex = 0;
   if (!ESC_RE.test(str)) return str;
   ESC_RE.lastIndex = 0;
@@ -657,7 +652,7 @@ function fmtTime(d) {
 }
 
 /* ============================================================
-   TOASTS — één container, geen reflow per toast
+   TOASTS
    ============================================================ */
 const toastWrap = $('toasts');
 function toast(msg, type = '') {
@@ -669,8 +664,215 @@ function toast(msg, type = '') {
 }
 
 /* ============================================================
+   API CLIENT — vervangt ss3.min.js
+   ============================================================ */
+const auth = {
+  creds: null,    // { username, password, main_url, mfa }
+  user:  null,    // { username, main_url }
+
+  encodeCreds() {
+    if (!this.creds) return null;
+    return btoa(unescape(encodeURIComponent(JSON.stringify(this.creds))));
+  },
+
+  setCreds(c) {
+    this.creds = c;
+    try {
+      sessionStorage.setItem('ss_creds', JSON.stringify(c));
+    } catch {}
+  },
+
+  tryRestore() {
+    try {
+      const raw = sessionStorage.getItem('ss_creds');
+      if (!raw) return false;
+      this.creds = JSON.parse(raw);
+      return true;
+    } catch { return false; }
+  },
+
+  clear() {
+    this.creds = null;
+    this.user = null;
+    try { sessionStorage.removeItem('ss_creds'); } catch {}
+  },
+};
+
+/**
+ * Basis fetch naar de bridge. Voegt X-SS-Creds header toe.
+ */
+async function apiFetch(path, opts = {}) {
+  const headers = Object.assign({}, opts.headers || {});
+  const credsHeader = auth.encodeCreds();
+  if (credsHeader) headers['X-SS-Creds'] = credsHeader;
+
+  const url = path.startsWith('http') ? path : API_BASE + path;
+  const res = await fetch(url, Object.assign({}, opts, { headers }));
+
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try {
+      const data = await res.json();
+      if (data.error) msg = data.error;
+    } catch {}
+    throw new Error(msg);
+  }
+
+  // 204 No Content
+  if (res.status === 204) return null;
+
+  const ct = res.headers.get('Content-Type') || '';
+  if (ct.includes('application/json')) return res.json();
+  if (ct.includes('application/octet-stream') || opts.raw) return res.blob();
+  return res.text();
+}
+
+/**
+ * Bouw URL met query params. `refresh: true` wordt `?refresh=1`.
+ */
+function withQuery(path, params) {
+  const qs = [];
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v === undefined || v === null || v === false) continue;
+    if (v === true) qs.push(`${k}=1`);
+    else qs.push(`${k}=${encodeURIComponent(v)}`);
+  }
+  if (!qs.length) return path;
+  return path + (path.includes('?') ? '&' : '?') + qs.join('&');
+}
+
+/* ============================================================
+   API MODULES
+   ============================================================ */
+const api = {
+  auth: {
+    async login({ username, password, main_url, mfa }) {
+      auth.setCreds({ username, password, main_url, mfa: mfa || '' });
+      const data = await apiFetch('/api/auth/login', { method: 'POST' });
+      auth.user = { username: data.username, main_url: data.main_url };
+      return auth.user;
+    },
+    logout() {
+      auth.clear();
+    },
+  },
+
+  grades: {
+    async load(forceRefresh = false) {
+      const path = withQuery('/api/grades', { refresh: forceRefresh });
+      return apiFetch(path);
+    },
+    async detail(id) {
+      return apiFetch(`/api/grades/evaluation/${encodeURIComponent(id)}`);
+    },
+  },
+
+  planner: {
+    async loadWeek(offset = 0, forceRefresh = false) {
+      const path = withQuery('/api/planner/week', {
+        offset: offset || 0,
+        refresh: forceRefresh,
+      });
+      return apiFetch(path);
+    },
+    async loadMyClass(forceRefresh = false) {
+      const path = withQuery('/api/planner/my-class', { refresh: forceRefresh });
+      return apiFetch(path);
+    },
+    async loadTodos(scope = 'open', forceRefresh = false) {
+      const path = withQuery('/api/planner/todos', {
+        scope,
+        limit: 200,
+        refresh: forceRefresh,
+      });
+      return apiFetch(path);
+    },
+    async createTodo(body) {
+      return apiFetch('/api/planner/todo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    },
+    async itemAction(platformId, elementId, action, type) {
+      const path = withQuery(
+        `/api/planner/${platformId}/${elementId}/${action}`,
+        { type }
+      );
+      return apiFetch(path, { method: 'POST' });
+    },
+    async toggleTodo(id, type, resolve) {
+      // platform_id zit in de uid van de items; gebruik 455 default
+      const platformId = '455';
+      const action = resolve ? 'resolve' : 'unresolve';
+      return this.itemAction(platformId, id, action, type);
+    },
+    async deleteTodo(id, type) {
+      const platformId = '455';
+      return this.itemAction(platformId, id, 'trash', type);
+    },
+  },
+
+  messages: {
+    async loadList(box = 'inbox') {
+      const data = await apiFetch(withQuery('/api/messages', { box }));
+      return data.messages || [];
+    },
+    async openMessage(id, box = 'inbox') {
+      return apiFetch(withQuery(`/api/messages/${encodeURIComponent(id)}`, { box }));
+    },
+    async action(id, action) {
+      return apiFetch(`/api/messages/${encodeURIComponent(id)}/action`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      });
+    },
+    async downloadAttachment(msgId, fileId) {
+      return apiFetch(
+        `/api/messages/${encodeURIComponent(msgId)}/attachment/${encodeURIComponent(fileId)}`,
+        { raw: true }
+      );
+    },
+    async searchUsers(q, type = 'all') {
+      const data = await apiFetch(withQuery('/api/messages/search-users', { q, type }));
+      return data.users || [];
+    },
+    async send({ subject, message_html, to, cc, bcc, attachments, send_date, draft_id }) {
+      return apiFetch('/api/messages/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          subject,
+          message_html,
+          to: to || [],
+          cc: cc || [],
+          bcc: bcc || [],
+          attachments: attachments || [],
+          send_date: send_date || '',
+          draft_id: draft_id || '',
+        }),
+      });
+    },
+  },
+
+  profile: {
+    async load() {
+      const data = await apiFetch('/api/profile');
+      return data.fields || {};
+    },
+    async save(changes) {
+      return apiFetch('/api/profile', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ changes }),
+      });
+    },
+  },
+};
+
+/* ============================================================
    REQUEST DEDUPLICATION
-   Voorkomt dat dezelfde request 2x loopt
    ============================================================ */
 const _inflight = new Map();
 function dedupe(key, fn) {
@@ -698,19 +900,8 @@ const loaded = {
 /* ============================================================
    INIT
    ============================================================ */
-let ss = null;
-if (typeof SmartschoolClient === 'undefined') {
-  document.body.innerHTML = '<div style="padding:40px;color:#f87171;font-family:monospace">Fout: SmartschoolClient niet geladen.</div>';
-} else {
-  ss = new SmartschoolClient();
-  setupLogin();
-  // Auto-login pas starten als de main thread vrij is
-  if ('requestIdleCallback' in window) {
-    requestIdleCallback(() => checkAutoLogin(), { timeout: 500 });
-  } else {
-    setTimeout(checkAutoLogin, 50);
-  }
-}
+setupLogin();
+autoLogin();
 
 /* ============================================================
    LOGIN
@@ -724,11 +915,11 @@ function setupLogin() {
     btn.disabled = true;
     btn.textContent = 'Aanmelden...';
     try {
-      await ss.login({
+      await api.auth.login({
         username: $('in-user').value.trim(),
         password: $('in-pass').value,
         main_url: $('in-url').value.trim(),
-        mfa:      $('in-mfa').value.trim() || undefined,
+        mfa:      $('in-mfa').value.trim(),
       });
       onLoggedIn();
     } catch (e) {
@@ -740,15 +931,23 @@ function setupLogin() {
   });
 }
 
-async function checkAutoLogin() {
+async function autoLogin() {
+  if (!auth.tryRestore()) return;
   try {
-    const user = await ss.tryAutoLogin();
-    if (user) onLoggedIn();
-  } catch {}
+    // Test of de credentials nog werken
+    await apiFetch('/api/auth/login', { method: 'POST' });
+    auth.user = {
+      username: auth.creds.username,
+      main_url: auth.creds.main_url,
+    };
+    onLoggedIn();
+  } catch {
+    auth.clear();
+  }
 }
 
 function onLoggedIn() {
-  const u = ss.auth?.user || ss.user || {};
+  const u = auth.user || auth.creds || {};
   const name = u.username || 'Gebruiker';
   $('user-name').textContent = name;
   $('user-avatar').textContent = name.slice(0, 1).toUpperCase();
@@ -757,21 +956,18 @@ function onLoggedIn() {
   $('app').classList.add('ready');
 
   setupAppEvents();
-  // Alleen het dashboard laden — rest lazy
   loadDashboard();
-  // Messages badge in de achtergrond (idle)
   scheduleBadgeUpdate();
 }
 
 /* ============================================================
-   EVENTS — alles via delegation
+   EVENTS
    ============================================================ */
 let _eventsBound = false;
 function setupAppEvents() {
   if (_eventsBound) return;
   _eventsBound = true;
 
-  // Navigation — één listener op de sidebar
   $('sidebar').addEventListener('click', (e) => {
     const btn = e.target.closest('.nav-item');
     if (btn) switchPage(btn.dataset.page);
@@ -780,32 +976,30 @@ function setupAppEvents() {
   $('menu-toggle').addEventListener('click', () => $('sidebar').classList.toggle('open'));
 
   $('btn-refresh').addEventListener('click', () => {
-    // Alleen de huidige pagina verversen
     const active = document.querySelector('.nav-item.active')?.dataset.page || 'dashboard';
     toast('Vernieuwen...');
-    loaded[active] = false;
-    switchPage(active, true);
+    refreshPage(active);
   });
 
   $('user-menu').addEventListener('click', () => {
-    if (confirm('Wil je afmelden?')) { ss.logout(); location.reload(); }
+    if (confirm('Wil je afmelden?')) { api.auth.logout(); location.reload(); }
   });
 
-  // Planner nav
-  $('week-prev').addEventListener('click',  () => ss.planner.shiftWeek(-1));
-  $('week-next').addEventListener('click',  () => ss.planner.shiftWeek(1));
-  $('week-today').addEventListener('click', () => ss.planner.goToToday());
+  $('week-prev').addEventListener('click',  () => shiftWeek(-1));
+  $('week-next').addEventListener('click',  () => shiftWeek(1));
+  $('week-today').addEventListener('click', () => {
+    weekOffset = 0;
+    loadPlanner(true);
+  });
 
-  // Todos scopes — delegation
   $('todo-scopes').addEventListener('click', (e) => {
     const tab = e.target.closest('.scope-tab');
     if (!tab) return;
     $$('.scope-tab', $('todo-scopes')).forEach(t => t.classList.toggle('active', t === tab));
     todoScope = tab.dataset.scope;
-    ss.planner.loadTodos(todoScope);
+    loadTodos(true);
   });
 
-  // Nieuwe taak modal
   $('btn-new-todo').addEventListener('click', () => {
     $('todo-modal').classList.add('show');
     $('todo-name').focus();
@@ -815,7 +1009,6 @@ function setupAppEvents() {
   $('todo-cancel').addEventListener('click', () => $('todo-modal').classList.remove('show'));
   $('todo-create').addEventListener('click', createTodo);
 
-  // Message tabs — delegation
   $('msg-tabs').addEventListener('click', (e) => {
     const tab = e.target.closest('.msg-tab');
     if (!tab) return;
@@ -826,20 +1019,17 @@ function setupAppEvents() {
     $('msg-view').innerHTML = '<div class="empty"><div class="ic">✉</div><p>Selecteer een bericht</p></div>';
   });
 
-  // Message list — delegation
   $('msg-rows').addEventListener('click', (e) => {
     const row = e.target.closest('.msg-row');
     if (row) openMessage(row.dataset.id);
   });
 
-  // Message view actions — delegation
   $('msg-view').addEventListener('click', (e) => {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
     handleMessageAction(btn.dataset.action, btn);
   });
 
-  // Todos list — delegation
   $('todos-list').addEventListener('click', (e) => {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
@@ -848,52 +1038,21 @@ function setupAppEvents() {
     handleTodoAction(btn.dataset.action, item.dataset.id, item.dataset.type);
   });
 
-  // Compose
   $('compose-close').addEventListener('click',  closeCompose);
   $('compose-cancel').addEventListener('click', closeCompose);
   $('compose-send').addEventListener('click',   sendCompose);
   setupRecipientSearch();
-
-  // SS events — alleen de essentiële
-  bindSsevents();
-}
-
-function bindSsevents() {
-  if (!ss.on) return;
-
-  ss.on('planner:week-loading', () => {
-    $('planner-grid').innerHTML = '<div class="loading-center" style="grid-column:1/-1"><div class="spinner"></div></div>';
-  });
-  ss.on('planner:week-loaded', ({ data }) => renderPlanner(data));
-  ss.on('planner:error', ({ error }) => toast('Planner: ' + error.message, 'error'));
-  ss.on('planner:my-class', (d) => {
-    $('exam-badge').style.display = d.exam_week ? 'inline-block' : 'none';
-  });
-  ss.on('planner:todos-loaded', ({ items }) => { todosCache = items || []; renderTodos(); });
-  ss.on('planner:todos-changed', (items) =>   { todosCache = items || []; renderTodos(); });
-  ss.on('planner:todos-error', ({ error }) => toast('Taken: ' + error.message, 'error'));
-
-  ss.on('messages:loaded', ({ messages }) => renderMessageList(messages));
-  ss.on('messages:error',  ({ error })    => toast('Berichten: ' + error.message, 'error'));
-  ss.on('messages:opened', ({ message })  => renderMessageView(message));
-  ss.on('messages:read', () => {
-    const row = document.querySelector(`.msg-row[data-id="${CSS.escape(String(currentMessageId))}"]`);
-    if (row) row.classList.remove('unread');
-  });
 }
 
 /* ============================================================
-   NAVIGATION + LAZY LOAD
+   NAVIGATION
    ============================================================ */
 function switchPage(page, force = false) {
-  // UI update
   $$('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.page === page));
   $$('.page').forEach(p => p.classList.toggle('active', p.id === 'page-' + page));
   $('sidebar').classList.remove('open');
 
   if (force) loaded[page] = false;
-
-  // Lazy load — alleen als nog niet geladen
   if (loaded[page]) return;
   loaded[page] = true;
 
@@ -907,13 +1066,24 @@ function switchPage(page, force = false) {
   }
 }
 
+function refreshPage(page) {
+  loaded[page] = false;
+  switch (page) {
+    case 'dashboard': loadDashboard(true); break;
+    case 'grades':    loadGrades(true);    break;
+    case 'planner':   loadPlanner(true);   break;
+    case 'todos':     loadTodos(true);     break;
+    case 'messages':  loadMessages(currentBox || 'inbox'); break;
+    case 'profile':   loadProfile();       break;
+  }
+}
+
 /* ============================================================
-   DASHBOARD — progressieve rendering per kaart
+   DASHBOARD
    ============================================================ */
-function loadDashboard() {
+function loadDashboard(forceRefresh = false) {
   const container = $('dash-cards');
 
-  // Zet meteen placeholders neer
   container.innerHTML = `
     <div class="card" id="dc-avg"><div class="loading-center"><div class="spinner"></div></div></div>
     <div class="card" id="dc-week"><div class="loading-center"><div class="spinner"></div></div></div>
@@ -921,20 +1091,19 @@ function loadDashboard() {
     <div class="card" id="dc-todos"><div class="loading-center"><div class="spinner"></div></div></div>
   `;
 
-  // Alle 4 parallel, elk rendert zodra klaar
-  dedupe('grades', () => ss.grades.load(true))
+  dedupe('grades' + (forceRefresh ? ':r' : ''), () => api.grades.load(forceRefresh))
     .then(g => renderDashAvg(g))
     .catch(() => $('dc-avg').innerHTML = '<p style="color:var(--text-dim)">—</p>');
 
-  dedupe('week:0', () => ss.planner.loadWeek(0))
+  dedupe('week:0' + (forceRefresh ? ':r' : ''), () => api.planner.loadWeek(0, forceRefresh))
     .then(w => renderDashWeek(w))
     .catch(() => $('dc-week').innerHTML = '<p style="color:var(--text-dim)">—</p>');
 
-  dedupe('myclass', () => ss.planner.loadMyClass())
+  dedupe('myclass' + (forceRefresh ? ':r' : ''), () => api.planner.loadMyClass(forceRefresh))
     .then(c => renderDashClass(c))
     .catch(() => $('dc-class').innerHTML = '<p style="color:var(--text-dim)">—</p>');
 
-  dedupe('todos:open', () => ss.planner.loadTodos('open'))
+  dedupe('todos:open' + (forceRefresh ? ':r' : ''), () => api.planner.loadTodos('open', forceRefresh))
     .then(t => renderDashTodos(t))
     .catch(() => $('dc-todos').innerHTML = '<p style="color:var(--text-dim)">—</p>');
 }
@@ -992,9 +1161,12 @@ function computeAverage(courses) {
 /* ============================================================
    GRADES
    ============================================================ */
-async function loadGrades() {
+async function loadGrades(forceRefresh = false) {
   try {
-    const data = await dedupe('grades', () => ss.grades.load(true));
+    const data = await dedupe(
+      'grades' + (forceRefresh ? ':r' : ''),
+      () => api.grades.load(forceRefresh)
+    );
     renderGrades(data);
   } catch (e) {
     $('grades-list').innerHTML = `<div class="empty"><p style="color:var(--red)">${esc(e.message)}</p></div>`;
@@ -1014,7 +1186,6 @@ function renderGrades(data) {
 
   $('grades-sub').textContent = `${data.total_evaluations || 0} evaluaties · ${data.total_courses || 0} vakken`;
 
-  // Bouw alle HTML in één keer (sneller dan += per course)
   const parts = [];
   for (let i = 0; i < courses.length; i++) {
     parts.push(buildCourseCard(courses[i]));
@@ -1071,13 +1242,25 @@ function computeCourseAvg(evals) {
 /* ============================================================
    PLANNER
    ============================================================ */
-async function loadPlanner() {
+let weekOffset = 0;
+
+async function loadPlanner(forceRefresh = false) {
+  $('planner-grid').innerHTML = '<div class="loading-center" style="grid-column:1/-1"><div class="spinner"></div></div>';
   try {
-    await dedupe('myclass', () => ss.planner.loadMyClass());
-    await dedupe('week:0', () => ss.planner.loadWeek(0));
+    await dedupe('myclass' + (forceRefresh ? ':r' : ''), () => api.planner.loadMyClass(forceRefresh));
+    const w = await dedupe(
+      'week:' + weekOffset + (forceRefresh ? ':r' : ''),
+      () => api.planner.loadWeek(weekOffset, forceRefresh)
+    );
+    renderPlanner(w);
   } catch (e) {
-    toast('Planner: ' + e.message, 'error');
+    $('planner-grid').innerHTML = `<div class="empty" style="grid-column:1/-1"><p style="color:var(--red)">${esc(e.message)}</p></div>`;
   }
+}
+
+function shiftWeek(delta) {
+  weekOffset += delta;
+  loadPlanner(true);
 }
 
 const DAY_NAMES = ['Ma', 'Di', 'Wo', 'Do', 'Vr', 'Za', 'Zo'];
@@ -1087,18 +1270,19 @@ function renderPlanner(data) {
   $('week-label').textContent = `${data?.week_start || ''} → ${data?.week_end || ''}`;
   $('exam-badge').style.display = data?.meta?.exam_week ? 'inline-block' : 'none';
 
-  // Bepaal maandag
+  // Bereken maandag van de weergegeven week uit week_start
   let monday;
-  try {
-    monday = ss.planner.getWeekBounds().monday;
-  } catch {
-    monday = new Date(data.week_start);
+  if (data?.week_start) {
+    monday = new Date(data.week_start + 'T00:00:00');
+  } else {
+    monday = new Date();
+    const day = monday.getDay() || 7;
+    monday.setDate(monday.getDate() - (day - 1));
   }
   monday.setHours(0, 0, 0, 0);
 
   const today = new Date(); today.setHours(0, 0, 0, 0);
 
-  // Groepeer per dag — één keer
   const byDay = new Map();
   for (let i = 0; i < items.length; i++) {
     const it = items[i];
@@ -1110,7 +1294,6 @@ function renderPlanner(data) {
     arr.push(it);
   }
 
-  // Bouw HTML
   const parts = [];
   for (let i = 0; i < 7; i++) {
     const d = new Date(monday);
@@ -1146,9 +1329,17 @@ function renderPlannerItem(it) {
 /* ============================================================
    TODOS
    ============================================================ */
-async function loadTodos() {
+let todoScope = 'open';
+let todosCache = [];
+
+async function loadTodos(forceRefresh = false) {
   try {
-    await dedupe('todos:' + todoScope, () => ss.planner.loadTodos(todoScope));
+    const data = await dedupe(
+      'todos:' + todoScope + (forceRefresh ? ':r' : ''),
+      () => api.planner.loadTodos(todoScope, forceRefresh)
+    );
+    todosCache = data?.items || [];
+    renderTodos();
   } catch (e) {
     toast('Taken: ' + e.message, 'error');
   }
@@ -1196,17 +1387,22 @@ function renderTodos() {
   list.innerHTML = parts.join('');
 }
 
-function handleTodoAction(action, id, type) {
+async function handleTodoAction(action, id, type) {
   const todo = todosCache.find(x => String(x.i) === String(id));
   if (!todo) return;
   const done = todo.st === 'resolved';
 
   if (action === 'toggle') {
-    ss.planner.toggleTodo(id, type, !done).catch(err => toast(err.message, 'error'));
+    try {
+      await api.planner.toggleTodo(id, type, !done);
+      await loadTodos(true);
+    } catch (e) { toast(e.message, 'error'); }
   } else if (action === 'delete') {
-    if (confirm('Taak verwijderen?')) {
-      ss.planner.deleteTodo(id, type).catch(err => toast(err.message, 'error'));
-    }
+    if (!confirm('Taak verwijderen?')) return;
+    try {
+      await api.planner.deleteTodo(id, type);
+      await loadTodos(true);
+    } catch (e) { toast(e.message, 'error'); }
   }
 }
 
@@ -1214,7 +1410,7 @@ async function createTodo() {
   const name = $('todo-name').value.trim();
   if (!name) return toast('Naam is verplicht', 'error');
   try {
-    await ss.planner.createTodo({
+    await api.planner.createTodo({
       name,
       description: $('todo-desc').value.trim(),
       date_from: $('todo-date').value,
@@ -1226,7 +1422,7 @@ async function createTodo() {
     $('todo-name').value = '';
     $('todo-desc').value = '';
     toast('Taak aangemaakt', 'success');
-    loadTodos();
+    await loadTodos(true);
   } catch (e) {
     toast('Fout: ' + e.message, 'error');
   }
@@ -1237,8 +1433,6 @@ async function createTodo() {
    ============================================================ */
 let currentBox = 'inbox';
 let currentMessageId = null;
-let todoScope = 'open';
-let todosCache = [];
 
 async function loadMessages(box, silent = false) {
   currentBox = box;
@@ -1246,14 +1440,14 @@ async function loadMessages(box, silent = false) {
     $('msg-rows').innerHTML = '<div class="loading-center" style="padding:40px"><div class="spinner"></div></div>';
   }
   try {
-    await dedupe('msgs:' + box, () => ss.messages.loadList(box));
+    const list = await dedupe('msgs:' + box, () => api.messages.loadList(box));
+    renderMessageList(list);
   } catch (e) {
     if (!silent) toast('Berichten: ' + e.message, 'error');
   }
 }
 
-function renderMessageList(messages) {
-  const list = messages || ss.messages.list || [];
+function renderMessageList(list) {
   const container = $('msg-rows');
 
   if (!list.length) {
@@ -1261,7 +1455,6 @@ function renderMessageList(messages) {
     return;
   }
 
-  // Unread badge
   let unread = 0;
   for (let i = 0; i < list.length; i++) if (list[i].unread || list[i].is_unread) unread++;
 
@@ -1294,7 +1487,8 @@ async function openMessage(id) {
   $$('.msg-row').forEach(r => r.classList.toggle('active', r.dataset.id === id));
   $('msg-view').innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
   try {
-    await ss.messages.openMessage(id, currentBox);
+    const msg = await api.messages.openMessage(id, currentBox);
+    renderMessageView(msg);
   } catch (e) {
     $('msg-view').innerHTML = `<div class="empty"><p style="color:var(--red)">${esc(e.message)}</p></div>`;
   }
@@ -1338,7 +1532,23 @@ function renderMessageView(msg) {
       (currentBox === 'inbox' ? '<button class="btn-sm" data-action="archive">📥 Archiveren</button>' : '') +
     '</div>';
 
-  // Image fix — eenmalig na render
+  // Koppel attachment-chips aan download
+  $$('#msg-view .attach-chip').forEach(chip => {
+    chip.addEventListener('click', async () => {
+      try {
+        const blob = await api.messages.downloadAttachment(currentMessageId, chip.dataset.file);
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = chip.dataset.name || 'bijlage';
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        toast('Download gestart', 'success');
+      } catch (e) {
+        toast('Download mislukt: ' + e.message, 'error');
+      }
+    });
+  });
+
   fixRelativeImages($('msg-view'));
 }
 
@@ -1347,30 +1557,13 @@ async function handleMessageAction(action, btn) {
   if (!id) return;
 
   if (action === 'reply') {
-    const msg = ss.messages.currentMessage || {};
+    const msg = ss_currentMessage || {};
     openCompose(msg.sender || msg.from, 'Re: ' + (msg.subject || ''));
     return;
   }
 
-  if (action === 'download') {
-    const chip = btn.closest('.attach-chip');
-    if (!chip) return;
-    try {
-      const blob = await ss.messages.downloadAttachment(id, chip.dataset.file);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = chip.dataset.name || 'bijlage';
-      document.body.appendChild(a); a.click(); document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-      toast('Download gestart', 'success');
-    } catch (e) {
-      toast('Download mislukt: ' + e.message, 'error');
-    }
-    return;
-  }
-
   try {
-    await ss.messages.action(id, action);
+    await api.messages.action(id, action);
     toast(action === 'trash' ? 'Verwijderd' : action === 'archive' ? 'Gearchiveerd' : 'Gemarkeerd', 'success');
     loadMessages(currentBox);
     if (action === 'trash' || action === 'archive') {
@@ -1381,9 +1574,21 @@ async function handleMessageAction(action, btn) {
   }
 }
 
+// Simpele state om huidig bericht in op te slaan voor "reply"
+let ss_currentMessage = null;
+const _origRenderMessageView = renderMessageView;
+renderMessageView = function(msg) {
+  ss_currentMessage = msg;
+  return _origRenderMessageView(msg);
+};
+
 /* ============================================================
    COMPOSE
    ============================================================ */
+const composeState = {
+  to: [],
+};
+
 function setupRecipientSearch() {
   const input = $('to-input');
   let timer = null;
@@ -1391,9 +1596,10 @@ function setupRecipientSearch() {
     clearTimeout(timer);
     const q = input.value.trim();
     if (q.length < 2) { $('to-suggestions').style.display = 'none'; return; }
-    timer = setTimeout(() => {
-      ss.messages.debouncedSearch('to', q, (err, users) => {
-        if (err || !users?.length) { $('to-suggestions').style.display = 'none'; return; }
+    timer = setTimeout(async () => {
+      try {
+        const users = await api.messages.searchUsers(q, 'all');
+        if (!users.length) { $('to-suggestions').style.display = 'none'; return; }
         const parts = [];
         const max = Math.min(users.length, 8);
         for (let i = 0; i < max; i++) {
@@ -1406,14 +1612,20 @@ function setupRecipientSearch() {
         }
         $('to-suggestions').innerHTML = parts.join('');
         $('to-suggestions').style.display = 'block';
-      });
+      } catch {
+        $('to-suggestions').style.display = 'none';
+      }
     }, 200);
   });
 
   $('to-suggestions').addEventListener('click', (e) => {
     const s = e.target.closest('.suggestion');
     if (!s) return;
-    ss.messages.addRecipient('to', { user_id: s.dataset.id, name: s.dataset.name, is_co_account: !!s.dataset.co });
+    composeState.to.push({
+      user_id: s.dataset.id,
+      name: s.dataset.name,
+      is_co_account: !!s.dataset.co,
+    });
     input.value = '';
     $('to-suggestions').style.display = 'none';
     renderRecipients();
@@ -1423,15 +1635,14 @@ function setupRecipientSearch() {
 function renderRecipients() {
   const box = $('to-box');
   const input = $('to-input');
-  const recipients = ss.messages.composeState?.to || [];
   box.querySelectorAll('.recipient-chip').forEach(c => c.remove());
-  for (let i = 0; i < recipients.length; i++) {
-    const r = recipients[i];
+  for (let i = 0; i < composeState.to.length; i++) {
+    const r = composeState.to[i];
     const chip = document.createElement('span');
     chip.className = 'recipient-chip';
     chip.innerHTML = esc(r.name || r.user_id) + ' <button data-i="' + i + '">×</button>';
     chip.querySelector('button').addEventListener('click', () => {
-      ss.messages.removeRecipient('to', i);
+      composeState.to.splice(i, 1);
       renderRecipients();
     });
     box.insertBefore(chip, input);
@@ -1439,9 +1650,8 @@ function renderRecipients() {
 }
 
 function openCompose(to, subject) {
-  ss.messages.startCompose();
-  if (to) ss.messages.addRecipient('to', { user_id: to, name: to });
-  if (subject) ss.messages.setSubject(subject);
+  composeState.to = [];
+  if (to) composeState.to.push({ user_id: to, name: to });
   $('compose-subject').value = subject || '';
   $('compose-body').value = '';
   $('to-input').value = '';
@@ -1451,7 +1661,7 @@ function openCompose(to, subject) {
 }
 
 function closeCompose() {
-  ss.messages.cancelCompose();
+  composeState.to = [];
   $('compose-modal').classList.remove('show');
   $('to-suggestions').style.display = 'none';
 }
@@ -1459,17 +1669,18 @@ function closeCompose() {
 async function sendCompose() {
   const subject = $('compose-subject').value.trim();
   const body = $('compose-body').value;
-  if (!ss.messages.composeState?.to?.length) return toast('Voeg een ontvanger toe', 'error');
+  if (!composeState.to.length) return toast('Voeg een ontvanger toe', 'error');
   if (!subject) return toast('Onderwerp is verplicht', 'error');
-
-  ss.messages.setSubject(subject);
-  ss.messages.setBodyHtml('<p>' + esc(body).replace(/\n/g, '<br>') + '</p>');
 
   const btn = $('compose-send');
   btn.disabled = true;
   btn.textContent = 'Versturen...';
   try {
-    await ss.messages.send();
+    await api.messages.send({
+      subject,
+      message_html: '<p>' + esc(body).replace(/\n/g, '<br>') + '</p>',
+      to: composeState.to,
+    });
     toast('Bericht verstuurd', 'success');
     closeCompose();
     if (currentBox === 'outbox') loadMessages('outbox');
@@ -1486,12 +1697,14 @@ async function sendCompose() {
    ============================================================ */
 async function loadProfile() {
   try {
-    const fields = await dedupe('profile', () => ss.profile.load());
+    const fields = await dedupe('profile', () => api.profile.load());
     renderProfile(fields);
   } catch (e) {
     $('profile-card').innerHTML = `<p style="color:var(--red)">${esc(e.message)}</p>`;
   }
 }
+
+let _originalProfile = null;
 
 function renderProfile(fields) {
   const entries = Object.entries(fields || {});
@@ -1499,6 +1712,9 @@ function renderProfile(fields) {
     $('profile-card').innerHTML = '<div class="empty"><p>Geen profielgegevens</p></div>';
     return;
   }
+
+  _originalProfile = {};
+  for (const [k, v] of entries) _originalProfile[k] = v.value || '';
 
   const parts = [];
   for (let i = 0; i < entries.length; i++) {
@@ -1518,16 +1734,17 @@ function renderProfile(fields) {
     '</div>';
 
   $('profile-save').addEventListener('click', async () => {
-    const current = {};
+    const changes = {};
     $$('#profile-card input[data-key]').forEach(inp => {
-      if (!inp.readOnly) current[inp.dataset.key] = inp.value;
+      if (inp.readOnly) return;
+      const key = inp.dataset.key;
+      if (inp.value !== _originalProfile[key]) changes[key] = inp.value;
     });
-    let changes = current;
-    try { if (typeof ss.profile.diff === 'function') changes = ss.profile.diff(current); } catch {}
     if (!Object.keys(changes).length) return toast('Niets gewijzigd', 'error');
     try {
-      await ss.profile.save(changes);
+      await api.profile.save(changes);
       toast('Profiel opgeslagen', 'success');
+      for (const k of Object.keys(changes)) _originalProfile[k] = changes[k];
     } catch (e) {
       toast('Opslaan mislukt: ' + e.message, 'error');
     }
@@ -1540,10 +1757,9 @@ function renderProfile(fields) {
 function scheduleBadgeUpdate() {
   const run = async () => {
     try {
-      const list = await dedupe('msgs:inbox', () => ss.messages.loadList('inbox'));
-      const messages = list || ss.messages.list || [];
+      const list = await dedupe('msgs:inbox', () => api.messages.loadList('inbox'));
       let unread = 0;
-      for (let i = 0; i < messages.length; i++) if (messages[i].unread || messages[i].is_unread) unread++;
+      for (let i = 0; i < list.length; i++) if (list[i].unread || list[i].is_unread) unread++;
       const badge = $('msg-badge');
       if (unread > 0) { badge.textContent = unread; badge.style.display = 'inline-block'; }
     } catch {}
@@ -1565,13 +1781,13 @@ document.addEventListener('keydown', (e) => {
 });
 
 /* ============================================================
-   IMAGE FIX — alleen voor message body (geen observer meer)
+   IMAGE FIX
    ============================================================ */
 function fixRelativeImages(root) {
   if (!root) return;
   let host = '';
   try {
-    host = (ss?.auth?.creds?.main_url || ss?.auth?.user?.main_url || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
+    host = (auth.creds?.main_url || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
   } catch {}
   if (!host) return;
 
