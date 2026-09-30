@@ -612,30 +612,39 @@
 'use strict';
 
 /* ============================================================
-   HELPERS
+   FAST HELPERS — geen allocations waar mogelijk
    ============================================================ */
-const $ = s => document.querySelector(s);
-const $$ = s => [...document.querySelectorAll(s)];
+const $  = id => document.getElementById(id);
+const $$ = (sel, root) => (root || document).querySelectorAll(sel);
 
-function toast(msg, type = '') {
-  const el = document.createElement('div');
-  el.className = 'toast ' + type;
-  el.textContent = msg;
-  $('#toasts').appendChild(el);
-  setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 3500);
-}
+// Één gecachte HTML-escaper
+const ESC_MAP = { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' };
+const ESC_RE  = /[&<>"']/g;
+const esc = s => {
+  if (s == null) return '';
+  const str = typeof s === 'string' ? s : String(s);
+  // Snelle check: geen speciale tekens? return direct
+  ESC_RE.lastIndex = 0;
+  if (!ESC_RE.test(str)) return str;
+  ESC_RE.lastIndex = 0;
+  return str.replace(ESC_RE, c => ESC_MAP[c]);
+};
 
-function esc(s) {
-  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-
+const NL_MONTHS = ['jan','feb','mrt','apr','mei','jun','jul','aug','sep','okt','nov','dec'];
+const _dateCache = new Map();
 function fmtDate(d) {
   if (!d) return '';
+  const key = typeof d === 'string' ? d : +d;
+  let cached = _dateCache.get(key);
+  if (cached !== undefined) return cached;
+  let out = '';
   try {
     const dt = typeof d === 'string' ? new Date(d.replace(' ', 'T')) : new Date(d);
-    if (isNaN(dt)) return String(d).split(' ')[0] || '';
-    return dt.toLocaleDateString('nl-BE', { day: 'numeric', month: 'short' });
-  } catch { return ''; }
+    if (!isNaN(dt)) out = dt.getDate() + ' ' + NL_MONTHS[dt.getMonth()];
+    else out = String(d).split(' ')[0] || '';
+  } catch { out = ''; }
+  _dateCache.set(key, out);
+  return out;
 }
 
 function fmtTime(d) {
@@ -643,51 +652,83 @@ function fmtTime(d) {
   try {
     const dt = typeof d === 'string' ? new Date(d) : new Date(d);
     if (isNaN(dt)) return '';
-    return dt.toLocaleTimeString('nl-BE', { hour: '2-digit', minute: '2-digit' });
+    return String(dt.getHours()).padStart(2,'0') + ':' + String(dt.getMinutes()).padStart(2,'0');
   } catch { return ''; }
 }
 
 /* ============================================================
-   GLOBAL STATE
+   TOASTS — één container, geen reflow per toast
    ============================================================ */
-let client = null;
-let currentBox = 'inbox';
-let currentMessageId = null;
-let todoScope = 'open';
-let todosCache = [];
+const toastWrap = $('toasts');
+function toast(msg, type = '') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+  toastWrap.appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 3500);
+}
+
+/* ============================================================
+   REQUEST DEDUPLICATION
+   Voorkomt dat dezelfde request 2x loopt
+   ============================================================ */
+const _inflight = new Map();
+function dedupe(key, fn) {
+  const existing = _inflight.get(key);
+  if (existing) return existing;
+  const p = Promise.resolve()
+    .then(fn)
+    .finally(() => _inflight.delete(key));
+  _inflight.set(key, p);
+  return p;
+}
+
+/* ============================================================
+   LAZY LOAD STATE
+   ============================================================ */
+const loaded = {
+  dashboard: false,
+  grades:    false,
+  planner:   false,
+  todos:     false,
+  messages:  false,
+  profile:   false,
+};
 
 /* ============================================================
    INIT
    ============================================================ */
+let ss = null;
 if (typeof SmartschoolClient === 'undefined') {
   document.body.innerHTML = '<div style="padding:40px;color:#f87171;font-family:monospace">Fout: SmartschoolClient niet geladen.</div>';
 } else {
-  // BELANGRIJK: gebruik `ss` als variabelenaam zoals in de werkende versie
-  var ss = new SmartschoolClient();
-  client = ss;
+  ss = new SmartschoolClient();
   setupLogin();
-  checkAutoLogin();
+  // Auto-login pas starten als de main thread vrij is
+  if ('requestIdleCallback' in window) {
+    requestIdleCallback(() => checkAutoLogin(), { timeout: 500 });
+  } else {
+    setTimeout(checkAutoLogin, 50);
+  }
 }
 
 /* ============================================================
    LOGIN
    ============================================================ */
 function setupLogin() {
-  $('#login-form').addEventListener('submit', async (e) => {
+  $('login-form').addEventListener('submit', async (e) => {
     e.preventDefault();
-    const btn = $('#login-btn');
-    const err = $('#login-error');
+    const btn = $('login-btn');
+    const err = $('login-error');
     err.classList.remove('show');
     btn.disabled = true;
     btn.textContent = 'Aanmelden...';
-
     try {
-      // ss.login() werkt direct (zoals in werkende versie)
       await ss.login({
-        username: $('#in-user').value.trim(),
-        password: $('#in-pass').value,
-        main_url: $('#in-url').value.trim(),
-        mfa: $('#in-mfa').value.trim() || undefined,
+        username: $('in-user').value.trim(),
+        password: $('in-pass').value,
+        main_url: $('in-url').value.trim(),
+        mfa:      $('in-mfa').value.trim() || undefined,
       });
       onLoggedIn();
     } catch (e) {
@@ -703,215 +744,249 @@ async function checkAutoLogin() {
   try {
     const user = await ss.tryAutoLogin();
     if (user) onLoggedIn();
-  } catch (e) { /* ignore */ }
+  } catch {}
 }
 
 function onLoggedIn() {
   const u = ss.auth?.user || ss.user || {};
-  $('#user-name').textContent = u.username || 'Gebruiker';
-  $('#user-avatar').textContent = (u.username || '?').slice(0, 1).toUpperCase();
-  $('#dash-greet').textContent = 'Welkom terug, ' + (u.username || '');
-  $('#login-screen').style.display = 'none';
-  $('#app').classList.add('ready');
+  const name = u.username || 'Gebruiker';
+  $('user-name').textContent = name;
+  $('user-avatar').textContent = name.slice(0, 1).toUpperCase();
+  $('dash-greet').textContent = 'Welkom terug, ' + name;
+  $('login-screen').style.display = 'none';
+  $('app').classList.add('ready');
+
   setupAppEvents();
+  // Alleen het dashboard laden — rest lazy
   loadDashboard();
-  loadGrades();
-  loadPlanner();
-  loadTodos();
-  loadMessages('inbox');
-  loadProfile();
+  // Messages badge in de achtergrond (idle)
+  scheduleBadgeUpdate();
 }
 
 /* ============================================================
-   NAVIGATION
+   EVENTS — alles via delegation
    ============================================================ */
+let _eventsBound = false;
 function setupAppEvents() {
-  $$('.nav-item').forEach(btn => {
-    btn.addEventListener('click', () => switchPage(btn.dataset.page));
+  if (_eventsBound) return;
+  _eventsBound = true;
+
+  // Navigation — één listener op de sidebar
+  $('sidebar').addEventListener('click', (e) => {
+    const btn = e.target.closest('.nav-item');
+    if (btn) switchPage(btn.dataset.page);
   });
 
-  $('#menu-toggle').addEventListener('click', () => {
-    $('#sidebar').classList.toggle('open');
-  });
+  $('menu-toggle').addEventListener('click', () => $('sidebar').classList.toggle('open'));
 
-  $('#btn-refresh').addEventListener('click', () => {
+  $('btn-refresh').addEventListener('click', () => {
+    // Alleen de huidige pagina verversen
+    const active = document.querySelector('.nav-item.active')?.dataset.page || 'dashboard';
     toast('Vernieuwen...');
-    loadDashboard();
-    loadGrades();
-    loadPlanner();
-    loadTodos();
-    loadMessages(currentBox);
+    loaded[active] = false;
+    switchPage(active, true);
   });
 
-  $('#user-menu').addEventListener('click', () => {
-    if (confirm('Wil je afmelden?')) {
-      ss.logout();
-      location.reload();
-    }
+  $('user-menu').addEventListener('click', () => {
+    if (confirm('Wil je afmelden?')) { ss.logout(); location.reload(); }
   });
 
   // Planner nav
-  $('#week-prev').addEventListener('click', () => ss.planner.shiftWeek(-1));
-  $('#week-next').addEventListener('click', () => ss.planner.shiftWeek(1));
-  $('#week-today').addEventListener('click', () => ss.planner.goToToday());
+  $('week-prev').addEventListener('click',  () => ss.planner.shiftWeek(-1));
+  $('week-next').addEventListener('click',  () => ss.planner.shiftWeek(1));
+  $('week-today').addEventListener('click', () => ss.planner.goToToday());
 
-  // Planner events
+  // Todos scopes — delegation
+  $('todo-scopes').addEventListener('click', (e) => {
+    const tab = e.target.closest('.scope-tab');
+    if (!tab) return;
+    $$('.scope-tab', $('todo-scopes')).forEach(t => t.classList.toggle('active', t === tab));
+    todoScope = tab.dataset.scope;
+    ss.planner.loadTodos(todoScope);
+  });
+
+  // Nieuwe taak modal
+  $('btn-new-todo').addEventListener('click', () => {
+    $('todo-modal').classList.add('show');
+    $('todo-name').focus();
+    $('todo-date').value = new Date().toISOString().slice(0, 10);
+  });
+  $('todo-close').addEventListener('click',  () => $('todo-modal').classList.remove('show'));
+  $('todo-cancel').addEventListener('click', () => $('todo-modal').classList.remove('show'));
+  $('todo-create').addEventListener('click', createTodo);
+
+  // Message tabs — delegation
+  $('msg-tabs').addEventListener('click', (e) => {
+    const tab = e.target.closest('.msg-tab');
+    if (!tab) return;
+    $$('.msg-tab', $('msg-tabs')).forEach(t => t.classList.toggle('active', t === tab));
+    currentBox = tab.dataset.box;
+    currentMessageId = null;
+    loadMessages(currentBox);
+    $('msg-view').innerHTML = '<div class="empty"><div class="ic">✉</div><p>Selecteer een bericht</p></div>';
+  });
+
+  // Message list — delegation
+  $('msg-rows').addEventListener('click', (e) => {
+    const row = e.target.closest('.msg-row');
+    if (row) openMessage(row.dataset.id);
+  });
+
+  // Message view actions — delegation
+  $('msg-view').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    handleMessageAction(btn.dataset.action, btn);
+  });
+
+  // Todos list — delegation
+  $('todos-list').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-action]');
+    if (!btn) return;
+    const item = btn.closest('.todo-item');
+    if (!item) return;
+    handleTodoAction(btn.dataset.action, item.dataset.id, item.dataset.type);
+  });
+
+  // Compose
+  $('compose-close').addEventListener('click',  closeCompose);
+  $('compose-cancel').addEventListener('click', closeCompose);
+  $('compose-send').addEventListener('click',   sendCompose);
+  setupRecipientSearch();
+
+  // SS events — alleen de essentiële
+  bindSsevents();
+}
+
+function bindSsevents() {
+  if (!ss.on) return;
+
   ss.on('planner:week-loading', () => {
-    $('#planner-grid').innerHTML = '<div class="loading-center" style="grid-column:1/-1"><div class="spinner"></div></div>';
+    $('planner-grid').innerHTML = '<div class="loading-center" style="grid-column:1/-1"><div class="spinner"></div></div>';
   });
   ss.on('planner:week-loaded', ({ data }) => renderPlanner(data));
   ss.on('planner:error', ({ error }) => toast('Planner: ' + error.message, 'error'));
   ss.on('planner:my-class', (d) => {
-    if (d.exam_week) $('#exam-badge').style.display = 'inline-block';
-    else $('#exam-badge').style.display = 'none';
+    $('exam-badge').style.display = d.exam_week ? 'inline-block' : 'none';
   });
-
-  // Todos events
-  ss.on('planner:todos-loaded', ({ items }) => {
-    todosCache = items || [];
-    renderTodos();
-  });
-  ss.on('planner:todos-changed', (items) => {
-    todosCache = items || [];
-    renderTodos();
-  });
+  ss.on('planner:todos-loaded', ({ items }) => { todosCache = items || []; renderTodos(); });
+  ss.on('planner:todos-changed', (items) =>   { todosCache = items || []; renderTodos(); });
   ss.on('planner:todos-error', ({ error }) => toast('Taken: ' + error.message, 'error'));
 
-  // Todo scopes
-  $$('#todo-scopes .scope-tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-      $$('#todo-scopes .scope-tab').forEach(t => t.classList.remove('active'));
-      tab.classList.add('active');
-      todoScope = tab.dataset.scope;
-      ss.planner.loadTodos(todoScope);
-    });
-  });
-
-  // New todo modal
-  $('#btn-new-todo').addEventListener('click', () => {
-    $('#todo-modal').classList.add('show');
-    $('#todo-name').focus();
-    $('#todo-date').value = new Date().toISOString().slice(0, 10);
-  });
-  $('#todo-close').addEventListener('click', () => $('#todo-modal').classList.remove('show'));
-  $('#todo-cancel').addEventListener('click', () => $('#todo-modal').classList.remove('show'));
-  $('#todo-create').addEventListener('click', createTodo);
-
-  // Messages tabs
-  $$('#msg-tabs .msg-tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-      $$('#msg-tabs .msg-tab').forEach(t => t.classList.remove('active'));
-      tab.classList.add('active');
-      currentBox = tab.dataset.box;
-      currentMessageId = null;
-      loadMessages(currentBox);
-      $('#msg-view').innerHTML = '<div class="empty"><div class="ic">✉</div><p>Selecteer een bericht</p></div>';
-    });
-  });
-
-  // Messages events
   ss.on('messages:loaded', ({ messages }) => renderMessageList(messages));
-  ss.on('messages:error', ({ error }) => toast('Berichten: ' + error.message, 'error'));
-  ss.on('messages:opened', ({ message }) => renderMessageView(message));
+  ss.on('messages:error',  ({ error })    => toast('Berichten: ' + error.message, 'error'));
+  ss.on('messages:opened', ({ message })  => renderMessageView(message));
   ss.on('messages:read', () => {
-    // update UI: markeer als gelezen in de lijst
-    const row = document.querySelector(`.msg-row[data-id="${currentMessageId}"]`);
+    const row = document.querySelector(`.msg-row[data-id="${CSS.escape(String(currentMessageId))}"]`);
     if (row) row.classList.remove('unread');
   });
-
-  // Compose
-  $('#compose-close').addEventListener('click', closeCompose);
-  $('#compose-cancel').addEventListener('click', closeCompose);
-  $('#compose-send').addEventListener('click', sendCompose);
-  setupRecipientSearch();
-}
-
-function switchPage(page) {
-  $$('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.page === page));
-  $$('.page').forEach(p => p.classList.toggle('active', p.id === 'page-' + page));
-  $('#sidebar').classList.remove('open');
 }
 
 /* ============================================================
-   DASHBOARD
+   NAVIGATION + LAZY LOAD
    ============================================================ */
-async function loadDashboard() {
-  try {
-    const results = await Promise.allSettled([
-      ss.grades.load(true),
-      ss.planner.loadWeek(0),
-      ss.planner.loadMyClass(),
-      ss.planner.loadTodos('open'),
-    ]);
+function switchPage(page, force = false) {
+  // UI update
+  $$('.nav-item').forEach(b => b.classList.toggle('active', b.dataset.page === page));
+  $$('.page').forEach(p => p.classList.toggle('active', p.id === 'page-' + page));
+  $('sidebar').classList.remove('open');
 
-    const g = results[0].status === 'fulfilled' ? results[0].value : ss.grades.cache;
-    const w = results[1].status === 'fulfilled' ? results[1].value : ss.planner.weekData;
-    const c = results[2].status === 'fulfilled' ? results[2].value : null;
-    const t = results[3].status === 'fulfilled' ? results[3].value : null;
+  if (force) loaded[page] = false;
 
-    const cards = [];
+  // Lazy load — alleen als nog niet geladen
+  if (loaded[page]) return;
+  loaded[page] = true;
 
-    if (g) {
-      const avg = computeAverage(g.courses);
-      cards.push(`
-        <div class="card">
-          <div style="font-size:12px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:0.05em">Gemiddelde</div>
-          <div style="font-size:36px;font-weight:700;margin:6px 0;font-family:var(--mono)">${avg ? avg.toFixed(1) : '—'}<span style="font-size:16px;color:var(--text-dim)">/10</span></div>
-          <div style="font-size:13px;color:var(--text-dim)">${g.total_evaluations || 0} evaluaties · ${g.total_courses || 0} vakken</div>
-        </div>
-      `);
-    }
-
-    if (w) {
-      const itemCount = (w.items || []).length;
-      cards.push(`
-        <div class="card">
-          <div style="font-size:12px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:0.05em">Deze week</div>
-          <div style="font-size:36px;font-weight:700;margin:6px 0;font-family:var(--mono)">${itemCount}</div>
-          <div style="font-size:13px;color:var(--text-dim)">${esc(w.week_start || '')} → ${esc(w.week_end || '')}</div>
-        </div>
-      `);
-    }
-
-    if (c) {
-      cards.push(`
-        <div class="card">
-          <div style="font-size:12px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:0.05em">Mijn klas</div>
-          <div style="font-size:36px;font-weight:700;margin:6px 0">${esc(c.class || '—')}</div>
-          <div style="font-size:13px;color:var(--text-dim)">${c.exam_week ? '⚠️ Examenweek' : 'Normale week'}</div>
-        </div>
-      `);
-    }
-
-    if (t) {
-      const open = (t.items || []).filter(i => i.st !== 'resolved').length;
-      cards.push(`
-        <div class="card">
-          <div style="font-size:12px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:0.05em">Open taken</div>
-          <div style="font-size:36px;font-weight:700;margin:6px 0;font-family:var(--mono)">${open}</div>
-          <div style="font-size:13px;color:var(--text-dim)">Te voltooien</div>
-        </div>
-      `);
-    }
-
-    $('#dash-cards').innerHTML = cards.join('') || '<div class="card"><p style="color:var(--text-dim)">Geen data beschikbaar</p></div>';
-  } catch (e) {
-    console.error(e);
+  switch (page) {
+    case 'dashboard': loadDashboard(); break;
+    case 'grades':    loadGrades();    break;
+    case 'planner':   loadPlanner();   break;
+    case 'todos':     loadTodos();     break;
+    case 'messages':  if (!currentBox) loadMessages('inbox'); break;
+    case 'profile':   loadProfile();   break;
   }
 }
 
+/* ============================================================
+   DASHBOARD — progressieve rendering per kaart
+   ============================================================ */
+function loadDashboard() {
+  const container = $('dash-cards');
+
+  // Zet meteen placeholders neer
+  container.innerHTML = `
+    <div class="card" id="dc-avg"><div class="loading-center"><div class="spinner"></div></div></div>
+    <div class="card" id="dc-week"><div class="loading-center"><div class="spinner"></div></div></div>
+    <div class="card" id="dc-class"><div class="loading-center"><div class="spinner"></div></div></div>
+    <div class="card" id="dc-todos"><div class="loading-center"><div class="spinner"></div></div></div>
+  `;
+
+  // Alle 4 parallel, elk rendert zodra klaar
+  dedupe('grades', () => ss.grades.load(true))
+    .then(g => renderDashAvg(g))
+    .catch(() => $('dc-avg').innerHTML = '<p style="color:var(--text-dim)">—</p>');
+
+  dedupe('week:0', () => ss.planner.loadWeek(0))
+    .then(w => renderDashWeek(w))
+    .catch(() => $('dc-week').innerHTML = '<p style="color:var(--text-dim)">—</p>');
+
+  dedupe('myclass', () => ss.planner.loadMyClass())
+    .then(c => renderDashClass(c))
+    .catch(() => $('dc-class').innerHTML = '<p style="color:var(--text-dim)">—</p>');
+
+  dedupe('todos:open', () => ss.planner.loadTodos('open'))
+    .then(t => renderDashTodos(t))
+    .catch(() => $('dc-todos').innerHTML = '<p style="color:var(--text-dim)">—</p>');
+}
+
+function renderDashAvg(g) {
+  const avg = computeAverage(g?.courses);
+  $('dc-avg').innerHTML = `
+    <div style="font-size:12px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:0.05em">Gemiddelde</div>
+    <div style="font-size:36px;font-weight:700;margin:6px 0;font-family:var(--mono)">${avg ? avg.toFixed(1) : '—'}<span style="font-size:16px;color:var(--text-dim)">/10</span></div>
+    <div style="font-size:13px;color:var(--text-dim)">${g?.total_evaluations || 0} evaluaties · ${g?.total_courses || 0} vakken</div>
+  `;
+}
+
+function renderDashWeek(w) {
+  $('dc-week').innerHTML = `
+    <div style="font-size:12px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:0.05em">Deze week</div>
+    <div style="font-size:36px;font-weight:700;margin:6px 0;font-family:var(--mono)">${(w?.items || []).length}</div>
+    <div style="font-size:13px;color:var(--text-dim)">${esc(w?.week_start || '')} → ${esc(w?.week_end || '')}</div>
+  `;
+}
+
+function renderDashClass(c) {
+  $('dc-class').innerHTML = `
+    <div style="font-size:12px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:0.05em">Mijn klas</div>
+    <div style="font-size:36px;font-weight:700;margin:6px 0">${esc(c?.class || '—')}</div>
+    <div style="font-size:13px;color:var(--text-dim)">${c?.exam_week ? '⚠️ Examenweek' : 'Normale week'}</div>
+  `;
+}
+
+function renderDashTodos(t) {
+  const open = (t?.items || []).filter(i => i.st !== 'resolved').length;
+  $('dc-todos').innerHTML = `
+    <div style="font-size:12px;color:var(--text-dim);font-weight:600;text-transform:uppercase;letter-spacing:0.05em">Open taken</div>
+    <div style="font-size:36px;font-weight:700;margin:6px 0;font-family:var(--mono)">${open}</div>
+    <div style="font-size:13px;color:var(--text-dim)">Te voltooien</div>
+  `;
+}
+
 function computeAverage(courses) {
-  if (!courses || !courses.length) return null;
-  const vals = [];
-  courses.forEach(c => {
-    (c.evaluations || []).forEach(ev => {
-      if (ev.does_count === false) return;
+  if (!courses?.length) return null;
+  let sum = 0, n = 0;
+  for (let i = 0; i < courses.length; i++) {
+    const evals = courses[i].evaluations;
+    if (!evals) continue;
+    for (let j = 0; j < evals.length; j++) {
+      const ev = evals[j];
+      if (ev.does_count === false) continue;
       const p = parseFloat(ev.percentage);
-      if (!isNaN(p)) vals.push(p / 10);
-    });
-  });
-  if (!vals.length) return null;
-  return vals.reduce((a, b) => a + b, 0) / vals.length;
+      if (!isNaN(p)) { sum += p / 10; n++; }
+    }
+  }
+  return n ? sum / n : null;
 }
 
 /* ============================================================
@@ -919,73 +994,78 @@ function computeAverage(courses) {
    ============================================================ */
 async function loadGrades() {
   try {
-    const data = await ss.grades.load(true);
+    const data = await dedupe('grades', () => ss.grades.load(true));
     renderGrades(data);
   } catch (e) {
-    $('#grades-list').innerHTML = `<div class="empty"><p style="color:var(--red)">${esc(e.message)}</p></div>`;
+    $('grades-list').innerHTML = `<div class="empty"><p style="color:var(--red)">${esc(e.message)}</p></div>`;
   }
 }
 
-// Event listener als backup
-ss.on?.('grades:loaded', (data) => {
-  if (data && data.courses) renderGrades(data);
-});
+const GRADE_COLOR = { green: 'var(--green)', red: 'var(--red)', orange: 'var(--orange)', blue: 'var(--accent)' };
 
 function renderGrades(data) {
-  const courses = data.courses || [];
+  const courses = data?.courses || [];
+  const list = $('grades-list');
+
   if (!courses.length) {
-    $('#grades-list').innerHTML = '<div class="empty"><div class="ic">◈</div><p>Geen cijfers gevonden</p></div>';
+    list.innerHTML = '<div class="empty"><div class="ic">◈</div><p>Geen cijfers gevonden</p></div>';
     return;
   }
-  $('#grades-sub').textContent = `${data.total_evaluations || 0} evaluaties · ${data.total_courses || 0} vakken`;
 
-  $('#grades-list').innerHTML = courses.map(c => {
-    const evals = c.evaluations || [];
-    const avg = computeCourseAvg(evals);
-    return `
-      <div class="card course-card">
-        <div class="course-head">
-          <span class="course-name">${esc(c.course_name)}</span>
-          <span class="course-avg" style="color:${avgColor(avg)}">${avg ? avg.toFixed(1) : '—'}</span>
-        </div>
-        ${evals.map(ev => {
-          const pct = parseFloat(ev.percentage);
-          const color = ev.color || (pct >= 70 ? 'green' : pct >= 50 ? 'orange' : 'red');
-          return `
-            <div class="eval-row">
-              <span class="eval-score score-${color}">${esc(ev.score || '—')}</span>
-              <div class="eval-info">
-                <div class="eval-name">${esc(ev.name)}</div>
-                <div class="eval-meta">${esc(ev.date || '')}${ev.period ? ' · periode ' + esc(ev.period) : ''}${ev.teacher ? ' · ' + esc(ev.teacher) : ''}</div>
-              </div>
-              <div class="eval-bar"><div class="eval-bar-fill" style="width:${Math.min(100, pct || 0)}%;background:${barColor(color)}"></div></div>
-            </div>
-          `;
-        }).join('')}
-      </div>
-    `;
-  }).join('');
+  $('grades-sub').textContent = `${data.total_evaluations || 0} evaluaties · ${data.total_courses || 0} vakken`;
+
+  // Bouw alle HTML in één keer (sneller dan += per course)
+  const parts = [];
+  for (let i = 0; i < courses.length; i++) {
+    parts.push(buildCourseCard(courses[i]));
+  }
+  list.innerHTML = parts.join('');
+}
+
+function buildCourseCard(c) {
+  const evals = c.evaluations || [];
+  const avg = computeCourseAvg(evals);
+  const avgCol = avg >= 7 ? 'var(--green)' : avg >= 5 ? 'var(--orange)' : 'var(--red)';
+  const evalParts = [];
+
+  for (let i = 0; i < evals.length; i++) {
+    const ev = evals[i];
+    const pct = parseFloat(ev.percentage);
+    const color = ev.color || (pct >= 70 ? 'green' : pct >= 50 ? 'orange' : 'red');
+    const barCol = GRADE_COLOR[color] || 'var(--accent)';
+    evalParts.push(
+      `<div class="eval-row">` +
+        `<span class="eval-score score-${color}">${esc(ev.score || '—')}</span>` +
+        `<div class="eval-info">` +
+          `<div class="eval-name">${esc(ev.name)}</div>` +
+          `<div class="eval-meta">${esc(ev.date || '')}${ev.period ? ' · periode ' + esc(ev.period) : ''}${ev.teacher ? ' · ' + esc(ev.teacher) : ''}</div>` +
+        `</div>` +
+        `<div class="eval-bar"><div class="eval-bar-fill" style="width:${Math.min(100, pct || 0)}%;background:${barCol}"></div></div>` +
+      `</div>`
+    );
+  }
+
+  return (
+    `<div class="card course-card">` +
+      `<div class="course-head">` +
+        `<span class="course-name">${esc(c.course_name)}</span>` +
+        `<span class="course-avg" style="color:${avg != null ? avgCol : 'var(--text-dim)'}">${avg != null ? avg.toFixed(1) : '—'}</span>` +
+      `</div>` +
+      evalParts.join('') +
+    `</div>`
+  );
 }
 
 function computeCourseAvg(evals) {
-  const vals = [];
-  (evals || []).forEach(ev => {
-    if (ev.does_count === false) return;
+  if (!evals?.length) return null;
+  let sum = 0, n = 0;
+  for (let i = 0; i < evals.length; i++) {
+    const ev = evals[i];
+    if (ev.does_count === false) continue;
     const p = parseFloat(ev.percentage);
-    if (!isNaN(p)) vals.push(p / 10);
-  });
-  if (!vals.length) return null;
-  return vals.reduce((a, b) => a + b, 0) / vals.length;
-}
-
-function avgColor(avg) {
-  if (!avg) return 'var(--text-dim)';
-  if (avg >= 7) return 'var(--green)';
-  if (avg >= 5) return 'var(--orange)';
-  return 'var(--red)';
-}
-function barColor(c) {
-  return { green: 'var(--green)', red: 'var(--red)', orange: 'var(--orange)', blue: 'var(--accent)' }[c] || 'var(--accent)';
+    if (!isNaN(p)) { sum += p / 10; n++; }
+  }
+  return n ? sum / n : null;
 }
 
 /* ============================================================
@@ -993,95 +1073,74 @@ function barColor(c) {
    ============================================================ */
 async function loadPlanner() {
   try {
-    await ss.planner.loadMyClass();
-    await ss.planner.loadWeek(0);
+    await dedupe('myclass', () => ss.planner.loadMyClass());
+    await dedupe('week:0', () => ss.planner.loadWeek(0));
   } catch (e) {
     toast('Planner: ' + e.message, 'error');
   }
 }
 
-function renderPlanner(data) {
-  const items = data.items || [];
-  $('#week-label').textContent = `${data.week_start || ''} → ${data.week_end || ''}`;
-  if (data.meta?.exam_week) $('#exam-badge').style.display = 'inline-block';
-  else $('#exam-badge').style.display = 'none';
+const DAY_NAMES = ['Ma', 'Di', 'Wo', 'Do', 'Vr', 'Za', 'Zo'];
 
-  // Gebruik ss.planner.getWeekBounds() voor correcte week
+function renderPlanner(data) {
+  const items = data?.items || [];
+  $('week-label').textContent = `${data?.week_start || ''} → ${data?.week_end || ''}`;
+  $('exam-badge').style.display = data?.meta?.exam_week ? 'inline-block' : 'none';
+
+  // Bepaal maandag
   let monday;
   try {
-    const bounds = ss.planner.getWeekBounds();
-    monday = bounds.monday;
+    monday = ss.planner.getWeekBounds().monday;
   } catch {
     monday = new Date(data.week_start);
   }
   monday.setHours(0, 0, 0, 0);
 
-  const days = ['Ma', 'Di', 'Wo', 'Do', 'Vr', 'Za', 'Zo'];
   const today = new Date(); today.setHours(0, 0, 0, 0);
 
-  // Groepeer via ss.planner.groupBySlot() als beschikbaar
-  let perSlot = {}, perWholeday = {};
-  try {
-    const grouped = ss.planner.groupBySlot();
-    perSlot = grouped.perSlot || {};
-    perWholeday = grouped.perWholeday || {};
-  } catch {
-    // fallback: handmatig groeperen
-    items.forEach(it => {
-      if (!it.df) return;
-      const d = new Date(it.df);
-      const key = dateKey(d) + '|' + (it._hourId || '');
-      perSlot[key] = perSlot[key] || [];
-      perSlot[key].push(it);
-    });
+  // Groepeer per dag — één keer
+  const byDay = new Map();
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (!it.df) continue;
+    const d = new Date(it.df);
+    const key = d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
+    let arr = byDay.get(key);
+    if (!arr) { arr = []; byDay.set(key, arr); }
+    arr.push(it);
   }
 
-  let html = '';
+  // Bouw HTML
+  const parts = [];
   for (let i = 0; i < 7; i++) {
-    const d = new Date(monday); d.setDate(d.getDate() + i);
-    const k = dateKey(d);
-    const isToday = d.getTime() === today.getTime();
-    const dayItems = items.filter(it => {
-      if (!it.df) return false;
-      const dt = new Date(it.df); dt.setHours(0,0,0,0);
-      return dt.getTime() === d.getTime();
-    }).sort((a, b) => (a.df || 0) - (b.df || 0));
+    const d = new Date(monday);
+    d.setDate(d.getDate() + i);
+    const key = d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
+    const dayItems = byDay.get(key) || [];
+    dayItems.sort((a, b) => (a.df || 0) - (b.df || 0));
 
-    html += `<div class="day-col">
-      <div class="day-head ${isToday ? 'today' : ''}">${days[i]} ${d.getDate()}</div>
-      ${dayItems.length ? dayItems.map(renderPlannerItem).join('') : '<div style="font-size:12px;color:var(--text-faint);padding:6px 10px">—</div>'}
-    </div>`;
+    const isToday = d.getTime() === today.getTime();
+    parts.push('<div class="day-col"><div class="day-head' + (isToday ? ' today' : '') + '">' + DAY_NAMES[i] + ' ' + d.getDate() + '</div>');
+    if (dayItems.length) {
+      for (let j = 0; j < dayItems.length; j++) parts.push(renderPlannerItem(dayItems[j]));
+    } else {
+      parts.push('<div style="font-size:12px;color:var(--text-faint);padding:6px 10px">—</div>');
+    }
+    parts.push('</div>');
   }
 
-  $('#planner-grid').innerHTML = html;
-
-  $$('#planner-grid .planner-item').forEach(el => {
-    el.addEventListener('click', () => {
-      const id = el.dataset.id;
-      const type = el.dataset.type;
-      const isDone = el.classList.contains('done');
-      if (type === 'planned-to-dos') {
-        ss.planner.toggleTodo(id, type, !isDone).catch(e => toast(e.message, 'error'));
-      } else if (type === 'planned-assignments') {
-        ss.planner.itemAction(id, isDone ? 'unresolve' : 'resolve', type).catch(e => toast(e.message, 'error'));
-      }
-    });
-  });
+  $('planner-grid').innerHTML = parts.join('');
 }
 
 function renderPlannerItem(it) {
   const typeClass = it.t === 'planned-to-dos' ? 'type-todo' : it.t === 'planned-assignments' ? 'type-assignment' : 'type-lesson';
   const done = it.st === 'resolved' || it.dl === 1;
-  return `
-    <div class="planner-item ${typeClass} ${done ? 'done' : ''}" data-id="${esc(it.i)}" data-type="${esc(it.t)}">
-      <div class="pi-name">${esc(it.n || it.c || '')}</div>
-      <div class="pi-meta">${esc(it.c || '')}${it.df ? ' · ' + fmtTime(it.df) : ''}${it.l ? ' · ' + esc(it.l) : ''}</div>
-    </div>
-  `;
-}
-
-function dateKey(d) {
-  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  return (
+    `<div class="planner-item ${typeClass}${done ? ' done' : ''}" data-id="${esc(it.i)}" data-type="${esc(it.t)}">` +
+      `<div class="pi-name">${esc(it.n || it.c || '')}</div>` +
+      `<div class="pi-meta">${esc(it.c || '')}${it.df ? ' · ' + fmtTime(it.df) : ''}${it.l ? ' · ' + esc(it.l) : ''}</div>` +
+    `</div>`
+  );
 }
 
 /* ============================================================
@@ -1089,7 +1148,7 @@ function dateKey(d) {
    ============================================================ */
 async function loadTodos() {
   try {
-    await ss.planner.loadTodos(todoScope);
+    await dedupe('todos:' + todoScope, () => ss.planner.loadTodos(todoScope));
   } catch (e) {
     toast('Taken: ' + e.message, 'error');
   }
@@ -1097,70 +1156,75 @@ async function loadTodos() {
 
 function renderTodos() {
   const items = todosCache || [];
+  const list = $('todos-list');
+
   if (!items.length) {
-    $('#todos-list').innerHTML = '<div class="empty"><div class="ic">☑</div><p>Geen taken</p></div>';
+    list.innerHTML = '<div class="empty"><div class="ic">☑</div><p>Geen taken</p></div>';
     return;
   }
-  const now = new Date(); now.setHours(0,0,0,0);
-  const tomorrow = new Date(now); tomorrow.setDate(now.getDate() + 1);
 
-  $('#todos-list').innerHTML = items.map(t => {
+  const now = new Date(); now.setHours(0, 0, 0, 0);
+  const tomorrow = new Date(now); tomorrow.setDate(now.getDate() + 1);
+  const nowTs = now.getTime(), tomTs = tomorrow.getTime();
+
+  const parts = [];
+  for (let i = 0; i < items.length; i++) {
+    const t = items[i];
     const done = t.st === 'resolved';
+
     let dateStr = '';
     if (t.df) {
       const dt = new Date(t.df);
-      const d0 = new Date(dt); d0.setHours(0,0,0,0);
-      if (d0.getTime() === now.getTime()) dateStr = 'vandaag';
-      else if (d0.getTime() === tomorrow.getTime()) dateStr = 'morgen';
+      const d0 = new Date(dt); d0.setHours(0, 0, 0, 0);
+      const ts = d0.getTime();
+      if (ts === nowTs) dateStr = 'vandaag';
+      else if (ts === tomTs) dateStr = 'morgen';
       else dateStr = fmtDate(dt);
     }
-    return `
-      <div class="todo-item ${done ? 'done' : ''}" data-id="${esc(t.i)}" data-type="${esc(t.t || 'planned-to-dos')}">
-        <button class="todo-check ${done ? 'done' : ''}" data-action="toggle">✓</button>
-        <div class="todo-body">
-          <div class="todo-name">${esc(t.n || '')}</div>
-          <div class="todo-meta">${dateStr ? fmtDate(t.df) + ' · ' : ''}${esc(t.c || '')}${t.ab ? ' · ' + esc(t.ab) : ''}</div>
-        </div>
-        <button class="todo-del" data-action="delete">🗑</button>
-      </div>
-    `;
-  }).join('');
 
-  $$('#todos-list .todo-item').forEach(el => {
-    const id = el.dataset.id;
-    const type = el.dataset.type;
-    const todo = items.find(x => String(x.i) === String(id));
-    if (!todo) return;
-    const done = todo.st === 'resolved';
+    parts.push(
+      `<div class="todo-item${done ? ' done' : ''}" data-id="${esc(t.i)}" data-type="${esc(t.t || 'planned-to-dos')}">` +
+        `<button class="todo-check${done ? ' done' : ''}" data-action="toggle">✓</button>` +
+        `<div class="todo-body">` +
+          `<div class="todo-name">${esc(t.n || '')}</div>` +
+          `<div class="todo-meta">${dateStr ? esc(dateStr) + ' · ' : ''}${esc(t.c || '')}${t.ab ? ' · ' + esc(t.ab) : ''}</div>` +
+        `</div>` +
+        `<button class="todo-del" data-action="delete">🗑</button>` +
+      `</div>`
+    );
+  }
+  list.innerHTML = parts.join('');
+}
 
-    el.querySelector('[data-action="toggle"]').addEventListener('click', (e) => {
-      e.stopPropagation();
-      ss.planner.toggleTodo(id, type, !done).catch(err => toast(err.message, 'error'));
-    });
-    el.querySelector('[data-action="delete"]').addEventListener('click', (e) => {
-      e.stopPropagation();
-      if (confirm('Taak verwijderen?')) {
-        ss.planner.deleteTodo(id, type).catch(err => toast(err.message, 'error'));
-      }
-    });
-  });
+function handleTodoAction(action, id, type) {
+  const todo = todosCache.find(x => String(x.i) === String(id));
+  if (!todo) return;
+  const done = todo.st === 'resolved';
+
+  if (action === 'toggle') {
+    ss.planner.toggleTodo(id, type, !done).catch(err => toast(err.message, 'error'));
+  } else if (action === 'delete') {
+    if (confirm('Taak verwijderen?')) {
+      ss.planner.deleteTodo(id, type).catch(err => toast(err.message, 'error'));
+    }
+  }
 }
 
 async function createTodo() {
-  const name = $('#todo-name').value.trim();
+  const name = $('todo-name').value.trim();
   if (!name) return toast('Naam is verplicht', 'error');
   try {
     await ss.planner.createTodo({
       name,
-      description: $('#todo-desc').value.trim(),
-      date_from: $('#todo-date').value,
-      date_to: $('#todo-date').value,
+      description: $('todo-desc').value.trim(),
+      date_from: $('todo-date').value,
+      date_to:   $('todo-date').value,
       color: 'blue-200',
       whole_day: false,
     });
-    $('#todo-modal').classList.remove('show');
-    $('#todo-name').value = '';
-    $('#todo-desc').value = '';
+    $('todo-modal').classList.remove('show');
+    $('todo-name').value = '';
+    $('todo-desc').value = '';
     toast('Taak aangemaakt', 'success');
     loadTodos();
   } catch (e) {
@@ -1171,13 +1235,18 @@ async function createTodo() {
 /* ============================================================
    MESSAGES
    ============================================================ */
+let currentBox = 'inbox';
+let currentMessageId = null;
+let todoScope = 'open';
+let todosCache = [];
+
 async function loadMessages(box, silent = false) {
   currentBox = box;
   if (!silent) {
-    $('#msg-rows').innerHTML = '<div class="loading-center" style="padding:40px"><div class="spinner"></div></div>';
+    $('msg-rows').innerHTML = '<div class="loading-center" style="padding:40px"><div class="spinner"></div></div>';
   }
   try {
-    await ss.messages.loadList(box);
+    await dedupe('msgs:' + box, () => ss.messages.loadList(box));
   } catch (e) {
     if (!silent) toast('Berichten: ' + e.message, 'error');
   }
@@ -1185,13 +1254,18 @@ async function loadMessages(box, silent = false) {
 
 function renderMessageList(messages) {
   const list = messages || ss.messages.list || [];
+  const container = $('msg-rows');
+
   if (!list.length) {
-    $('#msg-rows').innerHTML = '<div class="empty" style="padding:40px"><div class="ic">✉</div><p>Geen berichten</p></div>';
+    container.innerHTML = '<div class="empty" style="padding:40px"><div class="ic">✉</div><p>Geen berichten</p></div>';
     return;
   }
 
-  const unread = list.filter(m => m.unread || m.is_unread).length;
-  const badge = $('#msg-badge');
+  // Unread badge
+  let unread = 0;
+  for (let i = 0; i < list.length; i++) if (list[i].unread || list[i].is_unread) unread++;
+
+  const badge = $('msg-badge');
   if (unread > 0 && currentBox === 'inbox') {
     badge.textContent = unread;
     badge.style.display = 'inline-block';
@@ -1199,31 +1273,30 @@ function renderMessageList(messages) {
     badge.style.display = 'none';
   }
 
-  $('#msg-rows').innerHTML = list.map(m => {
+  const parts = [];
+  for (let i = 0; i < list.length; i++) {
+    const m = list[i];
     const isUnread = m.unread || m.is_unread;
     const active = String(m.id) === String(currentMessageId);
-    return `
-      <div class="msg-row ${isUnread ? 'unread' : ''} ${active ? 'active' : ''}" data-id="${esc(m.id)}">
-        <div class="msg-from">${isUnread ? '<span class="msg-dot"></span>' : ''}${esc(m.from || m.sender || 'Onbekend')}</div>
-        <div class="msg-subject">${esc(m.subject || '(geen onderwerp)')}</div>
-        <div class="msg-date">${fmtDate(m.date || m.timestamp)}</div>
-      </div>
-    `;
-  }).join('');
-
-  $$('#msg-rows .msg-row').forEach(row => {
-    row.addEventListener('click', () => openMessage(row.dataset.id));
-  });
+    parts.push(
+      `<div class="msg-row${isUnread ? ' unread' : ''}${active ? ' active' : ''}" data-id="${esc(m.id)}">` +
+        `<div class="msg-from">${isUnread ? '<span class="msg-dot"></span>' : ''}${esc(m.from || m.sender || 'Onbekend')}</div>` +
+        `<div class="msg-subject">${esc(m.subject || '(geen onderwerp)')}</div>` +
+        `<div class="msg-date">${fmtDate(m.date || m.timestamp)}</div>` +
+      `</div>`
+    );
+  }
+  container.innerHTML = parts.join('');
 }
 
 async function openMessage(id) {
   currentMessageId = id;
-  $$('#msg-rows .msg-row').forEach(r => r.classList.toggle('active', r.dataset.id === id));
-  $('#msg-view').innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
+  $$('.msg-row').forEach(r => r.classList.toggle('active', r.dataset.id === id));
+  $('msg-view').innerHTML = '<div class="loading-center"><div class="spinner"></div></div>';
   try {
     await ss.messages.openMessage(id, currentBox);
   } catch (e) {
-    $('#msg-view').innerHTML = `<div class="empty"><p style="color:var(--red)">${esc(e.message)}</p></div>`;
+    $('msg-view').innerHTML = `<div class="empty"><p style="color:var(--red)">${esc(e.message)}</p></div>`;
   }
 }
 
@@ -1232,161 +1305,167 @@ function renderMessageView(msg) {
   const body = msg.body_html || msg.bodyHtml || msg.body || msg.html || '<p style="color:var(--text-dim)">Geen inhoud</p>';
   const canReply = currentBox === 'inbox' || currentBox === 'archive';
 
-  $('#msg-view').innerHTML = `
-    <div class="msg-view-head">
-      <h3>${esc(msg.subject || '(geen onderwerp)')}</h3>
-      <div class="msg-view-meta">
-        <span>Van: <strong>${esc(msg.sender || msg.from || 'Onbekend')}</strong></span>
-        <span>${esc(msg.date || '')}</span>
-      </div>
-    </div>
-    <div class="msg-view-body">
-      ${body}
-      ${attachments.length ? `
-        <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border-soft)">
-          <div style="font-size:12px;color:var(--text-dim);margin-bottom:6px;font-weight:600">BIJLAGEN (${attachments.length})</div>
-          ${attachments.map(a => `
-            <span class="attach-chip" data-file="${esc(a.file_id || a.id || a.fileId)}" data-name="${esc(a.name || a.filename || 'bestand')}">
-              📎 ${esc(a.name || a.filename || 'bestand')}${a.size ? ' <small style="color:var(--text-faint)">' + esc(a.size) + '</small>' : ''}
-            </span>
-          `).join('')}
-        </div>
-      ` : ''}
-    </div>
-    <div class="msg-view-actions">
-      ${canReply ? '<button class="btn-sm primary" data-action="reply">↩ Antwoorden</button>' : ''}
-      <button class="btn-sm" data-action="unread">📬 Ongelezen</button>
-      ${currentBox !== 'trash' ? '<button class="btn-sm" data-action="trash">🗑 Verwijderen</button>' : ''}
-      ${currentBox === 'inbox' ? '<button class="btn-sm" data-action="archive">📥 Archiveren</button>' : ''}
-    </div>
-  `;
+  let attachHtml = '';
+  if (attachments.length) {
+    const chips = [];
+    for (let i = 0; i < attachments.length; i++) {
+      const a = attachments[i];
+      chips.push(
+        `<span class="attach-chip" data-file="${esc(a.file_id || a.id || a.fileId)}" data-name="${esc(a.name || a.filename || 'bestand')}">` +
+          `📎 ${esc(a.name || a.filename || 'bestand')}` +
+          (a.size ? ` <small style="color:var(--text-faint)">${esc(a.size)}</small>` : '') +
+        `</span>`
+      );
+    }
+    attachHtml = '<div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border-soft)">' +
+      '<div style="font-size:12px;color:var(--text-dim);margin-bottom:6px;font-weight:600">BIJLAGEN (' + attachments.length + ')</div>' +
+      chips.join('') + '</div>';
+  }
 
-  $$('#msg-view .attach-chip').forEach(chip => {
-    chip.addEventListener('click', async () => {
-      try {
-        const blob = await ss.messages.downloadAttachment(msg.id, chip.dataset.file);
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url; a.download = chip.dataset.name || 'bijlage';
-        document.body.appendChild(a); a.click(); document.body.removeChild(a);
-        setTimeout(() => URL.revokeObjectURL(url), 1000);
-        toast('Download gestart', 'success');
-      } catch (e) {
-        toast('Download mislukt: ' + e.message, 'error');
-      }
-    });
-  });
+  $('msg-view').innerHTML =
+    '<div class="msg-view-head">' +
+      '<h3>' + esc(msg.subject || '(geen onderwerp)') + '</h3>' +
+      '<div class="msg-view-meta">' +
+        '<span>Van: <strong>' + esc(msg.sender || msg.from || 'Onbekend') + '</strong></span>' +
+        '<span>' + esc(msg.date || '') + '</span>' +
+      '</div>' +
+    '</div>' +
+    '<div class="msg-view-body">' + body + attachHtml + '</div>' +
+    '<div class="msg-view-actions">' +
+      (canReply ? '<button class="btn-sm primary" data-action="reply">↩ Antwoorden</button>' : '') +
+      '<button class="btn-sm" data-action="unread">📬 Ongelezen</button>' +
+      (currentBox !== 'trash' ? '<button class="btn-sm" data-action="trash">🗑 Verwijderen</button>' : '') +
+      (currentBox === 'inbox' ? '<button class="btn-sm" data-action="archive">📥 Archiveren</button>' : '') +
+    '</div>';
 
-  $('#msg-view [data-action="trash"]')?.addEventListener('click', async () => {
-    try {
-      await ss.messages.action(msg.id, 'trash');
-      toast('Verwijderd', 'success');
-      loadMessages(currentBox);
-      $('#msg-view').innerHTML = '<div class="empty"><div class="ic">✉</div><p>Selecteer een bericht</p></div>';
-    } catch (e) { toast(e.message, 'error'); }
-  });
+  // Image fix — eenmalig na render
+  fixRelativeImages($('msg-view'));
+}
 
-  $('#msg-view [data-action="archive"]')?.addEventListener('click', async () => {
-    try {
-      await ss.messages.action(msg.id, 'archive');
-      toast('Gearchiveerd', 'success');
-      loadMessages(currentBox);
-      $('#msg-view').innerHTML = '<div class="empty"><div class="ic">✉</div><p>Selecteer een bericht</p></div>';
-    } catch (e) { toast(e.message, 'error'); }
-  });
+async function handleMessageAction(action, btn) {
+  const id = currentMessageId;
+  if (!id) return;
 
-  $('#msg-view [data-action="unread"]')?.addEventListener('click', async () => {
-    try {
-      await ss.messages.action(msg.id, 'unread');
-      toast('Gemarkeerd als ongelezen', 'success');
-      loadMessages(currentBox);
-    } catch (e) { toast(e.message, 'error'); }
-  });
-
-  $('#msg-view [data-action="reply"]')?.addEventListener('click', () => {
+  if (action === 'reply') {
+    const msg = ss.messages.currentMessage || {};
     openCompose(msg.sender || msg.from, 'Re: ' + (msg.subject || ''));
-  });
+    return;
+  }
+
+  if (action === 'download') {
+    const chip = btn.closest('.attach-chip');
+    if (!chip) return;
+    try {
+      const blob = await ss.messages.downloadAttachment(id, chip.dataset.file);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = chip.dataset.name || 'bijlage';
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast('Download gestart', 'success');
+    } catch (e) {
+      toast('Download mislukt: ' + e.message, 'error');
+    }
+    return;
+  }
+
+  try {
+    await ss.messages.action(id, action);
+    toast(action === 'trash' ? 'Verwijderd' : action === 'archive' ? 'Gearchiveerd' : 'Gemarkeerd', 'success');
+    loadMessages(currentBox);
+    if (action === 'trash' || action === 'archive') {
+      $('msg-view').innerHTML = '<div class="empty"><div class="ic">✉</div><p>Selecteer een bericht</p></div>';
+    }
+  } catch (e) {
+    toast(e.message, 'error');
+  }
 }
 
 /* ============================================================
    COMPOSE
    ============================================================ */
 function setupRecipientSearch() {
-  const input = $('#to-input');
+  const input = $('to-input');
+  let timer = null;
   input.addEventListener('input', () => {
+    clearTimeout(timer);
     const q = input.value.trim();
-    if (q.length < 2) {
-      $('#to-suggestions').style.display = 'none';
-      return;
-    }
-    ss.messages.debouncedSearch('to', q, (err, users) => {
-      if (err || !users || !users.length) {
-        $('#to-suggestions').style.display = 'none';
-        return;
-      }
-      $('#to-suggestions').innerHTML = users.slice(0, 8).map(u => `
-        <div class="suggestion" data-id="${esc(u.user_id)}" data-name="${esc(u.name)}" data-co="${u.is_co_account ? '1' : ''}">
-          ${u.is_co_account ? '★ ' : ''}${esc(u.name)}
-        </div>
-      `).join('');
-      $('#to-suggestions').style.display = 'block';
-      $$('#to-suggestions .suggestion').forEach(s => {
-        s.addEventListener('click', () => {
-          ss.messages.addRecipient('to', { user_id: s.dataset.id, name: s.dataset.name, is_co_account: !!s.dataset.co });
-          input.value = '';
-          $('#to-suggestions').style.display = 'none';
-          renderRecipients();
-        });
+    if (q.length < 2) { $('to-suggestions').style.display = 'none'; return; }
+    timer = setTimeout(() => {
+      ss.messages.debouncedSearch('to', q, (err, users) => {
+        if (err || !users?.length) { $('to-suggestions').style.display = 'none'; return; }
+        const parts = [];
+        const max = Math.min(users.length, 8);
+        for (let i = 0; i < max; i++) {
+          const u = users[i];
+          parts.push(
+            `<div class="suggestion" data-id="${esc(u.user_id)}" data-name="${esc(u.name)}" data-co="${u.is_co_account ? '1' : ''}">` +
+              (u.is_co_account ? '★ ' : '') + esc(u.name) +
+            `</div>`
+          );
+        }
+        $('to-suggestions').innerHTML = parts.join('');
+        $('to-suggestions').style.display = 'block';
       });
-    });
+    }, 200);
+  });
+
+  $('to-suggestions').addEventListener('click', (e) => {
+    const s = e.target.closest('.suggestion');
+    if (!s) return;
+    ss.messages.addRecipient('to', { user_id: s.dataset.id, name: s.dataset.name, is_co_account: !!s.dataset.co });
+    input.value = '';
+    $('to-suggestions').style.display = 'none';
+    renderRecipients();
   });
 }
 
 function renderRecipients() {
-  const box = $('#to-box');
-  const input = $('#to-input');
+  const box = $('to-box');
+  const input = $('to-input');
   const recipients = ss.messages.composeState?.to || [];
   box.querySelectorAll('.recipient-chip').forEach(c => c.remove());
-  recipients.forEach((r, i) => {
+  for (let i = 0; i < recipients.length; i++) {
+    const r = recipients[i];
     const chip = document.createElement('span');
     chip.className = 'recipient-chip';
-    chip.innerHTML = `${esc(r.name || r.user_id)} <button data-i="${i}">×</button>`;
+    chip.innerHTML = esc(r.name || r.user_id) + ' <button data-i="' + i + '">×</button>';
     chip.querySelector('button').addEventListener('click', () => {
       ss.messages.removeRecipient('to', i);
       renderRecipients();
     });
     box.insertBefore(chip, input);
-  });
+  }
 }
 
 function openCompose(to, subject) {
   ss.messages.startCompose();
   if (to) ss.messages.addRecipient('to', { user_id: to, name: to });
   if (subject) ss.messages.setSubject(subject);
-  $('#compose-subject').value = subject || '';
-  $('#compose-body').value = '';
-  $('#to-input').value = '';
+  $('compose-subject').value = subject || '';
+  $('compose-body').value = '';
+  $('to-input').value = '';
   renderRecipients();
-  $('#compose-modal').classList.add('show');
-  setTimeout(() => $('#to-input').focus(), 100);
+  $('compose-modal').classList.add('show');
+  requestAnimationFrame(() => $('to-input').focus());
 }
 
 function closeCompose() {
   ss.messages.cancelCompose();
-  $('#compose-modal').classList.remove('show');
-  $('#to-suggestions').style.display = 'none';
+  $('compose-modal').classList.remove('show');
+  $('to-suggestions').style.display = 'none';
 }
 
 async function sendCompose() {
-  const subject = $('#compose-subject').value.trim();
-  const body = $('#compose-body').value;
+  const subject = $('compose-subject').value.trim();
+  const body = $('compose-body').value;
   if (!ss.messages.composeState?.to?.length) return toast('Voeg een ontvanger toe', 'error');
   if (!subject) return toast('Onderwerp is verplicht', 'error');
 
   ss.messages.setSubject(subject);
   ss.messages.setBodyHtml('<p>' + esc(body).replace(/\n/g, '<br>') + '</p>');
 
-  const btn = $('#compose-send');
+  const btn = $('compose-send');
   btn.disabled = true;
   btn.textContent = 'Versturen...';
   try {
@@ -1407,43 +1486,44 @@ async function sendCompose() {
    ============================================================ */
 async function loadProfile() {
   try {
-    const fields = await ss.profile.load();
+    const fields = await dedupe('profile', () => ss.profile.load());
     renderProfile(fields);
   } catch (e) {
-    $('#profile-card').innerHTML = `<p style="color:var(--red)">${esc(e.message)}</p>`;
+    $('profile-card').innerHTML = `<p style="color:var(--red)">${esc(e.message)}</p>`;
   }
 }
 
 function renderProfile(fields) {
   const entries = Object.entries(fields || {});
   if (!entries.length) {
-    $('#profile-card').innerHTML = '<div class="empty"><p>Geen profielgegevens</p></div>';
+    $('profile-card').innerHTML = '<div class="empty"><p>Geen profielgegevens</p></div>';
     return;
   }
 
-  $('#profile-card').innerHTML = `
-    <div class="grid grid-2">
-      ${entries.map(([key, f]) => `
-        <div class="field" style="margin:0">
-          <label>${esc(key.replace(/_/g, ' '))}</label>
-          <input value="${esc(f.value || '')}" ${f.readonly ? 'readonly style="opacity:0.6"' : ''} data-key="${esc(key)}">
-        </div>
-      `).join('')}
-    </div>
-    <div style="margin-top:18px;display:flex;justify-content:flex-end">
-      <button class="btn-sm primary" id="profile-save">Opslaan</button>
-    </div>
-  `;
+  const parts = [];
+  for (let i = 0; i < entries.length; i++) {
+    const [key, f] = entries[i];
+    parts.push(
+      `<div class="field" style="margin:0">` +
+        `<label>${esc(key.replace(/_/g, ' '))}</label>` +
+        `<input value="${esc(f.value || '')}" ${f.readonly ? 'readonly style="opacity:0.6"' : ''} data-key="${esc(key)}">` +
+      `</div>`
+    );
+  }
 
-  $('#profile-save')?.addEventListener('click', async () => {
+  $('profile-card').innerHTML =
+    '<div class="grid grid-2">' + parts.join('') + '</div>' +
+    '<div style="margin-top:18px;display:flex;justify-content:flex-end">' +
+      '<button class="btn-sm primary" id="profile-save">Opslaan</button>' +
+    '</div>';
+
+  $('profile-save').addEventListener('click', async () => {
     const current = {};
     $$('#profile-card input[data-key]').forEach(inp => {
       if (!inp.readOnly) current[inp.dataset.key] = inp.value;
     });
     let changes = current;
-    try {
-      if (typeof ss.profile.diff === 'function') changes = ss.profile.diff(current);
-    } catch {}
+    try { if (typeof ss.profile.diff === 'function') changes = ss.profile.diff(current); } catch {}
     if (!Object.keys(changes).length) return toast('Niets gewijzigd', 'error');
     try {
       await ss.profile.save(changes);
@@ -1455,81 +1535,54 @@ function renderProfile(fields) {
 }
 
 /* ============================================================
+   BACKGROUND TASKS (idle)
+   ============================================================ */
+function scheduleBadgeUpdate() {
+  const run = async () => {
+    try {
+      const list = await dedupe('msgs:inbox', () => ss.messages.loadList('inbox'));
+      const messages = list || ss.messages.list || [];
+      let unread = 0;
+      for (let i = 0; i < messages.length; i++) if (messages[i].unread || messages[i].is_unread) unread++;
+      const badge = $('msg-badge');
+      if (unread > 0) { badge.textContent = unread; badge.style.display = 'inline-block'; }
+    } catch {}
+  };
+  if ('requestIdleCallback' in window) requestIdleCallback(run, { timeout: 2000 });
+  else setTimeout(run, 800);
+}
+
+/* ============================================================
    KEYBOARD
    ============================================================ */
 document.addEventListener('keydown', (e) => {
   const tag = (e.target.tagName || '').toLowerCase();
   if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
   if (e.key === 'Escape') {
-    $('#compose-modal').classList.remove('show');
-    $('#todo-modal').classList.remove('show');
+    $('compose-modal').classList.remove('show');
+    $('todo-modal').classList.remove('show');
   }
 });
 
 /* ============================================================
- * Fix relatieve afbeeldingen in Smartschool content
- * - Vervangt src zonder protocol door https://<main_url>/...
- * - Herhaalt automatisch via MutationObserver
- * ============================================================ */
-(function () {
-  'use strict';
+   IMAGE FIX — alleen voor message body (geen observer meer)
+   ============================================================ */
+function fixRelativeImages(root) {
+  if (!root) return;
+  let host = '';
+  try {
+    host = (ss?.auth?.creds?.main_url || ss?.auth?.user?.main_url || '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
+  } catch {}
+  if (!host) return;
 
-  function fixImg(img) {
-    if (!img || img.tagName !== 'IMG') return;
+  const imgs = root.querySelectorAll('img[src]');
+  for (let i = 0; i < imgs.length; i++) {
+    const img = imgs[i];
     const src = img.getAttribute('src');
-    if (!src) return;
-    // Sla volledige URLs en data-URIs over
-    if (/^(https?:|data:|blob:|\/\/)/i.test(src)) return;
-
-    // Haal main_url uit ss (met fallbacks)
-    let host = '';
-    try {
-      host = (window.ss && ss.auth && (ss.auth.creds?.main_url || ss.auth.user?.main_url)) || '';
-    } catch (e) {}
-    if (!host) return;
-    host = host.replace(/^https?:\/\//, '').replace(/\/+$/, '');
-
-    const path = src[0] === '/' ? src : '/' + src;
-    img.src = 'https://' + host + path;
+    if (!src || /^(https?:|data:|blob:|\/\/)/i.test(src)) continue;
+    img.src = 'https://' + host + (src[0] === '/' ? src : '/' + src);
   }
-
-  function fixAll(root) {
-    const scope = root || document;
-    // Alle bestaande images
-    scope.querySelectorAll?.('img').forEach(fixImg);
-    // Als root zelf een img is
-    if (scope.tagName === 'IMG') fixImg(scope);
-  }
-
-  // 1) Fix alles wat er nu al is
-  fixAll(document);
-
-  // 2) Blijf kijken naar nieuwe nodes
-  const observer = new MutationObserver(function (mutations) {
-    for (const m of mutations) {
-      if (m.type === 'childList') {
-        m.addedNodes.forEach(function (node) {
-          if (node.nodeType === 1) fixAll(node);
-        });
-      } else if (m.type === 'attributes' && m.attributeName === 'src') {
-        fixImg(m.target);
-      }
-    }
-  });
-
-  observer.observe(document.body, {
-    childList: true,
-    subtree: true,
-    attributes: true,
-    attributeFilter: ['src'],
-  });
-
-  // 3) Extra fallback: vang laad-fouten op en probeer opnieuw
-  document.addEventListener('error', function (e) {
-    const img = e.target;
-    if (img && img.tagName === 'IMG') fixImg(img);
-  }, true);
-})();
+}
 </script>
 </body>
 </html>
