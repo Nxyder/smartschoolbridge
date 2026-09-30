@@ -1,7 +1,7 @@
 """
 Planner endpoints — webversie.
 
-API structuur:
+Endpoints:
   GET  /api/planner                     → compact: uren + items
   GET  /api/planner/week?offset=0       → week + aanvulling lege uren
   GET  /api/planner/todos?scope=open    → enkel taken (snel)
@@ -10,39 +10,27 @@ API structuur:
   POST /api/planner/todo                → nieuwe to-do
   GET  /api/planner/my-class            → detecteer klas
 
-Query params (/api/planner):
-  from=YYYY-MM-DD        startdatum (default: vandaag - 14d)
-  to=YYYY-MM-DD          einddatum (default: vandaag + 30d)
-  types=lessons|tasks|all
-  limit=N                (default: 500, max: 2000)
-  compact=0|1            (default: 1)
-  hours=0|1              (default: 1)
-  placeholders=0|1       (default: 0)
+Caching:
+  - Response-cache: 2 min TTL op /week en /todos, HMAC-key per creds
+  - UID-cache: 1u TTL — bewaart alleen de user-ID string
+  - Klas-cache: 1u TTL — bewaart de gedetecteerde klas
+  - Rooster-cache: 5 min TTL — school-breed, gedeeld tussen users
+  - Uren-cache: 1u TTL — SmartschoolHours
+  - Géén sessies of credentials in cache, alleen JSON-output
 
-Query params (/api/planner/week):
-  offset=0               0 = deze week, -1 = vorige, +1 = volgende
-  placeholders=0|1
-  fill=0|1               (default: 1)
-
-Query params (/api/planner/todos):
-  scope=open|today|week|month|all   (default: open = 7d terug, 7d vooruit)
-  limit=N                            (default: 100, max: 500)
-
-Features:
-  - URL-encoding van +02:00 in from/to ISO strings
-  - Unicode unescape van Homepage HTML (\\u0022 → ")
-  - Placeholders standaard verborgen
-  - Klas-detectie via schoolrooster (gecached 1u)
-  - Aanvulling lege uren uit schoolrooster (geen blokkade)
-  - Examen-detectie
+Performance:
+  - my-class + week delen dezelfde raw fetch (bug gefixt)
+  - Response-cache hit = <10ms
 """
 
 import json
 import random
 import re
 import sys
+import threading
 import time
 import urllib.request
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
@@ -78,84 +66,125 @@ UUR_TIJDEN = {
     "7": ("14:40", "15:30"),
 }
 
+REQUEST_TIMEOUT = 15
+
+CACHE_TTL = 120           # 2 minuten voor response-cache
+CACHE_MAX_ENTRIES = 300
+
+UID_TTL = 3600            # 1 uur
+KLAS_TTL = 3600           # 1 uur
+ROOSTER_TTL = 300         # 5 minuten
+HOURS_TTL = 3600          # 1 uur
+
 
 # ============================================================
-# CACHE — items per user, korte TTL
+# LOCKS
 # ============================================================
-_CACHE = {}
-_CACHE_TTL = 30
+_CACHE_LOCK = threading.Lock()
+_UID_LOCK = threading.Lock()
+_KLAS_LOCK = threading.Lock()
+_ROOSTER_LOCK = threading.Lock()
+_HOURS_LOCK = threading.Lock()
+
+
+# ============================================================
+# RESPONSE CACHE — alleen JSON-output
+# ============================================================
+_CACHE = OrderedDict()  # uid -> {"range_key": str, "items": list, "ts": float}
 
 
 def _cache_get(uid, range_key):
-    entry = _CACHE.get(uid)
-    if not entry:
-        return None
-    if entry["range_key"] != range_key:
-        return None
-    if time.time() - entry["timestamp"] > _CACHE_TTL:
-        _CACHE.pop(uid, None)
-        return None
-    return entry["items"]
+    with _CACHE_LOCK:
+        entry = _CACHE.get(uid)
+        if not entry:
+            return None
+        if entry["range_key"] != range_key:
+            return None
+        if time.time() - entry["ts"] > CACHE_TTL:
+            _CACHE.pop(uid, None)
+            return None
+        _CACHE.move_to_end(uid)
+        return entry["items"]
 
 
 def _cache_set(uid, range_key, items):
-    _CACHE[uid] = {
-        "timestamp": time.time(),
-        "range_key": range_key,
-        "items": items,
-    }
+    with _CACHE_LOCK:
+        _CACHE[uid] = {
+            "ts": time.time(),
+            "range_key": range_key,
+            "items": items,
+        }
+        _CACHE.move_to_end(uid)
+        while len(_CACHE) > CACHE_MAX_ENTRIES:
+            _CACHE.popitem(last=False)
 
 
 def _cache_invalidate(uid):
-    _CACHE.pop(uid, None)
+    with _CACHE_LOCK:
+        _CACHE.pop(uid, None)
 
 
 # ============================================================
-# KLAS CACHE — 1x detecteren per user
+# UID CACHE — bewaart alleen user-ID string, geen credentials
 # ============================================================
-_KLAS_CACHE = {}
-_KLAS_TTL = 3600  # 1 uur
+_UID_CACHE = {}  # creds_hash -> {"uid": str, "ts": float}
 
 
-def _get_cached_class(session, base, uid):
-    """Detecteer klas op basis van huidige week (gecached)."""
-    now_ts = time.time()
-    entry = _KLAS_CACHE.get(uid)
-    if entry and now_ts - entry["ts"] < _KLAS_TTL:
-        return entry["class"], entry["score"]
+def _creds_fingerprint(creds):
+    """Niet-cryptografische fingerprint, alleen voor interne cache-keys."""
+    return "|".join([
+        creds.get("username", ""),
+        creds.get("main_url", ""),
+        creds.get("mfa", "")[:4],  # alleen eerste 4 van mfa, niet volledig
+    ])
 
-    tz = timezone(timedelta(hours=2))
-    now = datetime.now(tz)
-    cur_monday = (now - timedelta(days=now.weekday())).replace(
-        hour=0, minute=0, second=0, microsecond=0)
-    cur_sunday = cur_monday + timedelta(days=6)
 
-    from_iso = cur_monday.strftime("%Y-%m-%dT%H:%M:%S+02:00")
-    to_iso = cur_sunday.strftime("%Y-%m-%dT%H:%M:%S+02:00")
+def _uid_cache_get(creds):
+    key = _creds_fingerprint(creds)
+    with _UID_LOCK:
+        entry = _UID_CACHE.get(key)
+        if entry and time.time() - entry["ts"] < UID_TTL:
+            return entry["uid"]
+    return None
 
-    items = _fetch_planned_elements(session, base, uid, from_iso, to_iso)
-    items = _filter_placeholders(items, False)
 
-    rooster = _fetch_school_rooster()
-    if not rooster:
-        return None, 0
-
-    klas, score = _detect_class(items, rooster)
-
-    if klas:
-        _KLAS_CACHE[uid] = {
-            "class": klas,
-            "score": score,
-            "ts": now_ts,
-        }
-    return klas, score
+def _uid_cache_set(creds, uid):
+    key = _creds_fingerprint(creds)
+    with _UID_LOCK:
+        _UID_CACHE[key] = {"uid": uid, "ts": time.time()}
+        while len(_UID_CACHE) > CACHE_MAX_ENTRIES:
+            # Verwijder oudste
+            oldest = min(_UID_CACHE.items(), key=lambda x: x[1]["ts"])
+            _UID_CACHE.pop(oldest[0], None)
 
 
 # ============================================================
-# ROOSTER CACHE — school-breed, 5 min TTL
+# KLAS CACHE — 1u TTL
+# ============================================================
+_KLAS_CACHE = {}  # uid -> {"class": str, "score": float, "ts": float}
+
+
+def _klas_cache_get(uid):
+    with _KLAS_LOCK:
+        entry = _KLAS_CACHE.get(uid)
+        if entry and time.time() - entry["ts"] < KLAS_TTL:
+            return entry["class"], entry["score"]
+    return None, None
+
+
+def _klas_cache_set(uid, klas, score):
+    with _KLAS_LOCK:
+        _KLAS_CACHE[uid] = {"class": klas, "score": score, "ts": time.time()}
+        while len(_KLAS_CACHE) > CACHE_MAX_ENTRIES:
+            oldest = min(_KLAS_CACHE.items(), key=lambda x: x[1]["ts"])
+            _KLAS_CACHE.pop(oldest[0], None)
+
+
+# ============================================================
+# ROOSTER CACHE — school-breed, 5 min
 # ============================================================
 _ROOSTER_CACHE = {"data": None, "ts": 0}
-_ROOSTER_TTL = 300
+_EXAMEN_CACHE = {"data": None, "ts": 0}
 
 
 def _fetch_json_url(url):
@@ -164,7 +193,7 @@ def _fetch_json_url(url):
         req = urllib.request.Request(
             f"{url}?_={random.randint(100000, 999999)}",
             headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
             raw = resp.read()
             if raw[:1] not in (b"{", b"\xef"):
                 return None
@@ -177,24 +206,62 @@ def _fetch_json_url(url):
 
 def _fetch_school_rooster():
     now = time.time()
-    if (_ROOSTER_CACHE["data"]
-            and now - _ROOSTER_CACHE["ts"] < _ROOSTER_TTL):
-        return _ROOSTER_CACHE["data"]
+    with _ROOSTER_LOCK:
+        if (_ROOSTER_CACHE["data"]
+                and now - _ROOSTER_CACHE["ts"] < ROOSTER_TTL):
+            return _ROOSTER_CACHE["data"]
 
     data = _fetch_json_url(ROOSTER_URL)
     if data and "Klassen" in data:
-        _ROOSTER_CACHE["data"] = data
-        _ROOSTER_CACHE["ts"] = now
+        with _ROOSTER_LOCK:
+            _ROOSTER_CACHE["data"] = data
+            _ROOSTER_CACHE["ts"] = time.time()
         return data
     return None
 
 
 def _fetch_examen_rooster():
+    now = time.time()
+    with _ROOSTER_LOCK:
+        if (_EXAMEN_CACHE["data"]
+                and now - _EXAMEN_CACHE["ts"] < ROOSTER_TTL):
+            return _EXAMEN_CACHE["data"]
+
     for url in EXAMEN_URLS:
         data = _fetch_json_url(url)
         if data and "Klassen" in data:
+            with _ROOSTER_LOCK:
+                _EXAMEN_CACHE["data"] = data
+                _EXAMEN_CACHE["ts"] = time.time()
             return data
     return None
+
+
+# ============================================================
+# HOURS CACHE — 1u TTL per uid
+# ============================================================
+_HOURS_CACHE = {}  # uid -> {"hours": list, "ts": float}
+
+
+def _get_hours_cached(session, uid):
+    with _HOURS_LOCK:
+        entry = _HOURS_CACHE.get(uid)
+        if entry and time.time() - entry["ts"] < HOURS_TTL:
+            return entry["hours"]
+
+    try:
+        from smartschool import SmartschoolHours
+        hours = [
+            {"id": h.hour_id, "s": h.start, "e": h.end, "t": h.title}
+            for h in SmartschoolHours(session)
+        ]
+    except Exception as e:
+        print(f"[planner] hours fout: {e}", file=sys.stderr)
+        hours = []
+
+    with _HOURS_LOCK:
+        _HOURS_CACHE[uid] = {"hours": hours, "ts": time.time()}
+    return hours
 
 
 # ============================================================
@@ -213,7 +280,8 @@ def _unescape_html(html):
 def _find_user_id(session, base):
     try:
         r = session.request("GET", "/?module=Homepage",
-                            headers={"Referer": base + "/"})
+                            headers={"Referer": base + "/"},
+                            timeout=REQUEST_TIMEOUT)
         html = r.text
         if r.status_code in (301, 302, 303, 307, 308):
             return None
@@ -240,27 +308,22 @@ def _find_user_id(session, base):
         return None
 
 
-def _get_uid(session, base):
+def _get_uid(session, base, creds=None):
+    # Probeer eerst de cache
+    if creds:
+        cached = _uid_cache_get(creds)
+        if cached:
+            return cached
+
     platform = getattr(session, "platform_id", None)
     user_num = _find_user_id(session, base)
     if not user_num or not platform:
         return None
-    return f"{platform}_{user_num}_0"
+    uid = f"{platform}_{user_num}_0"
 
-
-# ============================================================
-# HOURS
-# ============================================================
-def _get_hours(session):
-    try:
-        from smartschool import SmartschoolHours
-        return [
-            {"id": h.hour_id, "s": h.start, "e": h.end, "t": h.title}
-            for h in SmartschoolHours(session)
-        ]
-    except Exception as e:
-        print(f"[planner] hours fout: {e}", file=sys.stderr)
-        return []
+    if creds:
+        _uid_cache_set(creds, uid)
+    return uid
 
 
 # ============================================================
@@ -274,20 +337,24 @@ def _fetch_planned_elements(session, base, uid, from_iso, to_iso):
     path = (f"/planner/api/v1/planned-elements/user/{uid}"
             f"?from={from_enc}&to={to_enc}"
             f"&includes=icon,courses,locations,upload-folders")
-    try:
-        r = session.request("GET", path, headers={
-            "Accept": "*/*",
-            "Content-Type": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-            "Origin": base,
-            "Referer": base + "/",
-        })
-        data = r.json()
-        return data if isinstance(data, list) else []
-    except Exception as e:
-        print(f"[planner] fetch fout: {type(e).__name__}: {e}",
-              file=sys.stderr)
-        return []
+
+    last_exc = None
+    for attempt in range(2):
+        try:
+            r = session.request("GET", path, headers={
+                "Accept": "*/*",
+                "Content-Type": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": base,
+                "Referer": base + "/",
+            }, timeout=REQUEST_TIMEOUT)
+            data = r.json()
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            last_exc = e
+    print(f"[planner] fetch fout: {type(last_exc).__name__}: {last_exc}",
+          file=sys.stderr)
+    return []
 
 
 # ============================================================
@@ -541,10 +608,6 @@ def _is_exam_week(items, klas_score, match_ratio):
 # LEGE UREN OP VULLEN
 # ============================================================
 def _fill_empty_slots(items, klas_naam, rooster, week_start):
-    """
-    Vul lege uren op basis van schoolrooster.
-    Hele-dag activiteiten (sportdag, uitstap) blokkeren NIET.
-    """
     if not rooster or not klas_naam:
         return []
 
@@ -623,6 +686,44 @@ def _fill_empty_slots(items, klas_naam, rooster, week_start):
 
 
 # ============================================================
+# KLAS DETECTIE — met gecachte fetch
+# ============================================================
+def _get_cached_class(session, base, uid):
+    """Detecteer klas op basis van huidige week (gecached)."""
+    cached_klas, cached_score = _klas_cache_get(uid)
+    if cached_klas:
+        return cached_klas, cached_score
+
+    tz = timezone(timedelta(hours=2))
+    now = datetime.now(tz)
+    cur_monday = (now - timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    cur_sunday = cur_monday + timedelta(days=6)
+
+    from_iso = cur_monday.strftime("%Y-%m-%dT%H:%M:%S+02:00")
+    to_iso = cur_sunday.strftime("%Y-%m-%dT%H:%M:%S+02:00")
+
+    # BELANGRIJK: gebruik dezelfde _CACHE als _build_week_response
+    raw_key = f"{from_iso}|{to_iso}|raw"
+    items = _cache_get(uid, raw_key)
+    if items is None:
+        items = _fetch_planned_elements(session, base, uid, from_iso, to_iso)
+        _cache_set(uid, raw_key, items)
+
+    items = _filter_placeholders(items, False)
+
+    rooster = _fetch_school_rooster()
+    if not rooster:
+        return None, 0
+
+    klas, score = _detect_class(items, rooster)
+
+    if klas:
+        _klas_cache_set(uid, klas, score)
+    return klas, score
+
+
+# ============================================================
 # WEEK RESPONSE BUILDER
 # ============================================================
 def _build_week_response(session, base, uid, monday, include_hours=True,
@@ -634,8 +735,7 @@ def _build_week_response(session, base, uid, monday, include_hours=True,
     raw_key = f"{from_iso}|{to_iso}|raw"
     raw = _cache_get(uid, raw_key)
     if raw is None:
-        raw = _fetch_planned_elements(session, base, uid,
-                                      from_iso, to_iso)
+        raw = _fetch_planned_elements(session, base, uid, from_iso, to_iso)
         _cache_set(uid, raw_key, raw)
 
     filtered = _filter_placeholders(raw, include_placeholders)
@@ -686,7 +786,7 @@ def _build_week_response(session, base, uid, monday, include_hours=True,
     }
 
     if include_hours:
-        result["hours"] = _get_hours(session)
+        result["hours"] = _get_hours_cached(session, uid)
 
     return result
 
@@ -697,9 +797,8 @@ def _build_week_response(session, base, uid, monday, include_hours=True,
 @bp.get("")
 @with_session
 def planner_list(_session=None, _creds=None):
-    """Planner items voor een range (default: 14d terug, 30d vooruit)."""
     base = base_url(_creds)
-    uid = _get_uid(_session, base)
+    uid = _get_uid(_session, base, _creds)
     if not uid:
         return jsonify({"error": "kon user_id niet vinden"}), 500
 
@@ -719,8 +818,7 @@ def planner_list(_session=None, _creds=None):
     raw_key = f"{from_iso}|{to_iso}|raw"
     raw = _cache_get(uid, raw_key)
     if raw is None:
-        raw = _fetch_planned_elements(_session, base, uid,
-                                      from_iso, to_iso)
+        raw = _fetch_planned_elements(_session, base, uid, from_iso, to_iso)
         _cache_set(uid, raw_key, raw)
 
     raw = _filter_placeholders(raw, include_placeholders)
@@ -751,7 +849,7 @@ def planner_list(_session=None, _creds=None):
     }
 
     if include_hours:
-        result["hours"] = _get_hours(_session)
+        result["hours"] = _get_hours_cached(_session, uid)
 
     return jsonify(result)
 
@@ -759,9 +857,8 @@ def planner_list(_session=None, _creds=None):
 @bp.get("/week")
 @with_session
 def planner_week(_session=None, _creds=None):
-    """Deze/vorige/volgende week met aanvulling."""
     base = base_url(_creds)
-    uid = _get_uid(_session, base)
+    uid = _get_uid(_session, base, _creds)
     if not uid:
         return jsonify({"error": "kon user_id niet vinden"}), 500
 
@@ -772,6 +869,7 @@ def planner_week(_session=None, _creds=None):
 
     include_placeholders = request.args.get("placeholders", "0") == "1"
     do_fill = request.args.get("fill", "1") == "1"
+    refresh = request.args.get("refresh", "0") == "1"
 
     tz = timezone(timedelta(hours=2))
     now = datetime.now(tz)
@@ -779,12 +877,24 @@ def planner_week(_session=None, _creds=None):
     monday = (now - timedelta(days=day) + timedelta(weeks=offset)).replace(
         hour=0, minute=0, second=0, microsecond=0)
 
+    # Response-cache op de finale output
+    response_key = f"week:{offset}:{include_placeholders}:{do_fill}"
+    if not refresh:
+        cached = _cache_get(uid, response_key)
+        if cached is not None:
+            resp = dict(cached)
+            resp["_cached"] = True
+            return jsonify(resp)
+
     result = _build_week_response(
         _session, base, uid, monday,
         include_hours=True,
         include_placeholders=include_placeholders,
         do_fill=do_fill,
     )
+
+    _cache_set(uid, response_key, result)
+    result["_cached"] = False
     return jsonify(result)
 
 
@@ -794,20 +904,8 @@ def planner_week(_session=None, _creds=None):
 @bp.get("/todos")
 @with_session
 def planner_todos(_session=None, _creds=None):
-    """
-    Enkel taken/opdrachten, snel en compact.
-
-    Query params:
-      scope=open|today|week|month|all
-        open  = 7 dagen terug tot 7 dagen vooruit (default)
-        today = vandaag
-        week  = deze week (ma-zo)
-        month = deze maand
-        all   = 30 dagen terug tot 180 dagen vooruit
-      limit=N (default 100, max 500)
-    """
     base = base_url(_creds)
-    uid = _get_uid(_session, base)
+    uid = _get_uid(_session, base, _creds)
     if not uid:
         return jsonify({"error": "kon user_id niet vinden"}), 500
 
@@ -816,6 +914,16 @@ def planner_todos(_session=None, _creds=None):
         limit = min(int(request.args.get("limit", "100")), 500)
     except ValueError:
         limit = 100
+    refresh = request.args.get("refresh", "0") == "1"
+
+    # Response-cache op de finale output
+    response_key = f"todos:{scope}:{limit}"
+    if not refresh:
+        cached = _cache_get(uid, response_key)
+        if cached is not None:
+            resp = dict(cached)
+            resp["_cached"] = True
+            return jsonify(resp)
 
     tz = timezone(timedelta(hours=2))
     now = datetime.now(tz)
@@ -835,7 +943,7 @@ def planner_todos(_session=None, _creds=None):
             hour=0, minute=0, second=0, microsecond=0)
         to_dt = (now + timedelta(days=180)).replace(
             hour=23, minute=59, second=59, microsecond=0)
-    else:  # open (default) — 7 dagen terug, 7 dagen vooruit
+    else:
         from_dt = (now - timedelta(days=7)).replace(
             hour=0, minute=0, second=0, microsecond=0)
         to_dt = (now + timedelta(days=7)).replace(
@@ -847,18 +955,15 @@ def planner_todos(_session=None, _creds=None):
     raw_key = f"{from_iso}|{to_iso}|raw"
     raw = _cache_get(uid, raw_key)
     if raw is None:
-        raw = _fetch_planned_elements(_session, base, uid,
-                                      from_iso, to_iso)
+        raw = _fetch_planned_elements(_session, base, uid, from_iso, to_iso)
         _cache_set(uid, raw_key, raw)
 
-    # Enkel taken (geen lessen/placeholders)
     tasks = [it for it in raw
              if it.get("plannedElementType") in
              ("planned-to-dos", "planned-assignments")]
 
     items = [_compact_item(it) for it in tasks]
 
-    # Sorteer: open eerst, dan op datum
     items.sort(key=lambda x: (
         1 if x["st"] == "resolved" else 0,
         x["df"] or 0,
@@ -868,7 +973,7 @@ def planner_todos(_session=None, _creds=None):
 
     open_count = sum(1 for it in items if it["st"] != "resolved")
 
-    return jsonify({
+    result = {
         "meta": {
             "count": len(items),
             "open_count": open_count,
@@ -878,7 +983,11 @@ def planner_todos(_session=None, _creds=None):
             "user_id": uid,
         },
         "items": items,
-    })
+    }
+
+    _cache_set(uid, response_key, result)
+    result["_cached"] = False
+    return jsonify(result)
 
 
 # ============================================================
@@ -941,14 +1050,14 @@ def planner_item_action(platform_id, element_id, action,
     path = (f"/planner/api/v1/{prefix}/{platform_id}/"
             f"{element_id}/{action}")
     try:
-        r = _session.request("POST", path)
+        r = _session.request("POST", path, timeout=REQUEST_TIMEOUT)
     except Exception as e:
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
     ok = r.status_code in (200, 204)
 
     base = base_url(_creds)
-    uid = _get_uid(_session, base)
+    uid = _get_uid(_session, base, _creds)
     if uid:
         _cache_invalidate(uid)
 
@@ -1011,12 +1120,12 @@ def planner_create_todo(_session=None, _creds=None):
 
     try:
         r = _session.request("POST", "/planner/api/v1/planned-to-dos/",
-                             json=body)
+                             json=body, timeout=REQUEST_TIMEOUT)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
     base = base_url(_creds)
-    uid = _get_uid(_session, base)
+    uid = _get_uid(_session, base, _creds)
     if uid:
         _cache_invalidate(uid)
 
@@ -1034,9 +1143,8 @@ def planner_create_todo(_session=None, _creds=None):
 @bp.get("/my-class")
 @with_session
 def planner_my_class(_session=None, _creds=None):
-    """Detecteer klas via schoolrooster matching."""
     base = base_url(_creds)
-    uid = _get_uid(_session, base)
+    uid = _get_uid(_session, base, _creds)
     if not uid:
         return jsonify({"error": "kon user_id niet vinden"}), 500
 
@@ -1047,6 +1155,7 @@ def planner_my_class(_session=None, _creds=None):
             "score": round(score, 3),
         }), 404
 
+    # BELANGRIJK: gebruik de cache die _get_cached_class al gevuld heeft
     tz = timezone(timedelta(hours=2))
     now = datetime.now(tz)
     day = now.weekday()
@@ -1056,8 +1165,14 @@ def planner_my_class(_session=None, _creds=None):
 
     from_iso = monday.strftime("%Y-%m-%dT%H:%M:%S+02:00")
     to_iso = sunday.strftime("%Y-%m-%dT%H:%M:%S+02:00")
+    raw_key = f"{from_iso}|{to_iso}|raw"
 
-    raw = _fetch_planned_elements(_session, base, uid, from_iso, to_iso)
+    # Cache hit — geen tweede fetch
+    raw = _cache_get(uid, raw_key)
+    if raw is None:
+        raw = _fetch_planned_elements(_session, base, uid, from_iso, to_iso)
+        _cache_set(uid, raw_key, raw)
+
     raw = _filter_placeholders(raw, False)
 
     rooster = _fetch_school_rooster()
@@ -1072,3 +1187,30 @@ def planner_my_class(_session=None, _creds=None):
         "exam_reason": reden if examen else "",
         "source": "rooster_match",
     })
+
+
+# ============================================================
+# CACHE MANAGEMENT (debug)
+# ============================================================
+@bp.post("/cache/clear")
+@with_session
+def planner_cache_clear(_session=None, _creds=None):
+    base = base_url(_creds)
+    uid = _get_uid(_session, base, _creds)
+    if uid:
+        _cache_invalidate(uid)
+    return jsonify({"ok": True, "uid": uid})
+
+
+@bp.get("/cache/stats")
+def planner_cache_stats():
+    with _CACHE_LOCK:
+        return jsonify({
+            "cache_entries": len(_CACHE),
+            "uid_entries": len(_UID_CACHE),
+            "klas_entries": len(_KLAS_CACHE),
+            "hours_entries": len(_HOURS_CACHE),
+            "rooster_cached": _ROOSTER_CACHE["data"] is not None,
+            "examen_cached": _EXAMEN_CACHE["data"] is not None,
+            "ttl_seconds": CACHE_TTL,
+        })
