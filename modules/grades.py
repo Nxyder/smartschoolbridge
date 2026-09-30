@@ -2,17 +2,29 @@
 Cijfers (grades) endpoints.
 
 Endpoints:
-  GET /api/grades                 → alle cijfers (basis, snel)
-  GET /api/grades?detail=1        → met detail-fetch per evaluatie (parallel)
+  GET /api/grades                 → cijfers + comments (snel, uit bulk, gecached)
+  GET /api/grades?detail=1        → + central_tendencies + extra comments (parallel)
+  GET /api/grades?refresh=1       → cache negeren en opnieuw ophalen
   GET /api/grades/evaluation/<id> → detail van 1 evaluatie
 
+Caching:
+  - In-memory, per (creds-hash, with_detail) key
+  - TTL: 5 minuten
+  - Bewaart ALLEEN de JSON-output, geen sessies of credentials
+  - ?refresh=1 forceert een verse fetch
+
 Performance:
-  - Standaard GEEN detail-fetch (dat is de N+1 die 8s kostte)
-  - Met detail=1: parallel via ThreadPoolExecutor (max 10 workers)
-  - Paginering stopt zodra een batch kleiner is dan de page size
+  - Comments komen uit de bulk-response (geen extra request)
+  - Detail-fetch (alleen met detail=1) is parallel via ThreadPoolExecutor
+  - Cache hit = <5ms response
 """
 
-from collections import defaultdict
+import hashlib
+import hmac
+import os
+import threading
+import time
+from collections import defaultdict, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import Blueprint, jsonify, request
@@ -31,6 +43,67 @@ bp = Blueprint("grades", __name__, url_prefix="/api/grades")
 PAGE_SIZE = 200
 DETAIL_WORKERS = 10
 REQUEST_TIMEOUT = 15
+
+CACHE_TTL = 300          # 5 minuten
+CACHE_MAX_ENTRIES = 200  # max aantal entries (LRU eviction)
+
+
+# ============================================================
+# CACHE — alleen JSON-output, geen sessies of credentials
+# ============================================================
+_CACHE = OrderedDict()      # key -> {"data": dict, "ts": float}
+_CACHE_LOCK = threading.Lock()
+
+# Server-side secret voor HMAC van de cache-key
+# Zet deze in je environment: SESSION_SECRET=<random 32+ bytes hex>
+_SERVER_SECRET = os.environ.get("SESSION_SECRET", "dev-secret-change-me").encode()
+
+
+def _cache_key(creds, with_detail):
+    """HMAC-based key — niemand kan de key reproduceren zonder SESSION_SECRET."""
+    msg = "\x00".join([
+        creds.get("username", ""),
+        creds.get("password", ""),
+        creds.get("main_url", ""),
+        creds.get("mfa", ""),
+        "detail=1" if with_detail else "detail=0",
+    ]).encode()
+    return hmac.new(_SERVER_SECRET, msg, hashlib.sha256).hexdigest()
+
+
+def _cache_get(key):
+    with _CACHE_LOCK:
+        entry = _CACHE.get(key)
+        if not entry:
+            return None
+        if time.time() - entry["ts"] > CACHE_TTL:
+            _CACHE.pop(key, None)
+            return None
+        # LRU: verplaats naar einde
+        _CACHE.move_to_end(key)
+        return entry["data"]
+
+
+def _cache_set(key, data):
+    with _CACHE_LOCK:
+        _CACHE[key] = {"data": data, "ts": time.time()}
+        _CACHE.move_to_end(key)
+        # Evict oudste als te groot
+        while len(_CACHE) > CACHE_MAX_ENTRIES:
+            _CACHE.popitem(last=False)
+
+
+def _cache_invalidate(creds):
+    """Verwijder alle cache-entries voor deze credentials."""
+    with _CACHE_LOCK:
+        to_delete = []
+        for key in _CACHE:
+            # We kunnen de key niet reverse-engineeren, dus we
+            # berekenen de 2 varianten (detail=0 en detail=1)
+            pass
+        # Simpeler: verwijder beide varianten
+        for wd in (False, True):
+            _CACHE.pop(_cache_key(creds, wd), None)
 
 
 # ============================================================
@@ -57,7 +130,6 @@ def _rget(session, base, path):
 
 
 def _fetch_all_evals(session, base):
-    """Haal alle evaluaties op via paginering."""
     items = []
     page = 1
     while True:
@@ -71,7 +143,6 @@ def _fetch_all_evals(session, base):
         if len(batch) < PAGE_SIZE:
             break
         page += 1
-        # Veiligheid: stop na 50 pagina's (= 10.000 evaluaties)
         if page > 50:
             break
     return items
@@ -115,6 +186,9 @@ def _eval_summary(e, full=None):
     courses = e.get("courses", []) or []
     teacher = (e.get("gradebookOwner") or {}).get("name", {}) or {}
 
+    # Comments uit bulk — altijd, is gratis
+    comments = _extract_comments(e)
+
     data = {
         "id": e.get("identifier"),
         "name": e.get("name"),
@@ -128,11 +202,15 @@ def _eval_summary(e, full=None):
         "period": (e.get("period") or {}).get("name", ""),
         "does_count": e.get("doesCount", False),
         "teacher": teacher.get("startingWithLastName") or "?",
+        "comments": comments,
     }
 
-    # Comments alleen als detail beschikbaar is — anders leeg
+    # Extra detail als we het opgehaald hebben
     if full:
-        data["comments"] = _extract_comments(full)
+        extra = [c for c in _extract_comments(full) if c not in comments]
+        if extra:
+            data["comments"] = comments + extra
+
         ct = (full.get("details") or {}).get("centralTendencies") or []
         if ct:
             data["central_tendencies"] = [
@@ -143,28 +221,17 @@ def _eval_summary(e, full=None):
                 }
                 for t in ct
             ]
-    else:
-        data["comments"] = []
 
     return data
 
 
 # ============================================================
-# ROUTES
+# CORE — fetch + build
 # ============================================================
-@bp.get("")
-@with_session
-def list_grades(_session=None, _creds=None):
-    """
-    Query params:
-      detail=0|1   (default 0) — haal per evaluatie extra detail op (traag)
-    """
-    base = base_url(_creds)
-    with_detail = request.args.get("detail", "0") == "1"
-
-    # 1) Courses + evaluaties parallel ophalen
-    courses = _rget(_session, base, f"{RESULTS_BASE}/courses/")
-    evals = _fetch_all_evals(_session, base)
+def _build_grades_payload(session, base, with_detail):
+    """Haal alles op en bouw de response dict. Wordt gecached."""
+    courses = _rget(session, base, f"{RESULTS_BASE}/courses/")
+    evals = _fetch_all_evals(session, base)
 
     course_names = {
         c["id"]: c["name"]
@@ -172,20 +239,19 @@ def list_grades(_session=None, _creds=None):
         if c.get("name") != "Totaal"
     }
 
-    # 2) Groepeer per course
     per_course = defaultdict(list)
     for e in evals:
         for cv in e.get("courses", []) or []:
             per_course[cv["id"]].append(e)
 
-    # 3) Detail-fetch parallel — alleen als gevraagd
+    # Detail parallel — alleen als gevraagd
     detail_map = {}
     if with_detail and evals:
         ids = [e.get("identifier") for e in evals if e.get("identifier")]
         if ids:
             with ThreadPoolExecutor(max_workers=DETAIL_WORKERS) as ex:
                 futures = {
-                    ex.submit(_fetch_eval_detail, _session, base, eid): eid
+                    ex.submit(_fetch_eval_detail, session, base, eid): eid
                     for eid in ids
                 }
                 for fut in as_completed(futures):
@@ -195,7 +261,6 @@ def list_grades(_session=None, _creds=None):
                     except Exception:
                         detail_map[eid] = None
 
-    # 4) Bouw response
     result = {
         "total_evaluations": len(evals),
         "total_courses": len(course_names),
@@ -215,7 +280,42 @@ def list_grades(_session=None, _creds=None):
             entry["evaluations"].append(_eval_summary(e, full))
         result["courses"].append(entry)
 
-    return jsonify(result)
+    return result
+
+
+# ============================================================
+# ROUTES
+# ============================================================
+@bp.get("")
+@with_session
+def list_grades(_session=None, _creds=None):
+    """
+    Query params:
+      detail=0|1   (default 0)
+      refresh=0|1  (default 0) — forceer verse fetch, negeer cache
+    """
+    base = base_url(_creds)
+    with_detail = request.args.get("detail", "0") == "1"
+    force_refresh = request.args.get("refresh", "0") == "1"
+
+    key = _cache_key(_creds, with_detail)
+
+    # Cache hit?
+    if not force_refresh:
+        cached = _cache_get(key)
+        if cached is not None:
+            # Voeg cache-metadata toe (zonder de data zelf te wijzigen)
+            resp = dict(cached)
+            resp["_cached"] = True
+            return jsonify(resp)
+
+    # Verse fetch
+    payload = _build_grades_payload(_session, base, with_detail)
+    _cache_set(key, payload)
+
+    resp = dict(payload)
+    resp["_cached"] = False
+    return jsonify(resp)
 
 
 @bp.get("/evaluation/<identifier>")
@@ -238,3 +338,22 @@ def grade_detail(identifier, _session=None, _creds=None):
         "central_tendencies": (full.get("details") or {}).get("centralTendencies", []),
         "raw": full,
     })
+
+
+@bp.post("/cache/clear")
+@with_session
+def clear_cache(_session=None, _creds=None):
+    """Wis de cache voor deze credentials (beide varianten)."""
+    _cache_invalidate(_creds)
+    return jsonify({"ok": True})
+
+
+@bp.get("/cache/stats")
+def cache_stats():
+    """Debug endpoint — aantal entries en TTL info."""
+    with _CACHE_LOCK:
+        return jsonify({
+            "entries": len(_CACHE),
+            "max": CACHE_MAX_ENTRIES,
+            "ttl_seconds": CACHE_TTL,
+        })
