@@ -580,7 +580,7 @@ def messages_send(_session=None, _creds=None):
         body = "<p></p>"
 
     if attachments:
-        body += '<hr><p><b>📎 Bijlagen:</b></p><ul>'
+        body += '<hr><p><b>Bijlagen:</b></p><ul>'
         for att in attachments:
             url = att.get("url")
             fn = att.get("filename", "bestand")
