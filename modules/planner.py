@@ -18,6 +18,11 @@ Caching:
   - Uren-cache: 1u TTL — SmartschoolHours
   - Géén sessies of credentials in cache, alleen JSON-output
 
+Tijdzone:
+  - Smartschool stuurt ISO met +01:00/+02:00 (zomer/winter)
+  - Backend converteert naar muurkloktijd-als-UTC-epoch (offset gestript)
+  - Frontend leest met getUTC*() → werkt in elke browsertijdzone, zomer én winter
+
 Performance:
   - my-class + week delen dezelfde raw fetch (bug gefixt)
   - Response-cache hit = <10ms
@@ -338,11 +343,20 @@ def _fetch_planned_elements(session, base, uid, from_iso, to_iso):
 # COMPACT FORMAT
 # ============================================================
 def _to_ms(iso):
+    """
+    Converteer ISO-tijd naar epoch-ms met muurkloktijd als UTC.
+    We strippen de tijdzone-offset, want Smartschool stuurt +01:00 in
+    winter en +02:00 in zomer — dat veroorzaakt anders DST-shifts.
+    Door de muurkloktijd als UTC te behandelen, werkt de frontend met
+    getUTC*() in élke browsertijdzone, zomer én winter.
+    """
     if not iso:
         return None
     try:
-        return int(datetime.fromisoformat(
-            iso.replace("Z", "+00:00")).timestamp() * 1000)
+        # Strip tijdzone-suffix (+HH:MM of -HH:MM of Z)
+        s = re.sub(r'([+-]\d{2}:\d{2}|Z)$', '', iso)
+        dt = datetime.fromisoformat(s)
+        return int(dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
     except Exception:
         return None
 
@@ -624,15 +638,18 @@ def _fill_empty_slots(items, klas_naam, rooster, week_start):
                 continue
 
             start, end = UUR_TIJDEN[uur_num]
-            df_iso = f"{d.strftime('%Y-%m-%d')}T{start}:00+02:00"
-            dt_iso = f"{d.strftime('%Y-%m-%d')}T{end}:00+02:00"
+            # Muurkloktijd als UTC — geen +02:00 (DST-veilig)
+            df_iso = f"{d.strftime('%Y-%m-%d')}T{start}:00"
+            dt_iso = f"{d.strftime('%Y-%m-%d')}T{end}:00"
 
             filled.append({
                 "i": f"filled_{d.strftime('%Y%m%d')}_{uur_num}",
                 "n": "",
                 "t": "planned-lessons",
-                "df": int(datetime.fromisoformat(df_iso).timestamp() * 1000),
-                "dt": int(datetime.fromisoformat(dt_iso).timestamp() * 1000),
+                "df": int(datetime.fromisoformat(df_iso)
+                          .replace(tzinfo=timezone.utc).timestamp() * 1000),
+                "dt": int(datetime.fromisoformat(dt_iso)
+                          .replace(tzinfo=timezone.utc).timestamp() * 1000),
                 "wd": 0,
                 "dl": 0,
                 "c": vak_code_naar_naam.get(les["vak"], les["vak"]),
