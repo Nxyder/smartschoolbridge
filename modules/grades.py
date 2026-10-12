@@ -96,12 +96,7 @@ def _cache_set(key, data):
 def _cache_invalidate(creds):
     """Verwijder alle cache-entries voor deze credentials."""
     with _CACHE_LOCK:
-        to_delete = []
-        for key in _CACHE:
-            # We kunnen de key niet reverse-engineeren, dus we
-            # berekenen de 2 varianten (detail=0 en detail=1)
-            pass
-        # Simpeler: verwijder beide varianten
+        # Verwijder beide varianten (detail=0 en detail=1)
         for wd in (False, True):
             _CACHE.pop(_cache_key(creds, wd), None)
 
@@ -181,6 +176,29 @@ def _extract_comments(data):
     return [c for c in dict.fromkeys(out) if c]
 
 
+def _normalize_central_tendencies(raw_ct):
+    """
+    Smartschool stuurt centralTendencies als:
+      [{"type": "average", "graphic": {"description": "7,7/9", "value": 86, "color": "olive"}}]
+    We normaliseren naar:
+      [{"type": "average", "score": "7,7/9", "percentage": 86, "color": "olive"}]
+    """
+    out = []
+    if not raw_ct:
+        return out
+    for t in raw_ct:
+        if not isinstance(t, dict):
+            continue
+        g = t.get("graphic") or {}
+        out.append({
+            "type": t.get("type"),
+            "score": g.get("description"),
+            "percentage": g.get("value"),
+            "color": g.get("color", ""),
+        })
+    return out
+
+
 def _eval_summary(e, full=None):
     g = e.get("graphic", {}) or {}
     courses = e.get("courses", []) or []
@@ -211,16 +229,10 @@ def _eval_summary(e, full=None):
         if extra:
             data["comments"] = comments + extra
 
-        ct = (full.get("details") or {}).get("centralTendencies") or []
+        raw_ct = (full.get("details") or {}).get("centralTendencies") or []
+        ct = _normalize_central_tendencies(raw_ct)
         if ct:
-            data["central_tendencies"] = [
-                {
-                    "type": t.get("type"),
-                    "score": (t.get("graphic") or {}).get("description"),
-                    "percentage": (t.get("graphic") or {}).get("value"),
-                }
-                for t in ct
-            ]
+            data["central_tendencies"] = ct
 
     return data
 
@@ -328,14 +340,17 @@ def grade_detail(identifier, _session=None, _creds=None):
         return jsonify({"error": "niet gevonden"}), 404
 
     g = full.get("graphic", {}) or {}
+    raw_ct = (full.get("details") or {}).get("centralTendencies") or []
+
     return jsonify({
         "id": full.get("identifier"),
         "name": full.get("name"),
         "date": (full.get("date") or "")[:10],
         "score": g.get("description"),
         "percentage": g.get("value"),
+        "color": g.get("color", ""),
         "comments": _extract_comments(full),
-        "central_tendencies": (full.get("details") or {}).get("centralTendencies", []),
+        "central_tendencies": _normalize_central_tendencies(raw_ct),
         "raw": full,
     })
 
