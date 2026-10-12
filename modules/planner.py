@@ -47,11 +47,6 @@ bp = Blueprint("planner", __name__, url_prefix="/api/planner")
 # ============================================================
 ROOSTER_URL = ("https://lesroosters.stjozefasoessen.be/json/"
                "Rooster_actueel.json")
-EXAMEN_URLS = [
-    "https://lesroosters.stjozefasoessen.be/json/Rooster_examens.json",
-    "https://lesroosters.stjozefasoessen.be/json/Examens_actueel.json",
-    "https://lesroosters.stjozefasoessen.be/json/Rooster_examen.json",
-]
 
 DAG_MAP = {0: "Maandag", 1: "Dinsdag", 2: "Woensdag",
            3: "Donderdag", 4: "Vrijdag", 5: "Zaterdag", 6: "Zondag"}
@@ -184,7 +179,6 @@ def _klas_cache_set(uid, klas, score):
 # ROOSTER CACHE — school-breed, 5 min
 # ============================================================
 _ROOSTER_CACHE = {"data": None, "ts": 0}
-_EXAMEN_CACHE = {"data": None, "ts": 0}
 
 
 def _fetch_json_url(url):
@@ -217,23 +211,6 @@ def _fetch_school_rooster():
             _ROOSTER_CACHE["data"] = data
             _ROOSTER_CACHE["ts"] = time.time()
         return data
-    return None
-
-
-def _fetch_examen_rooster():
-    now = time.time()
-    with _ROOSTER_LOCK:
-        if (_EXAMEN_CACHE["data"]
-                and now - _EXAMEN_CACHE["ts"] < ROOSTER_TTL):
-            return _EXAMEN_CACHE["data"]
-
-    for url in EXAMEN_URLS:
-        data = _fetch_json_url(url)
-        if data and "Klassen" in data:
-            with _ROOSTER_LOCK:
-                _EXAMEN_CACHE["data"] = data
-                _EXAMEN_CACHE["ts"] = time.time()
-            return data
     return None
 
 
@@ -578,56 +555,42 @@ def _planner_matches_rooster(items, klas_naam, rooster):
 
 
 # ============================================================
-# EXAMEN-DETECTIE
-# ============================================================
-def _is_exam_week(items, klas_score, match_ratio):
-    if klas_score < 0.5:
-        return True, "klas_score laag"
-    if match_ratio < 0.5:
-        return True, "rooster-match laag"
-
-    onbekend = totaal = 0
-    for it in items:
-        if it.get("plannedElementType") != "planned-lessons":
-            continue
-        totaal += 1
-        courses = it.get("courses") or []
-        if not courses:
-            onbekend += 1
-            continue
-        naam = (courses[0].get("name") or "").upper()
-        if naam in ("SEM", "SES", "SEMINARIE", "EXAMEN"):
-            onbekend += 1
-
-    if totaal and onbekend / totaal > 0.5:
-        return True, f"{onbekend}/{totaal} examen-vakken"
-    return False, ""
-
-
-# ============================================================
-# LEGE UREN OP VULLEN
+# LEGE UREN OP VULLEN — werkt met of zonder klas
 # ============================================================
 def _fill_empty_slots(items, klas_naam, rooster, week_start):
-    if not rooster or not klas_naam:
+    if not rooster:
         return []
 
-    klas_data = None
-    for k in rooster.get("Klassen", []):
-        if k.get("Class") == klas_naam:
-            klas_data = k
-            break
-    if not klas_data:
-        return []
-
+    # Bouw rooster_lessen: als klas_naam gegeven is, enkel die klas.
+    # Anders: union van alle klassen (fallback).
     rooster_lessen = {}
-    for les in klas_data.get("Lessons", []):
-        dag, uur = les.get("Dag"), les.get("Uur")
-        if dag and uur:
-            rooster_lessen[(dag, uur)] = {
-                "vak": les.get("Vak", ""),
-                "lokaal": les.get("Lokaal", ""),
-                "lkr_code": les.get("Leerkracht", ""),
-            }
+
+    if klas_naam:
+        for k in rooster.get("Klassen", []):
+            if k.get("Class") == klas_naam:
+                for les in k.get("Lessons", []):
+                    dag, uur = les.get("Dag"), les.get("Uur")
+                    if dag and uur:
+                        rooster_lessen[(dag, uur)] = {
+                            "vak": les.get("Vak", ""),
+                            "lokaal": les.get("Lokaal", ""),
+                            "lkr_code": les.get("Leerkracht", ""),
+                        }
+                break
+    else:
+        # Fallback: alle klassen samen — pakt eerste les per (dag, uur)
+        for k in rooster.get("Klassen", []):
+            for les in k.get("Lessons", []):
+                dag, uur = les.get("Dag"), les.get("Uur")
+                if dag and uur and (dag, uur) not in rooster_lessen:
+                    rooster_lessen[(dag, uur)] = {
+                        "vak": les.get("Vak", ""),
+                        "lokaal": les.get("Lokaal", ""),
+                        "lkr_code": les.get("Leerkracht", ""),
+                    }
+
+    if not rooster_lessen:
+        return []
 
     vak_code_naar_naam = {v.get("Code", ""): v.get("DisplayName", "")
                           for v in rooster.get("Vakken", [])}
@@ -744,26 +707,17 @@ def _build_week_response(session, base, uid, monday, include_hours=True,
     klas = None
     score = 0.0
     match_ratio = 0.0
-    examen = False
-    examen_reden = ""
 
     if rooster:
         klas, score = _get_cached_class(session, base, uid)
         if klas:
             match_ratio = _planner_matches_rooster(filtered, klas, rooster)
-        examen, examen_reden = _is_exam_week(filtered, score, match_ratio)
-
-        if examen and do_fill:
-            ex_rooster = _fetch_examen_rooster()
-            if ex_rooster:
-                rooster = ex_rooster
-            else:
-                do_fill = False
 
     items = [_compact_item(it) for it in filtered]
 
     filled = []
-    if do_fill and klas:
+    if do_fill and rooster:
+        # Als geen klas gedetecteerd: vul met ALLE klassen samen
         filled = _fill_empty_slots(filtered, klas, rooster, monday)
 
     all_items = items + filled
@@ -780,8 +734,6 @@ def _build_week_response(session, base, uid, monday, include_hours=True,
             "class": klas,
             "class_score": round(score, 3),
             "match_ratio": round(match_ratio, 3),
-            "exam_week": examen,
-            "exam_reason": examen_reden,
         },
     }
 
@@ -1177,14 +1129,11 @@ def planner_my_class(_session=None, _creds=None):
 
     rooster = _fetch_school_rooster()
     match_ratio = _planner_matches_rooster(raw, klas, rooster) if rooster else 0
-    examen, reden = _is_exam_week(raw, score, match_ratio)
 
     return jsonify({
         "class": klas,
         "score": round(score, 3),
         "match_ratio": round(match_ratio, 3),
-        "exam_week": examen,
-        "exam_reason": reden if examen else "",
         "source": "rooster_match",
     })
 
@@ -1211,6 +1160,5 @@ def planner_cache_stats():
             "klas_entries": len(_KLAS_CACHE),
             "hours_entries": len(_HOURS_CACHE),
             "rooster_cached": _ROOSTER_CACHE["data"] is not None,
-            "examen_cached": _EXAMEN_CACHE["data"] is not None,
             "ttl_seconds": CACHE_TTL,
         })
