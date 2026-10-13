@@ -78,6 +78,32 @@ HOURS_TTL = 3600          # 1 uur
 
 
 # ============================================================
+# SMARTSCHOOL PLANNER TYPES
+# ============================================================
+# Het type is ALTIJD het URL-segment in /planner/api/v1/<type>/...
+ALLOWED_TYPES = {
+    "planned-to-dos",
+    "planned-assignments",
+    "planned-school-activities",
+    "planned-lessons",
+    "planned-placeholders",
+}
+
+# Types die als "taak" beschouwd worden (in /todos en types=tasks)
+TASK_TYPES = {
+    "planned-to-dos",
+    "planned-assignments",
+    "planned-school-activities",
+}
+
+# Types waarvoor resolve/unresolve/trash ondersteund wordt
+ACTIONABLE_TYPES = {
+    "planned-to-dos",
+    "planned-assignments",
+}
+
+
+# ============================================================
 # LOCKS
 # ============================================================
 _CACHE_LOCK = threading.Lock()
@@ -796,6 +822,7 @@ def planner_list(_session=None, _creds=None):
         raw = [it for it in raw
                if it.get("plannedElementType") == "planned-lessons"]
     elif types_filter == "tasks":
+        # Alle niet-les types (to-dos, assignments, school-activities, ...)
         raw = [it for it in raw
                if it.get("plannedElementType") != "planned-lessons"]
 
@@ -928,8 +955,7 @@ def planner_todos(_session=None, _creds=None):
         _cache_set(uid, raw_key, raw)
 
     tasks = [it for it in raw
-             if it.get("plannedElementType") in
-             ("planned-to-dos", "planned-assignments")]
+             if it.get("plannedElementType") in TASK_TYPES]
 
     items = [_compact_item(it) for it in tasks]
 
@@ -968,13 +994,14 @@ def planner_item_detail(element_id, _session=None, _creds=None):
     element_type = request.args.get("type", "")
     platform_id = _session.platform_id
 
-    if element_type == "planned-to-dos":
-        prefix = "planned-to-dos"
-    elif element_type == "planned-assignments":
-        prefix = "planned-assignments"
-    else:
-        return jsonify({"error": "detail niet beschikbaar"}), 400
+    # Whitelist — Smartschool gebruikt het type altijd als URL-segment
+    if element_type not in ALLOWED_TYPES:
+        return jsonify({
+            "error": f"type '{element_type}' niet ondersteund",
+            "allowed": sorted(ALLOWED_TYPES),
+        }), 400
 
+    prefix = element_type
     path = f"/planner/api/v1/{prefix}/{platform_id}/{element_id}"
     try:
         data = _session.json(path)
@@ -1010,13 +1037,13 @@ def planner_item_action(platform_id, element_id, action,
     if not element_type:
         return jsonify({"error": "type query param verplicht"}), 400
 
-    if element_type == "planned-to-dos":
-        prefix = "planned-to-dos"
-    elif element_type == "planned-assignments":
-        prefix = "planned-assignments"
-    else:
-        return jsonify({"error": f"actie niet ondersteund voor {element_type}"}), 400
+    if element_type not in ACTIONABLE_TYPES:
+        return jsonify({
+            "error": f"actie niet ondersteund voor {element_type}",
+            "allowed": sorted(ACTIONABLE_TYPES),
+        }), 400
 
+    prefix = element_type
     path = (f"/planner/api/v1/{prefix}/{platform_id}/"
             f"{element_id}/{action}")
     try:
