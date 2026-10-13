@@ -41,7 +41,7 @@ from urllib.parse import quote
 
 from flask import Blueprint, jsonify, request
 
-from modules.common import with_session, strip_html, base_url
+from modules.common import with_session, base_url
 
 
 bp = Blueprint("planner", __name__, url_prefix="/api/planner")
@@ -984,7 +984,8 @@ def planner_item_detail(element_id, _session=None, _creds=None):
     return jsonify({
         "id": element_id,
         "type": element_type,
-        "public_info": strip_html(data.get("publicInfo") or ""),
+        # RUWE HTML — niet meer gestript
+        "public_info": data.get("publicInfo") or "",
         "attachments": [
             {"name": a.get("name", ""),
              "file_id": a.get("fileID") or a.get("id")}
