@@ -184,6 +184,74 @@ def _get_message_full_xml(session, base, msg_id, box_type="inbox"):
     return r.text
 
 
+def _extract_names_from_message_xml(xml_text):
+    """
+    Zoek naam-user_id paren in de volledige bericht XML.
+    Ondersteunt meerdere patronen die Smartschool gebruikt.
+    Retourneert dict: user_id (met en zonder U prefix) -> name
+    """
+    result = {}
+    if not xml_text:
+        return result
+
+    def _store(uid, name):
+        uid = (uid or "").strip()
+        name = (name or "").strip()
+        if not uid or not name:
+            return
+        # Skip als naam puur een nummer is (= id, geen naam)
+        if name.isdigit() or re.match(r"^U?\d+$", name):
+            return
+        result[uid] = name
+        if uid.startswith("U"):
+            result[uid[1:]] = name
+        else:
+            result["U" + uid] = name
+
+    # Patroon 1: <xxx id="5122" name="Jan">
+    for m in re.finditer(
+        r'<[^>]*\bid="(U?\d+)"[^>]*\bname="([^"]+)"[^>]*>',
+        xml_text, re.IGNORECASE
+    ):
+        _store(m.group(1), m.group(2))
+
+    # Patroon 2: <xxx name="Jan" id="5122">
+    for m in re.finditer(
+        r'<[^>]*\bname="([^"]+)"[^>]*\bid="(U?\d+)"[^>]*>',
+        xml_text, re.IGNORECASE
+    ):
+        _store(m.group(2), m.group(1))
+
+    # Patroon 3: <user><id>5122</id><name>Jan</name></user>
+    for um in re.finditer(r'<user>(.*?)</user>', xml_text, re.DOTALL | re.IGNORECASE):
+        block = um.group(1)
+        uid_m = re.search(r'<id>(U?\d+)</id>', block, re.IGNORECASE)
+        name_m = re.search(r'<name>(.*?)</name>', block, re.DOTALL | re.IGNORECASE)
+        if uid_m and name_m:
+            name = re.sub(r"<[^>]+>", "", name_m.group(1)).strip()
+            name = (name.replace("&nbsp;", " ").replace("&amp;", "&")
+                        .replace("&lt;", "<").replace("&gt;", ">")
+                        .replace("&quot;", '"').replace("&#39;", "'"))
+            _store(uid_m.group(1), name)
+
+    # Patroon 4: <userID>5122</userID><userName>Jan</userName>
+    for um in re.finditer(
+        r'<userID>(U?\d+)</userID>\s*<[^>]*?(?:userName|displayName|fullName)>(.*?)</[^>]+>',
+        xml_text, re.DOTALL | re.IGNORECASE
+    ):
+        name = re.sub(r"<[^>]+>", "", um.group(2)).strip()
+        _store(um.group(1), name)
+
+    # Patroon 5: "Jan Jansen <5122>" in tekst
+    for m in re.finditer(
+        r'([A-Za-zÀ-ÿ][\w\s\.\-\'À-ÿ]{1,60}?)\s*<\s*(U?\d+)\s*>',
+        xml_text
+    ):
+        _store(m.group(2), m.group(1).strip())
+
+    return result
+
+
 def _parse_full_message(xml_text):
     try:
         root = ET.fromstring(xml_text)
@@ -193,18 +261,80 @@ def _parse_full_message(xml_text):
     result = {"id": "", "subject": "", "sender": "", "to": "", "cc": "", "bcc": "",
               "date": "", "body_html": "", "body_text": "",
               "send_date": "",
-              "attachments": [], "inline_images": []}
+              "attachments": [], "inline_images": [],
+              "to_list": [], "cc_list": [], "bcc_list": []}
+
+    names_map = _extract_names_from_message_xml(xml_text)
+
     msg = root.find(".//message")
     if msg is not None:
         result["id"] = msg.findtext("id", "")
         result["subject"] = msg.findtext("subject", "")
         result["date"] = msg.findtext("date", "")
         result["sender"] = msg.findtext("from", "")
-        result["to"] = msg.findtext("to", "")
-        result["cc"] = msg.findtext("cc", "")
-        result["bcc"] = msg.findtext("bcc", "")
         result["send_date"] = (msg.findtext("sendDate", "")
                                or msg.findtext("senddate", ""))
+
+        def _parse_recipients(tag_name):
+            items = []
+            seen = set()
+            for recip in msg.findall(f".//{tag_name}"):
+                uid = recip.get("id") or recip.get("userID") or ""
+                name = recip.get("name") or ""
+                txt = (recip.text or "").strip()
+                if not uid and txt:
+                    m = re.match(r"(.+?)\s*<\s*(U?\d+)\s*>", txt)
+                    if m:
+                        name, uid = m.group(1).strip(), m.group(2)
+                    elif txt.isdigit() or re.match(r"^U\d+$", txt):
+                        uid = txt
+                    else:
+                        name = txt
+                if not uid:
+                    continue
+                if uid in seen:
+                    continue
+                seen.add(uid)
+                if not name:
+                    name = names_map.get(uid, "")
+                items.append({"user_id": uid, "name": name})
+
+            if not items:
+                raw = msg.findtext(tag_name, "") or ""
+                for part in raw.split(","):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    m = re.match(r"(.+?)\s*<\s*(U?\d+)\s*>", part)
+                    if m:
+                        items.append({
+                            "user_id": m.group(2),
+                            "name": m.group(1).strip(),
+                        })
+                    elif part.isdigit() or re.match(r"^U\d+$", part):
+                        items.append({
+                            "user_id": part,
+                            "name": names_map.get(part, ""),
+                        })
+                    else:
+                        items.append({"user_id": "", "name": part})
+            return items
+
+        result["to_list"] = _parse_recipients("to")
+        result["cc_list"] = _parse_recipients("cc")
+        result["bcc_list"] = _parse_recipients("bcc")
+
+        # Backwards compat: platte strings
+        result["to"] = ", ".join(
+            (r["name"] or r["user_id"]) for r in result["to_list"]
+        ) or msg.findtext("to", "")
+        result["cc"] = ", ".join(
+            (r["name"] or r["user_id"]) for r in result["cc_list"]
+        ) or msg.findtext("cc", "")
+        result["bcc"] = ", ".join(
+            (r["name"] or r["user_id"]) for r in result["bcc_list"]
+        ) or msg.findtext("bcc", "")
+
         for tag in ["body", "messageBody", "content", "htmlBody"]:
             b = msg.find(tag)
             if b is not None:
@@ -337,6 +467,36 @@ def _extract_receivers_from_html(html, role):
         })
 
     return result
+
+
+def _enrich_receivers_with_names(session, base, receivers, msg_id, box_type=SCHEDULED_BOX):
+    """
+    Vul ontbrekende namen aan door de volledige XML van het bericht te scannen.
+    """
+    if not receivers:
+        return receivers
+
+    if all(r.get("name") for r in receivers):
+        return receivers
+
+    try:
+        xml_text = _get_message_full_xml(session, base, msg_id, box_type)
+        names_map = _extract_names_from_message_xml(xml_text)
+    except Exception:
+        names_map = {}
+
+    for r in receivers:
+        if r.get("name"):
+            continue
+        uid = r.get("user_id", "") or ""
+        if uid in names_map:
+            r["name"] = names_map[uid]
+        elif uid.startswith("U") and uid[1:] in names_map:
+            r["name"] = names_map[uid[1:]]
+        elif not uid.startswith("U") and f"U{uid}" in names_map:
+            r["name"] = names_map[f"U{uid}"]
+
+    return receivers
 
 
 # ============================================================
@@ -675,6 +835,40 @@ def _read_scheduled_full(session, base, msg_id):
                 body_html = old.get("body_html", "") or ""
             if not send_date:
                 send_date = old.get("send_date", "") or ""
+
+            # Vul receivers aan op basis van old.to_list / cc_list / bcc_list
+            if not receivers["to"] and old.get("to_list"):
+                receivers["to"] = [
+                    {
+                        "user_id": r.get("user_id", ""),
+                        "name": r.get("name", ""),
+                        "is_co_account": (r.get("user_id", "").startswith("U")),
+                        "ss_id": "455",
+                    }
+                    for r in old["to_list"]
+                ]
+            if not receivers["cc"] and old.get("cc_list"):
+                receivers["cc"] = [
+                    {
+                        "user_id": r.get("user_id", ""),
+                        "name": r.get("name", ""),
+                        "is_co_account": (r.get("user_id", "").startswith("U")),
+                        "ss_id": "455",
+                    }
+                    for r in old["cc_list"]
+                ]
+            if not receivers["bcc"] and old.get("bcc_list"):
+                receivers["bcc"] = [
+                    {
+                        "user_id": r.get("user_id", ""),
+                        "name": r.get("name", ""),
+                        "is_co_account": (r.get("user_id", "").startswith("U")),
+                        "ss_id": "455",
+                    }
+                    for r in old["bcc_list"]
+                ]
+
+            # Nog steeds geen receivers? Probeer via string
             if not receivers["to"]:
                 old_to = old.get("to", "") or ""
                 if old_to:
@@ -714,6 +908,14 @@ def message_read_scheduled(msg_id, _session=None, _creds=None):
     except Exception as e:
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
+    # Verrijk receivers met namen uit de XML
+    to_full  = _enrich_receivers_with_names(
+        _session, base, info["receivers"]["to"], msg_id)
+    cc_full  = _enrich_receivers_with_names(
+        _session, base, info["receivers"]["cc"], msg_id)
+    bcc_full = _enrich_receivers_with_names(
+        _session, base, info["receivers"]["bcc"], msg_id)
+
     return jsonify({
         "msg_id": msg_id,
         "subject": info["subject"],
@@ -724,6 +926,9 @@ def message_read_scheduled(msg_id, _session=None, _creds=None):
         "to": info["receivers"]["to"],
         "cc": info["receivers"]["cc"],
         "bcc": info["receivers"]["bcc"],
+        "to_full": to_full,
+        "cc_full": cc_full,
+        "bcc_full": bcc_full,
         "has_compose_html": bool(info["html"]),
         "fields_found": sorted(info["fields"].keys()),
     })
@@ -1328,9 +1533,7 @@ def messages_get_user(user_id, _session=None, _creds=None):
 
     tried = []
 
-    # ============================================================
     # Methode 1: Smartschool internal userinfo endpoint
-    # ============================================================
     for candidate in (clean_id, f"U{clean_id}"):
         tried.append(f"userinfo:{candidate}")
         try:
@@ -1347,9 +1550,7 @@ def messages_get_user(user_id, _session=None, _creds=None):
         except Exception:
             pass
 
-    # ============================================================
     # Methode 2: Smartschool profile API
-    # ============================================================
     for candidate in (clean_id, f"U{clean_id}"):
         tried.append(f"profile:{candidate}")
         try:
@@ -1373,9 +1574,7 @@ def messages_get_user(user_id, _session=None, _creds=None):
         except Exception:
             pass
 
-    # ============================================================
     # Methode 3: Messages dispatcher "get user info"
-    # ============================================================
     for candidate in (clean_id, f"U{clean_id}"):
         tried.append(f"dispatcher:{candidate}")
         try:
@@ -1394,9 +1593,7 @@ def messages_get_user(user_id, _session=None, _creds=None):
         except Exception:
             pass
 
-    # ============================================================
     # Methode 4: Zoek via searchUsers (meestal faalt voor pure ids)
-    # ============================================================
     try:
         tokens = _get_compose_tokens(_session, base)
         if tokens.get("unique_usc"):
