@@ -240,6 +240,136 @@ def _parse_full_message(xml_text):
 
 
 # ============================================================
+# HELPER — receivers uit HTML halen
+# ============================================================
+def _extract_receivers_from_html(html, role):
+    """
+    Zoek in de HTML van composeMessage naar receiverSpan-divs.
+
+    role: 0=to, 1=cc, 2=bcc
+    typeatt → rol:
+        0,1 → to
+        2,4 → cc
+        3,5 → bcc
+
+    Retourneert lijst van {user_id, name, is_co_account, ss_id}.
+    """
+    if not html:
+        return []
+
+    pattern = re.compile(
+        r'<div[^>]*?'
+        r'realuserid="(?P<rid>\d+)"[^>]*?'
+        r'idatt="(?P<idatt>[^"]*)"[^>]*?'
+        r'userltatt="(?P<userlt>\d+)"[^>]*?'
+        r'typeatt="(?P<typeatt>\d+)"[^>]*?'
+        r'ssidatt="(?P<ssid>\d+)"'
+        r'[^>]*>'
+        r'.*?'
+        r'<div[^>]*class="[^"]*receiverSpanName[^"]*"[^>]*>'
+        r'(?P<name>.*?)'
+        r'</div>',
+        re.DOTALL | re.IGNORECASE
+    )
+
+    result = []
+    for m in pattern.finditer(html):
+        typeatt = int(m.group("typeatt"))
+
+        if typeatt in (0, 1):
+            this_role = 0
+        elif typeatt in (2, 4):
+            this_role = 1
+        elif typeatt in (3, 5):
+            this_role = 2
+        else:
+            this_role = 0
+
+        if this_role != role:
+            continue
+
+        real_id = m.group("rid")
+        idatt = m.group("idatt")
+        userlt = m.group("userlt")
+        ssid = m.group("ssid")
+        name = re.sub(r"<[^>]+>", "", m.group("name")).strip()
+
+        if userlt == "2":
+            user_id = idatt if idatt.startswith("U") else f"U{real_id}"
+        else:
+            user_id = real_id
+
+        result.append({
+            "user_id": user_id,
+            "name": name,
+            "is_co_account": userlt == "2",
+            "ss_id": ssid,
+        })
+
+    return result
+
+
+# ============================================================
+# HELPER — naam-string omzetten naar users (fallback)
+# ============================================================
+def _resolve_receivers_from_string(session, base, s, role):
+    """
+    Zet een string als "Jan Peeters, Piet Janssens" om in een lijst users.
+    """
+    if not s:
+        return []
+
+    names = [n.strip() for n in re.split(r"[,;]", s) if n.strip()]
+    if not names:
+        return []
+
+    try:
+        tokens = _get_compose_tokens(session, base)
+    except Exception:
+        return []
+
+    if not tokens.get("random_dir"):
+        return []
+
+    result = []
+    for name in names:
+        try:
+            users = _search_users(session, base, name, tokens["unique_usc"], "all")
+        except Exception:
+            continue
+        if not users:
+            continue
+
+        needle = name.lower()
+        best = None
+        for u in users:
+            if (u.get("display_name") or "").lower() == needle:
+                best = u
+                break
+        if not best:
+            for u in users:
+                if (u.get("raw_name") or "").lower() == needle:
+                    best = u
+                    break
+        if not best:
+            for u in users:
+                if needle in (u.get("display_name") or "").lower():
+                    best = u
+                    break
+        if not best:
+            best = users[0]
+
+        result.append({
+            "user_id": best["user_id"],
+            "name": best.get("display_name") or best.get("raw_name") or name,
+            "is_co_account": bool(best.get("is_co_account")),
+            "ss_id": best.get("ss_id", "455"),
+        })
+
+    return result
+
+
+# ============================================================
 # ROUTE — LIJST
 # ============================================================
 @bp.get("")
@@ -409,7 +539,7 @@ def message_cancel_scheduled(msg_id, _session=None, _creds=None):
 
 
 # ============================================================
-# RESCHEDULE — via delete + recreate
+# RESCHEDULE — delete + recreate (alles automatisch)
 # ============================================================
 @bp.post("/<msg_id>/reschedule")
 @with_session
@@ -417,17 +547,17 @@ def message_reschedule(msg_id, _session=None, _creds=None):
     """
     Herplan een gepland bericht.
 
-    Smartschool kan een scheduled bericht NIET openen als draft,
-    dus we doen: (1) lees inhoud, (2) quick delete, (3) verstuur nieuw
-    met dezelfde inhoud + nieuwe sendDate.
+    Strategie:
+      1. Open composeMessage&boxType=scheduled&msgID=X → lees HTML
+      2. Extract receivers uit receiverSpan-divs (to/cc/bcc)
+      3. Extract subject + body uit HTML
+      4. quick delete oud bericht
+      5. Stuur nieuw bericht met dezelfde data + nieuwe sendDate
 
     Body JSON:
         {"send_date": "24h" | "2026-11-17 08:00" | ISO}
-
     Optioneel:
-        {"subject": "nieuw onderwerp"}  → overschrijf onderwerp
-        {"message_html": "<p>nieuw</p>"} → overschrijf body
-        {"to": [...]}                    → overschrijf ontvangers
+        {"subject": "...", "message_html": "...", "to": [...]}
     """
     data = request.get_json(force=True, silent=True) or {}
     send_date_raw = data.get("send_date") or ""
@@ -443,61 +573,110 @@ def message_reschedule(msg_id, _session=None, _creds=None):
     base = base_url(_creds)
 
     # --------------------------------------------------------
-    # Stap 1: lees de inhoud van het bestaande bericht
+    # Stap 1: open HTML om receivers/subject/body te lezen
     # --------------------------------------------------------
-    try:
-        xml_text = _get_message_full_xml(_session, base, msg_id, SCHEDULED_BOX)
-        old = _parse_full_message(xml_text)
-    except Exception as e:
-        return jsonify({"error": f"kon bericht niet lezen: {e}"}), 500
+    html = ""
+    fields_html = {}
+    for box_name in (SCHEDULED_BOX, "sendLater", "draft"):
+        try:
+            url = (f"/?module=Messages&file=composeMessage"
+                   f"&boxType={box_name}&composeType=5&msgID={msg_id}")
+            r = _session.request("GET", url, headers={"Referer": base + "/"})
+            if r.status_code != 200:
+                continue
 
-    if old.get("error"):
-        return jsonify({"error": old["error"]}), 500
+            html = r.text
+            fields_html = {}
+            for m in re.finditer(
+                r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>',
+                html,
+            ):
+                fields_html[m.group(1)] = m.group(2)
 
-    # Als detail leeg is, probeer via de lijst (soms mist show message)
-    if not old.get("subject") and not old.get("body_html"):
-        msgs = _get_message_list(_session, base, SCHEDULED_BOX)
-        found = next((m for m in msgs if str(m["id"]) == str(msg_id)), None)
-        if found:
-            old["subject"] = found.get("subject", "")
-
-    old_subject = old.get("subject", "") or "(geen onderwerp)"
-    old_body_html = old.get("body_html") or ""
-    old_body_text = old.get("body_text") or ""
-    old_to = old.get("to", "")
-    old_cc = old.get("cc", "")
-    old_bcc = old.get("bcc", "")
+            if fields_html.get("randomDir"):
+                break
+        except Exception:
+            continue
 
     # --------------------------------------------------------
-    # Stap 2: bepaal ontvangers (nieuw of overgenomen)
+    # Stap 2: receivers bepalen (uit HTML, of fallback uit XML)
     # --------------------------------------------------------
     new_to = data.get("to")
     new_cc = data.get("cc")
     new_bcc = data.get("bcc")
-    new_subject = data.get("subject")
-    new_body_html = data.get("message_html")
 
-    # Als geen nieuwe ontvangers opgegeven: probeer uit oude bericht te halen
     if new_to is None:
-        new_to = _resolve_receivers_from_string(_session, base, old_to, "to")
+        new_to = _extract_receivers_from_html(html, role=0)
     if new_cc is None:
-        new_cc = _resolve_receivers_from_string(_session, base, old_cc, "cc")
+        new_cc = _extract_receivers_from_html(html, role=1)
     if new_bcc is None:
-        new_bcc = _resolve_receivers_from_string(_session, base, old_bcc, "bcc")
+        new_bcc = _extract_receivers_from_html(html, role=2)
+
+    # Fallback 1: probeer via show message
+    old = None
+    if not new_to:
+        try:
+            xml_text = _get_message_full_xml(_session, base, msg_id, SCHEDULED_BOX)
+            old = _parse_full_message(xml_text)
+            old_to = old.get("to", "") or ""
+            if old_to:
+                new_to = _resolve_receivers_from_string(_session, base, old_to, "to")
+        except Exception:
+            pass
+
+    # Fallback 2: ruwe regex op HTML
+    if not new_to:
+        try:
+            for m in re.finditer(
+                r'realuserid="(\d+)"[^>]*idatt="([^"]*)"[^>]*'
+                r'userltatt="(\d+)"[^>]*typeatt="(\d+)"[^>]*ssidatt="(\d+)"',
+                html, re.DOTALL,
+            ):
+                real_id, idatt, userlt, typeatt, ssid = m.groups()
+                if int(typeatt) in (0, 1):
+                    new_to = [{
+                        "user_id": idatt if userlt == "2" else real_id,
+                        "name": "",
+                        "is_co_account": userlt == "2",
+                        "ss_id": ssid,
+                    }]
+                    break
+        except Exception:
+            pass
 
     if not new_to:
         return jsonify({
-            "error": "geen ontvangers — geef 'to' mee of kon oude niet parsen",
-            "old_to": old_to,
+            "error": "kon ontvangers niet bepalen",
+            "hint": "geef 'to' mee in de request body",
+            "html_len": len(html),
+            "fields_found": list(fields_html.keys()),
         }), 400
 
-    subject = new_subject if new_subject else old_subject
-    body_html = new_body_html if new_body_html else (
-        old_body_html if old_body_html else f"<p>{old_body_text}</p>"
-    )
+    # --------------------------------------------------------
+    # Stap 3: subject + body
+    # --------------------------------------------------------
+    subject = data.get("subject") or fields_html.get("subject", "") or ""
+    if not subject and old:
+        subject = old.get("subject", "")
+    if not subject:
+        subject = "(geen onderwerp)"
+
+    body_html = data.get("message_html")
+    if not body_html:
+        m = re.search(r'<textarea[^>]*name="message"[^>]*>(.*?)</textarea>',
+                      html, re.DOTALL | re.IGNORECASE)
+        if m:
+            body_html = m.group(1)
+            body_html = (body_html.replace("&lt;", "<").replace("&gt;", ">")
+                                  .replace("&quot;", '"').replace("&#39;", "'")
+                                  .replace("&amp;", "&").replace("&nbsp;", " "))
+    if not body_html and old:
+        body_html = old.get("body_html", "") or f"<p>{old.get('body_text', '')}</p>"
+    if not body_html:
+        body_html = "<p></p>"
 
     # --------------------------------------------------------
-    # Stap 3: verwijder het oude bericht (quick delete)
+    # Stap 4: quick delete oud bericht
     # --------------------------------------------------------
     try:
         r_del = _dispatch(_session, base, [{
@@ -520,7 +699,7 @@ def message_reschedule(msg_id, _session=None, _creds=None):
         }), 500
 
     # --------------------------------------------------------
-    # Stap 4: stuur nieuw bericht met nieuwe sendDate
+    # Stap 5: stuur nieuw bericht
     # --------------------------------------------------------
     try:
         tokens = _get_compose_tokens(_session, base)
@@ -530,7 +709,6 @@ def message_reschedule(msg_id, _session=None, _creds=None):
     if not tokens.get("random_dir"):
         return jsonify({"error": "geen compose-tokens"}), 500
 
-    # Ontvangers toevoegen aan sessie
     for role_idx, user_list in [(0, new_to), (1, new_cc or []), (2, new_bcc or [])]:
         for u in user_list:
             is_co = u.get("is_co_account", False)
@@ -582,7 +760,7 @@ def message_reschedule(msg_id, _session=None, _creds=None):
     return jsonify({
         "ok": ok,
         "reason": reason,
-        "msg_id": msg_id,       # oude id (verwijderd)
+        "msg_id": msg_id,
         "new_send_date": send_date,
         "status": r_send.status_code,
         "deleted_old": del_ok,
@@ -591,65 +769,6 @@ def message_reschedule(msg_id, _session=None, _creds=None):
         "bcc_count": len(new_bcc or []),
         "subject": subject,
     })
-
-
-def _resolve_receivers_from_string(session, base, s, role):
-    """
-    Zet een string als "Jan Peeters, Piet Janssens" om in een lijst users.
-    Zoekt via search-users en kiest de beste match.
-    """
-    if not s:
-        return []
-
-    # Split op komma's of puntkomma's
-    names = [n.strip() for n in re.split(r"[,;]", s) if n.strip()]
-    if not names:
-        return []
-
-    try:
-        tokens = _get_compose_tokens(session, base)
-    except Exception:
-        return []
-
-    if not tokens.get("random_dir"):
-        return []
-
-    result = []
-    for name in names:
-        try:
-            users = _search_users(session, base, name, tokens["unique_usc"], "all")
-        except Exception:
-            continue
-        if not users:
-            continue
-
-        needle = name.lower()
-        best = None
-        for u in users:
-            if (u.get("display_name") or "").lower() == needle:
-                best = u
-                break
-        if not best:
-            for u in users:
-                if (u.get("raw_name") or "").lower() == needle:
-                    best = u
-                    break
-        if not best:
-            for u in users:
-                if needle in (u.get("display_name") or "").lower():
-                    best = u
-                    break
-        if not best:
-            best = users[0]
-
-        result.append({
-            "user_id": best["user_id"],
-            "name": best.get("display_name") or best.get("raw_name") or name,
-            "is_co_account": bool(best.get("is_co_account")),
-            "ss_id": best.get("ss_id", "455"),
-        })
-
-    return result
 
 
 # ============================================================
