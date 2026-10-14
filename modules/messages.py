@@ -1,12 +1,14 @@
 """
-Berichten (messages) endpoints — inclusief uploads en drafts.
+Berichten (messages) endpoints — inclusief uploads en drafts + scheduled verzending.
 """
 
+import calendar
 import re
 import secrets
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from io import BytesIO
 
 import requests as _requests
@@ -32,6 +34,52 @@ DROPPED_TYPE = {
     (0, False): 0, (1, False): 2, (2, False): 3,
     (0, True):  1, (1, True):  4, (2, True):  5,
 }
+
+
+# ============================================================
+# TIJDFORMAAT — ISO met tijdzone (Brussel)
+# ============================================================
+def _is_dst(dt_naive):
+    """EU DST: laatste zondag maart 02:00 → laatste zondag oktober 03:00."""
+    year = dt_naive.year
+    mar = calendar.monthcalendar(year, 3)
+    last_mar_sun = max(w[6] for w in mar if w[6] != 0)
+    dst_start = datetime(year, 3, last_mar_sun, 2, 0)
+    oct_cal = calendar.monthcalendar(year, 10)
+    last_oct_sun = max(w[6] for w in oct_cal if w[6] != 0)
+    dst_end = datetime(year, 10, last_oct_sun, 3, 0)
+    return dst_start <= dt_naive < dst_end
+
+
+def _format_send_date(dt):
+    """
+    Smartschool formaat: '2026-10-15T19:32:03+02:00'
+    Accepteert datetime of string.
+    """
+    if isinstance(dt, str):
+        s = dt.strip()
+        # Als het al ISO met T en +hh:mm is, geef terug
+        if "T" in s and ("+" in s or s.endswith("Z")):
+            return s
+        # Probeer meerdere formaten te parsen
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
+                    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+                    "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M",
+                    "%d-%m-%Y %H:%M"):
+            try:
+                dt = datetime.strptime(s, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            raise ValueError(f"Kan send_date '{dt}' niet parsen")
+
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+    offset_hours = 2 if _is_dst(dt) else 1
+    sign = "+" if offset_hours >= 0 else "-"
+    return f"{dt.strftime('%Y-%m-%dT%H:%M:%S')}{sign}{abs(offset_hours):02d}:00"
 
 
 # ============================================================
@@ -96,7 +144,6 @@ def _get_message_list(session, base, box_type="inbox", box_id="0"):
             "subject": msg.findtext("subject", ""),
             "date": msg.findtext("date", ""),
             "attachment": msg.findtext("attachment", "") == "1",
-            # LET OP: Smartschool's unread veld is in deze instantie OMGEKEERD.
             "unread": msg.findtext("unread", "") == "0",
             "real_box": msg.findtext("realBox", "") or box_type,
             "is_draft": (msg.findtext("realBox", "") == "draft") or (box_type == "draft"),
@@ -187,7 +234,6 @@ def message_read(msg_id, _session=None, _creds=None):
 @bp.post("/<msg_id>/read")
 @with_session
 def message_mark_read(msg_id, _session=None, _creds=None):
-    """Markeer een bericht als gelezen."""
     base = base_url(_creds)
     box = request.args.get("box", "inbox")
     try:
@@ -206,7 +252,6 @@ def message_mark_read(msg_id, _session=None, _creds=None):
 @bp.post("/mark-all-read")
 @with_session
 def messages_mark_all_read(_session=None, _creds=None):
-    """Markeer alle berichten in een box als gelezen."""
     box = request.args.get("box", "inbox")
     base = base_url(_creds)
 
@@ -224,7 +269,7 @@ def messages_mark_all_read(_session=None, _creds=None):
     msg_ids = []
     for msg in root.findall(".//message"):
         mid = msg.findtext("id", "")
-        if mid and msg.findtext("unread", "") == "0":  # omgekeerd!
+        if mid and msg.findtext("unread", "") == "0":
             msg_ids.append(mid)
 
     if not msg_ids:
@@ -553,7 +598,59 @@ def messages_search_users(_session=None, _creds=None):
 
 
 # ============================================================
-# VERZENDEN
+# SUCCES-DETECTIE
+# ============================================================
+def _is_send_success(r):
+    """
+    Bepaal of een composeMessage-POST écht gelukt is.
+    Returns: (ok: bool, reason: str)
+    """
+    if r.status_code in (302, 303):
+        loc = r.headers.get("Location", "")
+        return True, f"redirect → {loc}"
+
+    if r.status_code == 200:
+        body = r.text or ""
+        body_low = body[:8000].lower()
+
+        # Meta-refresh = redirect (scheduled succes)
+        if ('http-equiv="refresh"' in body_low or
+                "http-equiv='refresh'" in body_low):
+            return True, "meta-refresh (scheduled succes)"
+
+        # Succes-indicatoren
+        for indicator in ("bericht verzonden", "bericht is verzonden",
+                          "succesvol verzonden", "werd verzonden",
+                          "message sent", "message was sent"):
+            if indicator in body_low:
+                return True, f"succes-indicator '{indicator}'"
+
+        # Compose-formulier = fail
+        if '<form' in body_low and ('name="send"' in body_low or
+                                     "name='send'" in body_low):
+            return False, "compose-formulier opnieuw (form reloaded)"
+
+        # Expliciete fouten
+        for err in ("oeps, er ging iets mis", 'class="error"',
+                    "class='error'", "fout opgetreden"):
+            if err in body_low:
+                return False, f"foutmelding: '{err}'"
+
+        # HTML zonder form, zonder fout = waarschijnlijk succes
+        if "<!doctype html" in body_low or "<html" in body_low:
+            return True, "HTML zonder form (waarschijnlijk succes)"
+
+        # Lege/korte body = succes
+        if len(body.strip()) < 50:
+            return True, "lege/korte body"
+
+        return True, "200 zonder HTML"
+
+    return False, f"HTTP {r.status_code}"
+
+
+# ============================================================
+# VERZENDEN (met optionele scheduled)
 # ============================================================
 @bp.post("/send")
 @with_session
@@ -566,7 +663,7 @@ def messages_send(_session=None, _creds=None):
     cc_users = data.get("cc") or []
     bcc_users = data.get("bcc") or []
     attachments = data.get("attachments") or []
-    send_date = data.get("send_date") or ""
+    send_date_raw = data.get("send_date") or ""
     draft_id = data.get("draft_id") or ""
 
     if not subject or not to_users:
@@ -587,6 +684,14 @@ def messages_send(_session=None, _creds=None):
             if url:
                 body += f'<li><a href="{url}" target="_blank">{fn}</a></li>'
         body += '</ul>'
+
+    # Normaliseer send_date naar ISO met tijdzone
+    send_date = ""
+    if send_date_raw:
+        try:
+            send_date = _format_send_date(send_date_raw)
+        except ValueError as e:
+            return jsonify({"error": f"ongeldige send_date: {e}"}), 400
 
     base = base_url(_creds)
     if draft_id:
@@ -617,7 +722,7 @@ def messages_send(_session=None, _creds=None):
         "composeType": "5" if draft_id else "0",
         "msgID": draft_id if draft_id else "0",
         "msgFormSelectedTab": "",
-        "sendDate": send_date,
+        "sendDate": send_date,     # ← ISO met tijdzone of leeg
         "subject": subject,
         "bcc": "1" if bcc_users else "0",
         "message": body,
@@ -637,12 +742,17 @@ def messages_send(_session=None, _creds=None):
         data=m,
         headers={"Content-Type": m.content_type, "Origin": base,
                  "Referer": base + "/"},
-        allow_redirects=True,
+        allow_redirects=False,   # ← BELANGRIJK
     )
+
+    ok, reason = _is_send_success(r)
+
     return jsonify({
-        "ok": r.status_code == 200,
+        "ok": ok,
+        "reason": reason,
         "status": r.status_code,
         "scheduled": bool(send_date),
+        "send_date": send_date,
         "draft_id": draft_id or None,
         "has_bcc": bool(bcc_users),
         "to_count": len(to_users),
