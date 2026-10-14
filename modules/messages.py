@@ -1,5 +1,6 @@
 """
-Berichten (messages) endpoints — inclusief uploads en drafts + scheduled verzending.
+Berichten (messages) endpoints — inclusief uploads, drafts, scheduled verzending
+en beheer van geplande berichten.
 """
 
 import calendar
@@ -8,7 +9,7 @@ import secrets
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
 import requests as _requests
@@ -35,6 +36,9 @@ DROPPED_TYPE = {
     (0, True):  1, (1, True):  4, (2, True):  5,
 }
 
+# De box-naam voor geplande berichten in Smartschool-Vlaanderen
+SCHEDULED_BOX = "scheduled"
+
 
 # ============================================================
 # TIJDFORMAAT — ISO met tijdzone (Brussel)
@@ -58,10 +62,8 @@ def _format_send_date(dt):
     """
     if isinstance(dt, str):
         s = dt.strip()
-        # Als het al ISO met T en +hh:mm is, geef terug
         if "T" in s and ("+" in s or s.endswith("Z")):
             return s
-        # Probeer meerdere formaten te parsen
         for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
                     "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
                     "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M",
@@ -169,6 +171,7 @@ def _parse_full_message(xml_text):
 
     result = {"id": "", "subject": "", "sender": "", "to": "", "cc": "", "bcc": "",
               "date": "", "body_html": "", "body_text": "",
+              "send_date": "",
               "attachments": [], "inline_images": []}
     msg = root.find(".//message")
     if msg is not None:
@@ -179,6 +182,8 @@ def _parse_full_message(xml_text):
         result["to"] = msg.findtext("to", "")
         result["cc"] = msg.findtext("cc", "")
         result["bcc"] = msg.findtext("bcc", "")
+        result["send_date"] = (msg.findtext("sendDate", "")
+                               or msg.findtext("senddate", ""))
         for tag in ["body", "messageBody", "content", "htmlBody"]:
             b = msg.find(tag)
             if b is not None:
@@ -213,6 +218,9 @@ def _parse_full_message(xml_text):
     return result
 
 
+# ============================================================
+# ROUTE — LIJST
+# ============================================================
 @bp.get("")
 @with_session
 def messages_list(_session=None, _creds=None):
@@ -220,6 +228,22 @@ def messages_list(_session=None, _creds=None):
     return jsonify({
         "box": box,
         "messages": _get_message_list(_session, base_url(_creds), box),
+    })
+
+
+@bp.get("/scheduled")
+@with_session
+def messages_scheduled(_session=None, _creds=None):
+    """
+    Haal alle geplande berichten op.
+    Box-naam: 'scheduled' (in Smartschool-Vlaanderen).
+    """
+    base = base_url(_creds)
+    msgs = _get_message_list(_session, base, SCHEDULED_BOX)
+    return jsonify({
+        "box": SCHEDULED_BOX,
+        "count": len(msgs),
+        "messages": msgs,
     })
 
 
@@ -332,6 +356,162 @@ def message_action(msg_id, _session=None, _creds=None):
         else:
             return jsonify({"error": "onbekende actie"}), 400
         return jsonify({"ok": True, "action": action})
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+
+# ============================================================
+# SCHEDULED — BEHEER (quick delete)
+# ============================================================
+@bp.post("/<msg_id>/cancel-scheduled")
+@with_session
+def message_cancel_scheduled(msg_id, _session=None, _creds=None):
+    """
+    Verwijder een gepland bericht via Smartschool's 'quick delete'.
+    Werkt met enkel msgID als param.
+    """
+    base = base_url(_creds)
+    try:
+        r = _dispatch(_session, base, [{
+            "subsystem": "postboxes",
+            "action": "quick delete",
+            "params": {"msgID": msg_id},
+        }])
+        body = r.text or ""
+        body_low = body.lower()
+        ok = ("<status>ok</status>" in body_low or
+              "<success>1</success>" in body_low or
+              (r.status_code in (200, 204) and "error" not in body_low))
+        return jsonify({
+            "ok": ok,
+            "action": "quick delete",
+            "msg_id": msg_id,
+            "status": r.status_code,
+            "response": body[:300],
+        })
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+
+@bp.post("/<msg_id>/reschedule")
+@with_session
+def message_reschedule(msg_id, _session=None, _creds=None):
+    """
+    Verander de sendDate van een gepland bericht.
+    Body JSON: {"send_date": "24h" | "2026-11-17 08:00" | ISO}
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    send_date_raw = data.get("send_date") or ""
+
+    if not send_date_raw:
+        return jsonify({"error": "send_date verplicht"}), 400
+
+    # Normaliseer
+    try:
+        send_date = _format_send_date(send_date_raw)
+    except ValueError as e:
+        return jsonify({"error": f"ongeldige send_date: {e}"}), 400
+
+    base = base_url(_creds)
+
+    # Stap 1: open als draft-edit (composeType=5) via scheduled box
+    try:
+        url = (f"/?module=Messages&file=composeMessage"
+               f"&boxType={SCHEDULED_BOX}&composeType=5&msgID={msg_id}")
+        r = _session.request("GET", url, headers={"Referer": base + "/"})
+        if r.status_code != 200:
+            return jsonify({"error": f"kon bericht niet openen (HTTP {r.status_code})"}), 500
+
+        html = r.text
+        fields = {}
+        for m in re.finditer(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>', html):
+            fields[m.group(1)] = m.group(2)
+
+        if not fields.get("randomDir"):
+            return jsonify({"error": "kon tokens niet ophalen"}), 500
+
+        # Body uit textarea
+        body_html = ""
+        body_match = re.search(
+            r'<textarea[^>]*name="message"[^>]*>(.*?)</textarea>',
+            html, re.DOTALL | re.IGNORECASE,
+        )
+        if body_match:
+            body_html = body_match.group(1)
+            body_html = (body_html.replace("&lt;", "<").replace("&gt;", ">")
+                                  .replace("&quot;", '"').replace("&#39;", "'")
+                                  .replace("&amp;", "&").replace("&nbsp;", " "))
+
+        subject = fields.get("subject", "")
+
+        # Receiver XML uit HTML halen
+        receivers = {}
+        alt = re.compile(
+            r'<div[^>]*realuserid="(\d+)"[^>]*idatt="([^"]*)"[^>]*'
+            r'userltatt="(\d+)"[^>]*typeatt="(\d+)"[^>]*ssidatt="(\d+)"',
+            re.DOTALL,
+        )
+        for m in alt.finditer(html):
+            real_id, idatt, userlt, typeatt, ssid = m.groups()
+            typeatt_int = int(typeatt)
+            if typeatt_int in (0, 1):
+                role = 0
+            elif typeatt_int in (2, 4):
+                role = 1
+            elif typeatt_int in (3, 5):
+                role = 2
+            else:
+                role = 0
+            if role not in receivers:
+                uid_out = idatt if (idatt.startswith("U") and userlt == "2") else real_id
+                receivers[role] = (
+                    f'<results><result>'
+                    f'<id>{uid_out}</id>'
+                    f'<ssid>{ssid}</ssid>'
+                    f'<type>{role}</type>'
+                    f'<userlt>{userlt}</userlt>'
+                    f'</result></results>'
+                )
+
+        post_fields = {
+            "send": "send",
+            "origMsgID": fields.get("origMsgID", msg_id),
+            "composeAction": "5",
+            "randomDir": fields.get("randomDir", ""),
+            "uniqueUsc": fields.get("uniqueUsc", ""),
+            "showTab": "tab1Container",
+            "delFile": "0",
+            "composeType": "5",
+            "msgID": msg_id,
+            "msgFormSelectedTab": "",
+            "sendDate": send_date,
+            "subject": subject,
+            "bcc": "0",
+            "message": body_html,
+            "encryptedSender": fields.get("encryptedSender", ""),
+        }
+        for idx in (0, 1, 2):
+            if idx in receivers:
+                post_fields[f"receiverPart{idx}"] = receivers[idx]
+
+        m = MultipartEncoder(fields=post_fields)
+        r2 = _session.request(
+            "POST",
+            "/?module=Messages&file=composeMessage&boxType=inbox&composeType=0&msgID=undefined",
+            data=m,
+            headers={"Content-Type": m.content_type,
+                     "Origin": base, "Referer": base + "/"},
+            allow_redirects=False,
+        )
+
+        ok = r2.status_code in (200, 302, 303)
+        return jsonify({
+            "ok": ok,
+            "msg_id": msg_id,
+            "new_send_date": send_date,
+            "status": r2.status_code,
+            "response_preview": r2.text[:300],
+        })
     except Exception as e:
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
@@ -601,10 +781,6 @@ def messages_search_users(_session=None, _creds=None):
 # SUCCES-DETECTIE
 # ============================================================
 def _is_send_success(r):
-    """
-    Bepaal of een composeMessage-POST écht gelukt is.
-    Returns: (ok: bool, reason: str)
-    """
     if r.status_code in (302, 303):
         loc = r.headers.get("Location", "")
         return True, f"redirect → {loc}"
@@ -613,34 +789,28 @@ def _is_send_success(r):
         body = r.text or ""
         body_low = body[:8000].lower()
 
-        # Meta-refresh = redirect (scheduled succes)
         if ('http-equiv="refresh"' in body_low or
                 "http-equiv='refresh'" in body_low):
             return True, "meta-refresh (scheduled succes)"
 
-        # Succes-indicatoren
         for indicator in ("bericht verzonden", "bericht is verzonden",
                           "succesvol verzonden", "werd verzonden",
                           "message sent", "message was sent"):
             if indicator in body_low:
                 return True, f"succes-indicator '{indicator}'"
 
-        # Compose-formulier = fail
         if '<form' in body_low and ('name="send"' in body_low or
                                      "name='send'" in body_low):
             return False, "compose-formulier opnieuw (form reloaded)"
 
-        # Expliciete fouten
         for err in ("oeps, er ging iets mis", 'class="error"',
                     "class='error'", "fout opgetreden"):
             if err in body_low:
                 return False, f"foutmelding: '{err}'"
 
-        # HTML zonder form, zonder fout = waarschijnlijk succes
         if "<!doctype html" in body_low or "<html" in body_low:
             return True, "HTML zonder form (waarschijnlijk succes)"
 
-        # Lege/korte body = succes
         if len(body.strip()) < 50:
             return True, "lege/korte body"
 
@@ -685,7 +855,7 @@ def messages_send(_session=None, _creds=None):
                 body += f'<li><a href="{url}" target="_blank">{fn}</a></li>'
         body += '</ul>'
 
-    # Normaliseer send_date naar ISO met tijdzone
+    # Normaliseer send_date
     send_date = ""
     if send_date_raw:
         try:
@@ -722,7 +892,7 @@ def messages_send(_session=None, _creds=None):
         "composeType": "5" if draft_id else "0",
         "msgID": draft_id if draft_id else "0",
         "msgFormSelectedTab": "",
-        "sendDate": send_date,     # ← ISO met tijdzone of leeg
+        "sendDate": send_date,
         "subject": subject,
         "bcc": "1" if bcc_users else "0",
         "message": body,
@@ -742,7 +912,7 @@ def messages_send(_session=None, _creds=None):
         data=m,
         headers={"Content-Type": m.content_type, "Origin": base,
                  "Referer": base + "/"},
-        allow_redirects=False,   # ← BELANGRIJK
+        allow_redirects=False,
     )
 
     ok, reason = _is_send_success(r)
