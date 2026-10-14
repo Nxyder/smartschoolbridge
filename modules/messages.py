@@ -239,23 +239,16 @@ def _parse_full_message(xml_text):
 
 
 # ============================================================
-# HELPER — receivers uit HTML halen  (GEfixt)
+# HELPER — receivers uit HTML halen
 # ============================================================
 def _extract_receivers_from_html(html, role):
     """
     Lees receiverSpan-divs uit de Smartschool composeMessage-HTML.
 
     role: 0=to, 1=cc, 2=bcc
-
-    typeatt → rol:
-        0,1 → to
-        2,4 → cc
-        3,5 → bcc
-
-    userltatt == "2"  → co-account (user_id krijgt prefix "U")
-    userltatt == "0"  → hoofdaccount (user_id = realuserid)
-
-    Retourneert lijst van {user_id, name, is_co_account, ss_id}.
+    typeatt → rol: 0,1 → to | 2,4 → cc | 3,5 → bcc
+    userltatt == "2" → co-account (user_id krijgt prefix "U")
+    userltatt == "0" → hoofdaccount (user_id = realuserid)
     """
     if not html:
         return []
@@ -400,6 +393,65 @@ def _resolve_receivers_from_string(session, base, s, role):
         })
 
     return result
+
+
+# ============================================================
+# HELPER — normaliseer user lijst (user_id mag ontbreken)
+# ============================================================
+def _normalize_user_list(session, base, lst, role, old_list=None):
+    """
+    Accepteert users met of zonder user_id.
+    - user_id aanwezig → gebruik die
+    - user_id leeg → match op naam met old_list
+    - geen match → zoek via Smartschool search op naam
+    - niks bruikbaar → skip
+    """
+    out = []
+    old_list = old_list or []
+
+    for u in (lst or []):
+        if isinstance(u, str):
+            # string → resolve via search
+            resolved = _resolve_receivers_from_string(session, base, u, role)
+            out.extend(resolved)
+            continue
+
+        if not isinstance(u, dict):
+            continue
+
+        uid = (u.get("user_id") or u.get("id") or "").strip()
+        name = (u.get("name") or u.get("display_name") or "").strip()
+
+        if not uid:
+            # Probeer te matchen met bestaande ontvanger op naam
+            if name:
+                for old_u in old_list:
+                    old_name = (old_u.get("name") or "").strip()
+                    if old_name and old_name.lower() == name.lower():
+                        out.append(dict(old_u))
+                        uid = "__matched__"
+                        break
+
+            if uid != "__matched__" and name:
+                resolved = _resolve_receivers_from_string(session, base, name, role)
+                if resolved:
+                    out.append(resolved[0])
+                    uid = "__matched__"
+
+            if uid != "__matched__":
+                # niks bruikbaar, skip
+                continue
+            else:
+                continue
+
+        out.append({
+            "user_id": uid,
+            "name": name,
+            "is_co_account": bool(u.get("is_co_account")),
+            "ss_id": str(u.get("ss_id", "455")),
+        })
+
+    return out
 
 
 # ============================================================
@@ -725,33 +777,27 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
     else:
         send_date = ""
 
-    def _resolve_field(field_name, old_list, role):
-        if field_name not in data:
-            return list(old_list)
-        val = data.get(field_name)
-        if val is None:
-            return []
-        if isinstance(val, str):
-            if not val.strip():
-                return []
-            return _resolve_receivers_from_string(_session, base, val, role)
-        if isinstance(val, list):
-            out = []
-            for u in val:
-                if not isinstance(u, dict) or not u.get("user_id"):
-                    continue
-                out.append({
-                    "user_id": u["user_id"],
-                    "name": u.get("name") or u.get("display_name") or "",
-                    "is_co_account": bool(u.get("is_co_account")),
-                    "ss_id": str(u.get("ss_id", "455")),
-                })
-            return out
-        return list(old_list)
+    # Resolve fields: user_id mag ontbreken
+    if "to" in data:
+        new_to = _normalize_user_list(
+            _session, base, data.get("to") or [], "to",
+            old_list=old_receivers["to"])
+    else:
+        new_to = list(old_receivers["to"])
 
-    new_to = _resolve_field("to", old_receivers["to"], "to")
-    new_cc = _resolve_field("cc", old_receivers["cc"], "cc")
-    new_bcc = _resolve_field("bcc", old_receivers["bcc"], "bcc")
+    if "cc" in data:
+        new_cc = _normalize_user_list(
+            _session, base, data.get("cc") or [], "cc",
+            old_list=old_receivers["cc"])
+    else:
+        new_cc = list(old_receivers["cc"])
+
+    if "bcc" in data:
+        new_bcc = _normalize_user_list(
+            _session, base, data.get("bcc") or [], "bcc",
+            old_list=old_receivers["bcc"])
+    else:
+        new_bcc = list(old_receivers["bcc"])
 
     if not new_to:
         return jsonify({
@@ -760,6 +806,7 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
             "old_to_count": len(old_receivers["to"]),
         }), 400
 
+    # Delete oude scheduled
     try:
         r_del = _dispatch(_session, base, [{
             "subsystem": "postboxes",
@@ -1264,6 +1311,58 @@ def messages_search_users(_session=None, _creds=None):
 
 
 # ============================================================
+# USER INFO OP BASIS VAN ID
+# ============================================================
+@bp.get("/user/<user_id>")
+@with_session
+def messages_get_user(user_id, _session=None, _creds=None):
+    """
+    Haal user info op basis van user_id.
+    user_id mag met of zonder 'U' prefix komen (co-account vs hoofdaccount).
+    """
+    base = base_url(_creds)
+    uid = (user_id or "").strip()
+    if not uid:
+        return jsonify({"error": "user_id verplicht"}), 400
+
+    is_co = uid.startswith("U")
+    clean_id = uid[1:] if is_co else uid
+
+    # Zoek via searchUsers met het ID als query
+    try:
+        tokens = _get_compose_tokens(_session, base)
+        if not tokens.get("random_dir"):
+            return jsonify({"error": "geen compose-tokens"}), 500
+        users = _search_users(_session, base, clean_id, tokens["unique_usc"], "all")
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+    # Match op user_id (met of zonder U prefix)
+    for u in users:
+        u_id = (u.get("user_id") or "").strip()
+        u_clean = u_id[1:] if u_id.startswith("U") else u_id
+        if u_clean == clean_id:
+            return jsonify({
+                "found": True,
+                "user_id": u_id,
+                "name": u.get("display_name") or u.get("name"),
+                "raw_name": u.get("raw_name"),
+                "is_co_account": bool(u.get("is_co_account", False)),
+                "ss_id": u.get("ss_id", "455"),
+                "type_label": u.get("type_label"),
+                "classname": u.get("classname"),
+            })
+
+    # Fallback: geen match gevonden
+    return jsonify({
+        "found": False,
+        "user_id": uid,
+        "is_co_account": is_co,
+        "ss_id": "455",
+    })
+
+
+# ============================================================
 # SUCCES-DETECTIE
 # ============================================================
 def _is_send_success(r):
@@ -1315,12 +1414,16 @@ def messages_send(_session=None, _creds=None):
     subject = data.get("subject")
     message_html = data.get("message_html")
     message_plain = data.get("message") or ""
-    to_users = data.get("to") or []
-    cc_users = data.get("cc") or []
-    bcc_users = data.get("bcc") or []
     attachments = data.get("attachments") or []
     send_date_raw = data.get("send_date") or ""
     draft_id = data.get("draft_id") or ""
+
+    base = base_url(_creds)
+
+    # Normaliseer user lijsten (user_id mag ontbreken → match op naam)
+    to_users = _normalize_user_list(_session, base, data.get("to") or [], "to")
+    cc_users = _normalize_user_list(_session, base, data.get("cc") or [], "cc")
+    bcc_users = _normalize_user_list(_session, base, data.get("bcc") or [], "bcc")
 
     if not subject or not to_users:
         return jsonify({"error": "subject en to zijn verplicht"}), 400
@@ -1348,7 +1451,6 @@ def messages_send(_session=None, _creds=None):
         except ValueError as e:
             return jsonify({"error": f"ongeldige send_date: {e}"}), 400
 
-    base = base_url(_creds)
     if draft_id:
         tokens = _get_draft_tokens(_session, base, draft_id)
     else:
