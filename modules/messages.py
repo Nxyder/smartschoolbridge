@@ -36,7 +36,6 @@ DROPPED_TYPE = {
     (0, True):  1, (1, True):  4, (2, True):  5,
 }
 
-# De box-naam voor geplande berichten in Smartschool-Vlaanderen
 SCHEDULED_BOX = "scheduled"
 
 
@@ -58,23 +57,45 @@ def _is_dst(dt_naive):
 def _format_send_date(dt):
     """
     Smartschool formaat: '2026-10-15T19:32:03+02:00'
-    Accepteert datetime of string.
+
+    Accepteert:
+      - datetime object
+      - ISO met tijdzone: "2026-10-15T19:32:03+02:00"
+      - ISO zonder tz:    "2026-10-15T19:32" / "2026-10-15 19:32"
+      - NL datum:         "15/10/2026 19:32"
+      - Relatief:         "24h", "2d", "30m"
     """
     if isinstance(dt, str):
         s = dt.strip()
-        if "T" in s and ("+" in s or s.endswith("Z")):
-            return s
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
-                    "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
-                    "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M",
-                    "%d-%m-%Y %H:%M"):
-            try:
-                dt = datetime.strptime(s, fmt)
-                break
-            except ValueError:
-                continue
+
+        # Relatief: "24h", "2d", "30m"
+        m = re.match(r"^(\d+)\s*([hdm])$", s, re.IGNORECASE)
+        if m:
+            n = int(m.group(1))
+            unit = m.group(2).lower()
+            if unit == "h":
+                dt = datetime.now() + timedelta(hours=n)
+            elif unit == "d":
+                dt = datetime.now() + timedelta(days=n)
+            elif unit == "m":
+                dt = datetime.now() + timedelta(minutes=n)
         else:
-            raise ValueError(f"Kan send_date '{dt}' niet parsen")
+            # Al ISO met T en tijdzone → direct terug
+            if "T" in s and ("+" in s or s.endswith("Z")):
+                return s
+
+            # Probeer meerdere formaten
+            for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
+                        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+                        "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M",
+                        "%d-%m-%Y %H:%M"):
+                try:
+                    dt = datetime.strptime(s, fmt)
+                    break
+                except ValueError:
+                    continue
+            else:
+                raise ValueError(f"Kan send_date '{dt}' niet parsen")
 
     if dt.tzinfo is not None:
         dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
@@ -234,10 +255,7 @@ def messages_list(_session=None, _creds=None):
 @bp.get("/scheduled")
 @with_session
 def messages_scheduled(_session=None, _creds=None):
-    """
-    Haal alle geplande berichten op.
-    Box-naam: 'scheduled' (in Smartschool-Vlaanderen).
-    """
+    """Haal alle geplande berichten op."""
     base = base_url(_creds)
     msgs = _get_message_list(_session, base, SCHEDULED_BOX)
     return jsonify({
@@ -366,10 +384,7 @@ def message_action(msg_id, _session=None, _creds=None):
 @bp.post("/<msg_id>/cancel-scheduled")
 @with_session
 def message_cancel_scheduled(msg_id, _session=None, _creds=None):
-    """
-    Verwijder een gepland bericht via Smartschool's 'quick delete'.
-    Werkt met enkel msgID als param.
-    """
+    """Verwijder een gepland bericht via 'quick delete'."""
     base = base_url(_creds)
     try:
         r = _dispatch(_session, base, [{
@@ -393,12 +408,26 @@ def message_cancel_scheduled(msg_id, _session=None, _creds=None):
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 
+# ============================================================
+# RESCHEDULE — via delete + recreate
+# ============================================================
 @bp.post("/<msg_id>/reschedule")
 @with_session
 def message_reschedule(msg_id, _session=None, _creds=None):
     """
-    Verander de sendDate van een gepland bericht.
-    Body JSON: {"send_date": "24h" | "2026-11-17 08:00" | ISO}
+    Herplan een gepland bericht.
+
+    Smartschool kan een scheduled bericht NIET openen als draft,
+    dus we doen: (1) lees inhoud, (2) quick delete, (3) verstuur nieuw
+    met dezelfde inhoud + nieuwe sendDate.
+
+    Body JSON:
+        {"send_date": "24h" | "2026-11-17 08:00" | ISO}
+
+    Optioneel:
+        {"subject": "nieuw onderwerp"}  → overschrijf onderwerp
+        {"message_html": "<p>nieuw</p>"} → overschrijf body
+        {"to": [...]}                    → overschrijf ontvangers
     """
     data = request.get_json(force=True, silent=True) or {}
     send_date_raw = data.get("send_date") or ""
@@ -406,7 +435,6 @@ def message_reschedule(msg_id, _session=None, _creds=None):
     if not send_date_raw:
         return jsonify({"error": "send_date verplicht"}), 400
 
-    # Normaliseer
     try:
         send_date = _format_send_date(send_date_raw)
     except ValueError as e:
@@ -414,88 +442,131 @@ def message_reschedule(msg_id, _session=None, _creds=None):
 
     base = base_url(_creds)
 
-    # Stap 1: open als draft-edit (composeType=5) via scheduled box
+    # --------------------------------------------------------
+    # Stap 1: lees de inhoud van het bestaande bericht
+    # --------------------------------------------------------
     try:
-        url = (f"/?module=Messages&file=composeMessage"
-               f"&boxType={SCHEDULED_BOX}&composeType=5&msgID={msg_id}")
-        r = _session.request("GET", url, headers={"Referer": base + "/"})
-        if r.status_code != 200:
-            return jsonify({"error": f"kon bericht niet openen (HTTP {r.status_code})"}), 500
+        xml_text = _get_message_full_xml(_session, base, msg_id, SCHEDULED_BOX)
+        old = _parse_full_message(xml_text)
+    except Exception as e:
+        return jsonify({"error": f"kon bericht niet lezen: {e}"}), 500
 
-        html = r.text
-        fields = {}
-        for m in re.finditer(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>', html):
-            fields[m.group(1)] = m.group(2)
+    if old.get("error"):
+        return jsonify({"error": old["error"]}), 500
 
-        if not fields.get("randomDir"):
-            return jsonify({"error": "kon tokens niet ophalen"}), 500
+    # Als detail leeg is, probeer via de lijst (soms mist show message)
+    if not old.get("subject") and not old.get("body_html"):
+        msgs = _get_message_list(_session, base, SCHEDULED_BOX)
+        found = next((m for m in msgs if str(m["id"]) == str(msg_id)), None)
+        if found:
+            old["subject"] = found.get("subject", "")
 
-        # Body uit textarea
-        body_html = ""
-        body_match = re.search(
-            r'<textarea[^>]*name="message"[^>]*>(.*?)</textarea>',
-            html, re.DOTALL | re.IGNORECASE,
-        )
-        if body_match:
-            body_html = body_match.group(1)
-            body_html = (body_html.replace("&lt;", "<").replace("&gt;", ">")
-                                  .replace("&quot;", '"').replace("&#39;", "'")
-                                  .replace("&amp;", "&").replace("&nbsp;", " "))
+    old_subject = old.get("subject", "") or "(geen onderwerp)"
+    old_body_html = old.get("body_html") or ""
+    old_body_text = old.get("body_text") or ""
+    old_to = old.get("to", "")
+    old_cc = old.get("cc", "")
+    old_bcc = old.get("bcc", "")
 
-        subject = fields.get("subject", "")
+    # --------------------------------------------------------
+    # Stap 2: bepaal ontvangers (nieuw of overgenomen)
+    # --------------------------------------------------------
+    new_to = data.get("to")
+    new_cc = data.get("cc")
+    new_bcc = data.get("bcc")
+    new_subject = data.get("subject")
+    new_body_html = data.get("message_html")
 
-        # Receiver XML uit HTML halen
-        receivers = {}
-        alt = re.compile(
-            r'<div[^>]*realuserid="(\d+)"[^>]*idatt="([^"]*)"[^>]*'
-            r'userltatt="(\d+)"[^>]*typeatt="(\d+)"[^>]*ssidatt="(\d+)"',
-            re.DOTALL,
-        )
-        for m in alt.finditer(html):
-            real_id, idatt, userlt, typeatt, ssid = m.groups()
-            typeatt_int = int(typeatt)
-            if typeatt_int in (0, 1):
-                role = 0
-            elif typeatt_int in (2, 4):
-                role = 1
-            elif typeatt_int in (3, 5):
-                role = 2
-            else:
-                role = 0
-            if role not in receivers:
-                uid_out = idatt if (idatt.startswith("U") and userlt == "2") else real_id
-                receivers[role] = (
-                    f'<results><result>'
-                    f'<id>{uid_out}</id>'
-                    f'<ssid>{ssid}</ssid>'
-                    f'<type>{role}</type>'
-                    f'<userlt>{userlt}</userlt>'
-                    f'</result></results>'
-                )
+    # Als geen nieuwe ontvangers opgegeven: probeer uit oude bericht te halen
+    if new_to is None:
+        new_to = _resolve_receivers_from_string(_session, base, old_to, "to")
+    if new_cc is None:
+        new_cc = _resolve_receivers_from_string(_session, base, old_cc, "cc")
+    if new_bcc is None:
+        new_bcc = _resolve_receivers_from_string(_session, base, old_bcc, "bcc")
 
-        post_fields = {
-            "send": "send",
-            "origMsgID": fields.get("origMsgID", msg_id),
-            "composeAction": "5",
-            "randomDir": fields.get("randomDir", ""),
-            "uniqueUsc": fields.get("uniqueUsc", ""),
-            "showTab": "tab1Container",
-            "delFile": "0",
-            "composeType": "5",
-            "msgID": msg_id,
-            "msgFormSelectedTab": "",
-            "sendDate": send_date,
-            "subject": subject,
-            "bcc": "0",
-            "message": body_html,
-            "encryptedSender": fields.get("encryptedSender", ""),
-        }
-        for idx in (0, 1, 2):
-            if idx in receivers:
-                post_fields[f"receiverPart{idx}"] = receivers[idx]
+    if not new_to:
+        return jsonify({
+            "error": "geen ontvangers — geef 'to' mee of kon oude niet parsen",
+            "old_to": old_to,
+        }), 400
 
-        m = MultipartEncoder(fields=post_fields)
-        r2 = _session.request(
+    subject = new_subject if new_subject else old_subject
+    body_html = new_body_html if new_body_html else (
+        old_body_html if old_body_html else f"<p>{old_body_text}</p>"
+    )
+
+    # --------------------------------------------------------
+    # Stap 3: verwijder het oude bericht (quick delete)
+    # --------------------------------------------------------
+    try:
+        r_del = _dispatch(_session, base, [{
+            "subsystem": "postboxes",
+            "action": "quick delete",
+            "params": {"msgID": msg_id},
+        }])
+        body_del = r_del.text or ""
+        body_del_low = body_del.lower()
+        del_ok = ("<status>ok</status>" in body_del_low or
+                  "<success>1</success>" in body_del_low or
+                  (r_del.status_code in (200, 204) and "error" not in body_del_low))
+    except Exception as e:
+        return jsonify({"error": f"verwijderen mislukt: {e}"}), 500
+
+    if not del_ok:
+        return jsonify({
+            "error": "kon oud bericht niet verwijderen",
+            "delete_response": body_del[:300],
+        }), 500
+
+    # --------------------------------------------------------
+    # Stap 4: stuur nieuw bericht met nieuwe sendDate
+    # --------------------------------------------------------
+    try:
+        tokens = _get_compose_tokens(_session, base)
+    except Exception as e:
+        return jsonify({"error": f"kon tokens niet ophalen: {e}"}), 500
+
+    if not tokens.get("random_dir"):
+        return jsonify({"error": "geen compose-tokens"}), 500
+
+    # Ontvangers toevoegen aan sessie
+    for role_idx, user_list in [(0, new_to), (1, new_cc or []), (2, new_bcc or [])]:
+        for u in user_list:
+            is_co = u.get("is_co_account", False)
+            dropped = DROPPED_TYPE[(role_idx, is_co)]
+            userlt = "2" if is_co else "0"
+            _add_user_to_selected(_session, base, u["user_id"],
+                                  tokens["unique_usc"], dropped,
+                                  ssid=u.get("ss_id", "455"), userlt=userlt)
+
+    fields = {
+        "send": "send",
+        "origMsgID": "0",
+        "composeAction": "0",
+        "randomDir": tokens["random_dir"],
+        "uniqueUsc": tokens["unique_usc"],
+        "showTab": "tab1Container",
+        "delFile": "0",
+        "composeType": "0",
+        "msgID": "0",
+        "msgFormSelectedTab": "",
+        "sendDate": send_date,
+        "subject": subject,
+        "bcc": "1" if new_bcc else "0",
+        "message": body_html,
+        "encryptedSender": tokens["encrypted_sender"],
+    }
+    if new_to:
+        fields["receiverPart0"] = _build_receiver_xml(new_to, 0)
+    if new_cc:
+        fields["receiverPart1"] = _build_receiver_xml(new_cc, 1)
+    if new_bcc:
+        fields["receiverPart2"] = _build_receiver_xml(new_bcc, 2)
+
+    m = MultipartEncoder(fields=fields)
+    try:
+        r_send = _session.request(
             "POST",
             "/?module=Messages&file=composeMessage&boxType=inbox&composeType=0&msgID=undefined",
             data=m,
@@ -503,17 +574,82 @@ def message_reschedule(msg_id, _session=None, _creds=None):
                      "Origin": base, "Referer": base + "/"},
             allow_redirects=False,
         )
-
-        ok = r2.status_code in (200, 302, 303)
-        return jsonify({
-            "ok": ok,
-            "msg_id": msg_id,
-            "new_send_date": send_date,
-            "status": r2.status_code,
-            "response_preview": r2.text[:300],
-        })
     except Exception as e:
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        return jsonify({"error": f"verzenden mislukt: {e}"}), 500
+
+    ok, reason = _is_send_success(r_send)
+
+    return jsonify({
+        "ok": ok,
+        "reason": reason,
+        "msg_id": msg_id,       # oude id (verwijderd)
+        "new_send_date": send_date,
+        "status": r_send.status_code,
+        "deleted_old": del_ok,
+        "to_count": len(new_to),
+        "cc_count": len(new_cc or []),
+        "bcc_count": len(new_bcc or []),
+        "subject": subject,
+    })
+
+
+def _resolve_receivers_from_string(session, base, s, role):
+    """
+    Zet een string als "Jan Peeters, Piet Janssens" om in een lijst users.
+    Zoekt via search-users en kiest de beste match.
+    """
+    if not s:
+        return []
+
+    # Split op komma's of puntkomma's
+    names = [n.strip() for n in re.split(r"[,;]", s) if n.strip()]
+    if not names:
+        return []
+
+    try:
+        tokens = _get_compose_tokens(session, base)
+    except Exception:
+        return []
+
+    if not tokens.get("random_dir"):
+        return []
+
+    result = []
+    for name in names:
+        try:
+            users = _search_users(session, base, name, tokens["unique_usc"], "all")
+        except Exception:
+            continue
+        if not users:
+            continue
+
+        needle = name.lower()
+        best = None
+        for u in users:
+            if (u.get("display_name") or "").lower() == needle:
+                best = u
+                break
+        if not best:
+            for u in users:
+                if (u.get("raw_name") or "").lower() == needle:
+                    best = u
+                    break
+        if not best:
+            for u in users:
+                if needle in (u.get("display_name") or "").lower():
+                    best = u
+                    break
+        if not best:
+            best = users[0]
+
+        result.append({
+            "user_id": best["user_id"],
+            "name": best.get("display_name") or best.get("raw_name") or name,
+            "is_co_account": bool(best.get("is_co_account")),
+            "ss_id": best.get("ss_id", "455"),
+        })
+
+    return result
 
 
 # ============================================================
@@ -820,7 +956,7 @@ def _is_send_success(r):
 
 
 # ============================================================
-# VERZENDEN (met optionele scheduled)
+# VERZENDEN
 # ============================================================
 @bp.post("/send")
 @with_session
@@ -855,7 +991,6 @@ def messages_send(_session=None, _creds=None):
                 body += f'<li><a href="{url}" target="_blank">{fn}</a></li>'
         body += '</ul>'
 
-    # Normaliseer send_date
     send_date = ""
     if send_date_raw:
         try:
