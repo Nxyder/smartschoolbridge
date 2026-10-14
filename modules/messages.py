@@ -105,6 +105,19 @@ def _format_send_date(dt):
     return f"{dt.strftime('%Y-%m-%dT%H:%M:%S')}{sign}{abs(offset_hours):02d}:00"
 
 
+def _parse_send_date_to_iso(raw):
+    """
+    Zelfde als _format_send_date, maar tolerant: geeft None terug bij leeg
+    i.p.v. exception, en probeert ook Smartschool's eigen ISO-formaat.
+    """
+    if not raw:
+        return None
+    try:
+        return _format_send_date(raw)
+    except ValueError:
+        return None
+
+
 # ============================================================
 # DISPATCHER
 # ============================================================
@@ -536,6 +549,365 @@ def message_cancel_scheduled(msg_id, _session=None, _creds=None):
         })
     except Exception as e:
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+
+# ============================================================
+# SCHEDULED — VOLLEDIG LEZEN (compose HTML + show message XML)
+# ============================================================
+def _read_scheduled_full(session, base, msg_id):
+    """
+    Lees ALLES wat we kunnen over een scheduled bericht:
+      - compose HTML (subject, body, receivers)
+      - show message XML (fallback voor subject/body/ontvangers/timing)
+
+    Retourneert dict met:
+      {
+        "html": str,
+        "fields": {naam: waarde uit <input>},
+        "receivers": {"to": [...], "cc": [...], "bcc": [...]},
+        "subject": str,
+        "body_html": str,
+        "send_date": str (ISO of ruw),
+        "orig_msg_id": str,
+        "raw": { ... }  # debug
+      }
+    """
+    html = ""
+    fields_html = {}
+    for box_name in (SCHEDULED_BOX, "sendLater", "draft"):
+        try:
+            url = (f"/?module=Messages&file=composeMessage"
+                   f"&boxType={box_name}&composeType=5&msgID={msg_id}")
+            r = session.request("GET", url, headers={"Referer": base + "/"})
+            if r.status_code != 200:
+                continue
+            html = r.text
+            fields_html = {}
+            for m in re.finditer(
+                r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>',
+                html,
+            ):
+                fields_html[m.group(1)] = m.group(2)
+            if fields_html.get("randomDir"):
+                break
+        except Exception:
+            continue
+
+    receivers = {
+        "to": _extract_receivers_from_html(html, role=0),
+        "cc": _extract_receivers_from_html(html, role=1),
+        "bcc": _extract_receivers_from_html(html, role=2),
+    }
+
+    subject = fields_html.get("subject", "")
+    body_html = ""
+    m = re.search(r'<textarea[^>]*name="message"[^>]*>(.*?)</textarea>',
+                  html, re.DOTALL | re.IGNORECASE)
+    if m:
+        body_html = m.group(1)
+        body_html = (body_html.replace("&lt;", "<").replace("&gt;", ">")
+                              .replace("&quot;", '"').replace("&#39;", "'")
+                              .replace("&amp;", "&").replace("&nbsp;", " "))
+
+    send_date = fields_html.get("sendDate", "") or ""
+    orig_msg_id = fields_html.get("origMsgID", "") or ""
+
+    # Fallback via show message XML
+    old = None
+    if not subject or not body_html or not receivers["to"]:
+        try:
+            xml_text = _get_message_full_xml(session, base, msg_id, SCHEDULED_BOX)
+            old = _parse_full_message(xml_text)
+            if not subject:
+                subject = old.get("subject", "") or ""
+            if not body_html:
+                body_html = old.get("body_html", "") or ""
+            if not send_date:
+                send_date = old.get("send_date", "") or ""
+            if not receivers["to"]:
+                old_to = old.get("to", "") or ""
+                if old_to:
+                    receivers["to"] = _resolve_receivers_from_string(
+                        session, base, old_to, "to")
+            if not receivers["cc"]:
+                old_cc = old.get("cc", "") or ""
+                if old_cc:
+                    receivers["cc"] = _resolve_receivers_from_string(
+                        session, base, old_cc, "cc")
+            if not receivers["bcc"]:
+                old_bcc = old.get("bcc", "") or ""
+                if old_bcc:
+                    receivers["bcc"] = _resolve_receivers_from_string(
+                        session, base, old_bcc, "bcc")
+        except Exception:
+            pass
+
+    return {
+        "html": html,
+        "fields": fields_html,
+        "receivers": receivers,
+        "subject": subject,
+        "body_html": body_html,
+        "send_date": send_date,
+        "orig_msg_id": orig_msg_id,
+        "old": old,
+    }
+
+
+@bp.get("/<msg_id>/scheduled")
+@with_session
+def message_read_scheduled(msg_id, _session=None, _creds=None):
+    """
+    Lees een scheduled bericht VOLLEDIG uit, klaar om te editen.
+
+    Retourneert subject, body_html, to/cc/bcc (met user_id + naam),
+    send_date en tokens zodat je exact weet wat je moet meesturen naar
+    PUT /api/messages/<msg_id>/scheduled.
+    """
+    base = base_url(_creds)
+    try:
+        info = _read_scheduled_full(_session, base, msg_id)
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+    return jsonify({
+        "msg_id": msg_id,
+        "subject": info["subject"],
+        "body_html": info["body_html"],
+        "body_text": strip_html(info["body_html"]),
+        "send_date": info["send_date"],
+        "orig_msg_id": info["orig_msg_id"],
+        "to": info["receivers"]["to"],
+        "cc": info["receivers"]["cc"],
+        "bcc": info["receivers"]["bcc"],
+        "has_compose_html": bool(info["html"]),
+        "fields_found": sorted(info["fields"].keys()),
+    })
+
+
+# ============================================================
+# SCHEDULED — VOLLEDIG AANPASSEN (subject, body, to/cc/bcc, send_date)
+# ============================================================
+@bp.put("/<msg_id>/scheduled")
+@bp.patch("/<msg_id>/scheduled")
+@with_session
+def message_update_scheduled(msg_id, _session=None, _creds=None):
+    """
+    Pas een scheduled bericht VOLLEDIG aan: subject, body_html,
+    to/cc/bcc en send_date.
+
+    Werking: delete + recreate (Smartschool heeft geen echte edit-API).
+    Alle velden zijn optioneel; weggelaten velden worden overgenomen
+    uit het bestaande bericht. Geef je 'to' mee, dan wordt de volledige
+    to-lijst VERVANGEN (niet aangevuld).
+
+    Body JSON (alle optioneel):
+      {
+        "subject": "...",
+        "message_html": "<p>...</p>",
+        "message": "platte tekst",         # fallback als message_html leeg is
+        "to":  [ {user_id, is_co_account, ss_id, name?}, ... ],
+        "cc":  [ ... ],
+        "bcc": [ ... ],
+        "send_date": "24h" | "2026-11-17 08:00" | ISO,
+        "keep_send_date": true             # negeer send_date, hergebruik bestaande
+      }
+
+    Voor 'to'/'cc'/'bcc' mag je ook een string meegeven:
+      "to": "Jan Peeters, Piet Janssens"  → wordt opgezocht via searchUsers
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    base = base_url(_creds)
+
+    # --------------------------------------------------------
+    # 1. Bestaande toestand lezen
+    # --------------------------------------------------------
+    try:
+        info = _read_scheduled_full(_session, base, msg_id)
+    except Exception as e:
+        return jsonify({"error": f"kon bericht niet lezen: {e}"}), 500
+
+    old_subject = info["subject"]
+    old_body = info["body_html"]
+    old_receivers = info["receivers"]
+    old_send_date = info["send_date"]
+
+    # --------------------------------------------------------
+    # 2. Nieuwe waarden bepalen (met fallback naar oud)
+    # --------------------------------------------------------
+    new_subject = data.get("subject")
+    if new_subject is None:
+        new_subject = old_subject or "(geen onderwerp)"
+
+    # body: message_html primeert, dan message (plain), dan oud
+    new_body = data.get("message_html")
+    if new_body is None or new_body == "":
+        plain = data.get("message")
+        if plain:
+            new_body = f"<p>{plain}</p>"
+        else:
+            new_body = old_body or "<p></p>"
+
+    # send_date
+    if data.get("keep_send_date"):
+        send_date_raw = old_send_date
+    else:
+        send_date_raw = data.get("send_date")
+        if send_date_raw is None:
+            send_date_raw = old_send_date
+
+    if send_date_raw:
+        try:
+            send_date = _format_send_date(send_date_raw)
+        except ValueError as e:
+            return jsonify({"error": f"ongeldige send_date: {e}"}), 400
+    else:
+        send_date = ""
+
+    # --------------------------------------------------------
+    # 3. Ontvangers bepalen
+    #    - key afwezig  → behoud oud
+    #    - key = null   → leegmaken
+    #    - key = lijst  → vervangen
+    #    - key = string → opzoeken via searchUsers
+    # --------------------------------------------------------
+    def _resolve_field(field_name, old_list, role):
+        if field_name not in data:
+            return list(old_list)
+
+        val = data.get(field_name)
+        if val is None:
+            return []
+        if isinstance(val, str):
+            if not val.strip():
+                return []
+            return _resolve_receivers_from_string(_session, base, val, role)
+        if isinstance(val, list):
+            out = []
+            for u in val:
+                if not isinstance(u, dict) or not u.get("user_id"):
+                    continue
+                out.append({
+                    "user_id": u["user_id"],
+                    "name": u.get("name") or u.get("display_name") or "",
+                    "is_co_account": bool(u.get("is_co_account")),
+                    "ss_id": str(u.get("ss_id", "455")),
+                })
+            return out
+        return list(old_list)
+
+    new_to = _resolve_field("to", old_receivers["to"], "to")
+    new_cc = _resolve_field("cc", old_receivers["cc"], "cc")
+    new_bcc = _resolve_field("bcc", old_receivers["bcc"], "bcc")
+
+    if not new_to:
+        return jsonify({
+            "error": "geen ontvangers (to) — geef 'to' mee of zorg dat het "
+                     "bestaande bericht ontvangers heeft",
+            "old_to_count": len(old_receivers["to"]),
+        }), 400
+
+    # --------------------------------------------------------
+    # 4. Quick delete oud bericht
+    # --------------------------------------------------------
+    try:
+        r_del = _dispatch(_session, base, [{
+            "subsystem": "postboxes",
+            "action": "quick delete",
+            "params": {"msgID": msg_id},
+        }])
+        body_del = r_del.text or ""
+        body_del_low = body_del.lower()
+        del_ok = ("<status>ok</status>" in body_del_low or
+                  "<success>1</success>" in body_del_low or
+                  (r_del.status_code in (200, 204) and "error" not in body_del_low))
+    except Exception as e:
+        return jsonify({"error": f"verwijderen mislukt: {e}"}), 500
+
+    if not del_ok:
+        return jsonify({
+            "error": "kon oud bericht niet verwijderen",
+            "delete_response": body_del[:300],
+        }), 500
+
+    # --------------------------------------------------------
+    # 5. Nieuw bericht opbouwen en versturen
+    # --------------------------------------------------------
+    try:
+        tokens = _get_compose_tokens(_session, base)
+    except Exception as e:
+        return jsonify({"error": f"kon tokens niet ophalen: {e}"}), 500
+
+    if not tokens.get("random_dir"):
+        return jsonify({"error": "geen compose-tokens"}), 500
+
+    for role_idx, user_list in [(0, new_to), (1, new_cc), (2, new_bcc)]:
+        for u in user_list:
+            is_co = u.get("is_co_account", False)
+            dropped = DROPPED_TYPE[(role_idx, is_co)]
+            userlt = "2" if is_co else "0"
+            _add_user_to_selected(_session, base, u["user_id"],
+                                  tokens["unique_usc"], dropped,
+                                  ssid=u.get("ss_id", "455"), userlt=userlt)
+
+    fields = {
+        "send": "send",
+        "origMsgID": "0",
+        "composeAction": "0",
+        "randomDir": tokens["random_dir"],
+        "uniqueUsc": tokens["unique_usc"],
+        "showTab": "tab1Container",
+        "delFile": "0",
+        "composeType": "0",
+        "msgID": "0",
+        "msgFormSelectedTab": "",
+        "sendDate": send_date,
+        "subject": new_subject,
+        "bcc": "1" if new_bcc else "0",
+        "message": new_body,
+        "encryptedSender": tokens["encrypted_sender"],
+    }
+    if new_to:
+        fields["receiverPart0"] = _build_receiver_xml(new_to, 0)
+    if new_cc:
+        fields["receiverPart1"] = _build_receiver_xml(new_cc, 1)
+    if new_bcc:
+        fields["receiverPart2"] = _build_receiver_xml(new_bcc, 2)
+
+    m = MultipartEncoder(fields=fields)
+    try:
+        r_send = _session.request(
+            "POST",
+            "/?module=Messages&file=composeMessage&boxType=inbox&composeType=0&msgID=undefined",
+            data=m,
+            headers={"Content-Type": m.content_type,
+                     "Origin": base, "Referer": base + "/"},
+            allow_redirects=False,
+        )
+    except Exception as e:
+        return jsonify({
+            "error": f"verzenden mislukt NA delete — origineel is weg: {e}",
+            "deleted_old": True,
+        }), 500
+
+    ok, reason = _is_send_success(r_send)
+
+    return jsonify({
+        "ok": ok,
+        "reason": reason,
+        "msg_id": msg_id,
+        "deleted_old": del_ok,
+        "subject": new_subject,
+        "send_date": send_date,
+        "body_length": len(new_body),
+        "to_count": len(new_to),
+        "cc_count": len(new_cc),
+        "bcc_count": len(new_bcc),
+        "to": new_to,
+        "cc": new_cc,
+        "bcc": new_bcc,
+        "status": r_send.status_code,
+    })
 
 
 # ============================================================
