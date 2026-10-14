@@ -4,6 +4,7 @@ en beheer van geplande berichten.
 """
 
 import calendar
+import json
 import re
 import secrets
 import time
@@ -411,7 +412,6 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
 
     for u in (lst or []):
         if isinstance(u, str):
-            # string → resolve via search
             resolved = _resolve_receivers_from_string(session, base, u, role)
             out.extend(resolved)
             continue
@@ -423,23 +423,22 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
         name = (u.get("name") or u.get("display_name") or "").strip()
 
         if not uid:
-            # Probeer te matchen met bestaande ontvanger op naam
+            matched = False
             if name:
                 for old_u in old_list:
                     old_name = (old_u.get("name") or "").strip()
                     if old_name and old_name.lower() == name.lower():
                         out.append(dict(old_u))
-                        uid = "__matched__"
+                        matched = True
                         break
 
-            if uid != "__matched__" and name:
+            if not matched and name:
                 resolved = _resolve_receivers_from_string(session, base, name, role)
                 if resolved:
                     out.append(resolved[0])
-                    uid = "__matched__"
+                    matched = True
 
-            if uid != "__matched__":
-                # niks bruikbaar, skip
+            if not matched:
                 continue
             else:
                 continue
@@ -777,7 +776,6 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
     else:
         send_date = ""
 
-    # Resolve fields: user_id mag ontbreken
     if "to" in data:
         new_to = _normalize_user_list(
             _session, base, data.get("to") or [], "to",
@@ -806,7 +804,6 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
             "old_to_count": len(old_receivers["to"]),
         }), 400
 
-    # Delete oude scheduled
     try:
         r_del = _dispatch(_session, base, [{
             "subsystem": "postboxes",
@@ -1318,48 +1315,209 @@ def messages_search_users(_session=None, _creds=None):
 def messages_get_user(user_id, _session=None, _creds=None):
     """
     Haal user info op basis van user_id.
-    user_id mag met of zonder 'U' prefix komen (co-account vs hoofdaccount).
+    user_id mag met of zonder 'U' prefix komen.
+    Probeert meerdere methodes omdat searchUsers op NAAM zoekt, niet op ID.
     """
     base = base_url(_creds)
-    uid = (user_id or "").strip()
-    if not uid:
+    raw = (user_id or "").strip()
+    if not raw:
         return jsonify({"error": "user_id verplicht"}), 400
 
-    is_co = uid.startswith("U")
-    clean_id = uid[1:] if is_co else uid
+    has_u = raw.startswith("U") or raw.startswith("u")
+    clean_id = raw[1:] if has_u else raw
 
-    # Zoek via searchUsers met het ID als query
+    tried = []
+
+    # ============================================================
+    # Methode 1: Smartschool internal userinfo endpoint
+    # ============================================================
+    for candidate in (clean_id, f"U{clean_id}"):
+        tried.append(f"userinfo:{candidate}")
+        try:
+            r = _session.request(
+                "GET",
+                f"/?module=UserInfo&file=userinfo&userId={candidate}",
+                headers={"Referer": base + "/", "X-Requested-With": "XMLHttpRequest"},
+            )
+            if r.status_code == 200 and r.text.strip():
+                info = _parse_userinfo_response(r.text, clean_id)
+                if info:
+                    info["tried"] = tried
+                    return jsonify(info)
+        except Exception:
+            pass
+
+    # ============================================================
+    # Methode 2: Smartschool profile API
+    # ============================================================
+    for candidate in (clean_id, f"U{clean_id}"):
+        tried.append(f"profile:{candidate}")
+        try:
+            r = _session.request(
+                "GET",
+                f"/?module=Profile&file=profile&userId={candidate}",
+                headers={"Referer": base + "/"},
+            )
+            if r.status_code == 200 and r.text.strip():
+                name = _extract_name_from_html(r.text)
+                if name:
+                    return jsonify({
+                        "found": True,
+                        "user_id": candidate,
+                        "name": name,
+                        "is_co_account": has_u,
+                        "ss_id": "455",
+                        "source": "profile",
+                        "tried": tried,
+                    })
+        except Exception:
+            pass
+
+    # ============================================================
+    # Methode 3: Messages dispatcher "get user info"
+    # ============================================================
+    for candidate in (clean_id, f"U{clean_id}"):
+        tried.append(f"dispatcher:{candidate}")
+        try:
+            r = _dispatch(_session, base, [{
+                "subsystem": "users",
+                "action": "get user",
+                "params": {"userID": candidate},
+            }])
+            if r.status_code == 200 and r.text.strip():
+                m = re.search(r"<user>(.*?)</user>", r.text, re.DOTALL | re.IGNORECASE)
+                if m:
+                    info = _parse_user_block(m.group(1), candidate)
+                    if info and info.get("name"):
+                        info["tried"] = tried
+                        return jsonify(info)
+        except Exception:
+            pass
+
+    # ============================================================
+    # Methode 4: Zoek via searchUsers (meestal faalt voor pure ids)
+    # ============================================================
     try:
         tokens = _get_compose_tokens(_session, base)
-        if not tokens.get("random_dir"):
-            return jsonify({"error": "geen compose-tokens"}), 500
-        users = _search_users(_session, base, clean_id, tokens["unique_usc"], "all")
-    except Exception as e:
-        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+        if tokens.get("unique_usc"):
+            for cand in (clean_id, f"U{clean_id}"):
+                tried.append(f"search:{cand}")
+                for st in [0, 1, 2, 3, 4, 5]:
+                    try:
+                        users = _search_users_single(_session, base, cand, tokens["unique_usc"], st)
+                        for u in users:
+                            uid = str(u.get("user_id", ""))
+                            if uid == cand or uid == clean_id or uid == f"U{clean_id}":
+                                return jsonify({
+                                    "found": True,
+                                    "user_id": uid,
+                                    "name": u.get("display_name") or u.get("name"),
+                                    "is_co_account": bool(u.get("is_co_account")),
+                                    "ss_id": u.get("ss_id", "455"),
+                                    "type_label": u.get("type_label"),
+                                    "source": "search",
+                                    "tried": tried,
+                                })
+                    except Exception:
+                        continue
+    except Exception:
+        pass
 
-    # Match op user_id (met of zonder U prefix)
-    for u in users:
-        u_id = (u.get("user_id") or "").strip()
-        u_clean = u_id[1:] if u_id.startswith("U") else u_id
-        if u_clean == clean_id:
-            return jsonify({
-                "found": True,
-                "user_id": u_id,
-                "name": u.get("display_name") or u.get("name"),
-                "raw_name": u.get("raw_name"),
-                "is_co_account": bool(u.get("is_co_account", False)),
-                "ss_id": u.get("ss_id", "455"),
-                "type_label": u.get("type_label"),
-                "classname": u.get("classname"),
-            })
-
-    # Fallback: geen match gevonden
+    # Niks gevonden
     return jsonify({
         "found": False,
-        "user_id": uid,
-        "is_co_account": is_co,
+        "user_id": raw,
+        "clean_id": clean_id,
+        "tried": tried,
+        "is_co_account": has_u,
         "ss_id": "455",
     })
+
+
+def _parse_userinfo_response(text, fallback_id):
+    """Parse Smartschool userinfo HTML/JSON."""
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            name = (data.get("name") or data.get("displayName")
+                    or data.get("fullName") or data.get("userName"))
+            if name:
+                return {
+                    "found": True,
+                    "user_id": str(data.get("userId") or data.get("id") or fallback_id),
+                    "name": name,
+                    "is_co_account": bool(data.get("isCoAccount") or data.get("coAccount")),
+                    "ss_id": str(data.get("ssId") or "455"),
+                    "type_label": data.get("type"),
+                    "source": "userinfo_json",
+                }
+    except Exception:
+        pass
+
+    name = _extract_name_from_html(text)
+    if name:
+        return {
+            "found": True,
+            "user_id": fallback_id,
+            "name": name,
+            "is_co_account": False,
+            "ss_id": "455",
+            "source": "userinfo_html",
+        }
+    return None
+
+
+def _extract_name_from_html(html):
+    """Probeer een naam te vinden in Smartschool HTML."""
+    patterns = [
+        r'<h1[^>]*class="[^"]*user[^"]*name[^"]*"[^>]*>(.*?)</h1>',
+        r'<span[^>]*class="[^"]*displayName[^"]*"[^>]*>(.*?)</span>',
+        r'<div[^>]*class="[^"]*profileName[^"]*"[^>]*>(.*?)</div>',
+        r'<title>(.*?)</title>',
+    ]
+    for pat in patterns:
+        m = re.search(pat, html, re.DOTALL | re.IGNORECASE)
+        if m:
+            name = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+            name = (name.replace("&nbsp;", " ")
+                        .replace("&amp;", "&")
+                        .replace("&lt;", "<")
+                        .replace("&gt;", ">")
+                        .replace("&quot;", '"')
+                        .replace("&#39;", "'"))
+            if name and name.lower() not in ("smartschool", "profiel", "profile", ""):
+                name = re.sub(r"\s*[-–|]\s*Smartschool.*$", "", name, flags=re.IGNORECASE).strip()
+                if name:
+                    return name
+    return None
+
+
+def _parse_user_block(block, fallback_id):
+    """Parse een <user>...</user> XML block."""
+    def _tag(t):
+        m = re.search(rf"<{t}>(.*?)</{t}>", block, re.DOTALL | re.IGNORECASE)
+        return m.group(1).strip() if m else ""
+
+    uid = _tag("userID") or _tag("id") or fallback_id
+    name = _tag("name") or _tag("value") or _tag("displayName")
+    user_lt = _tag("userLT") or "0"
+    ss_id = _tag("ssID") or "455"
+    classname = _tag("classname")
+    user_type = _tag("userType")
+
+    if not name:
+        return None
+
+    return {
+        "found": True,
+        "user_id": uid,
+        "name": name,
+        "is_co_account": user_lt == "2",
+        "ss_id": ss_id,
+        "type_label": classname or user_type,
+        "classname": classname,
+        "source": "dispatcher",
+    }
 
 
 # ============================================================
@@ -1420,7 +1578,6 @@ def messages_send(_session=None, _creds=None):
 
     base = base_url(_creds)
 
-    # Normaliseer user lijsten (user_id mag ontbreken → match op naam)
     to_users = _normalize_user_list(_session, base, data.get("to") or [], "to")
     cc_users = _normalize_user_list(_session, base, data.get("cc") or [], "cc")
     bcc_users = _normalize_user_list(_session, base, data.get("bcc") or [], "bcc")
