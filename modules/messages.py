@@ -187,7 +187,6 @@ def _get_message_full_xml(session, base, msg_id, box_type="inbox"):
 def _extract_names_from_message_xml(xml_text):
     """
     Zoek naam-user_id paren in de volledige bericht XML.
-    Ondersteunt meerdere patronen die Smartschool gebruikt.
     Retourneert dict: user_id (met en zonder U prefix) -> name
     """
     result = {}
@@ -199,7 +198,6 @@ def _extract_names_from_message_xml(xml_text):
         name = (name or "").strip()
         if not uid or not name:
             return
-        # Skip als naam puur een nummer is (= id, geen naam)
         if name.isdigit() or re.match(r"^U?\d+$", name):
             return
         result[uid] = name
@@ -208,21 +206,18 @@ def _extract_names_from_message_xml(xml_text):
         else:
             result["U" + uid] = name
 
-    # Patroon 1: <xxx id="5122" name="Jan">
     for m in re.finditer(
         r'<[^>]*\bid="(U?\d+)"[^>]*\bname="([^"]+)"[^>]*>',
         xml_text, re.IGNORECASE
     ):
         _store(m.group(1), m.group(2))
 
-    # Patroon 2: <xxx name="Jan" id="5122">
     for m in re.finditer(
         r'<[^>]*\bname="([^"]+)"[^>]*\bid="(U?\d+)"[^>]*>',
         xml_text, re.IGNORECASE
     ):
         _store(m.group(2), m.group(1))
 
-    # Patroon 3: <user><id>5122</id><name>Jan</name></user>
     for um in re.finditer(r'<user>(.*?)</user>', xml_text, re.DOTALL | re.IGNORECASE):
         block = um.group(1)
         uid_m = re.search(r'<id>(U?\d+)</id>', block, re.IGNORECASE)
@@ -234,7 +229,6 @@ def _extract_names_from_message_xml(xml_text):
                         .replace("&quot;", '"').replace("&#39;", "'"))
             _store(uid_m.group(1), name)
 
-    # Patroon 4: <userID>5122</userID><userName>Jan</userName>
     for um in re.finditer(
         r'<userID>(U?\d+)</userID>\s*<[^>]*?(?:userName|displayName|fullName)>(.*?)</[^>]+>',
         xml_text, re.DOTALL | re.IGNORECASE
@@ -242,7 +236,6 @@ def _extract_names_from_message_xml(xml_text):
         name = re.sub(r"<[^>]+>", "", um.group(2)).strip()
         _store(um.group(1), name)
 
-    # Patroon 5: "Jan Jansen <5122>" in tekst
     for m in re.finditer(
         r'([A-Za-zÀ-ÿ][\w\s\.\-\'À-ÿ]{1,60}?)\s*<\s*(U?\d+)\s*>',
         xml_text
@@ -324,7 +317,6 @@ def _parse_full_message(xml_text):
         result["cc_list"] = _parse_recipients("cc")
         result["bcc_list"] = _parse_recipients("bcc")
 
-        # Backwards compat: platte strings
         result["to"] = ", ".join(
             (r["name"] or r["user_id"]) for r in result["to_list"]
         ) or msg.findtext("to", "")
@@ -373,14 +365,6 @@ def _parse_full_message(xml_text):
 # HELPER — receivers uit HTML halen
 # ============================================================
 def _extract_receivers_from_html(html, role):
-    """
-    Lees receiverSpan-divs uit de Smartschool composeMessage-HTML.
-
-    role: 0=to, 1=cc, 2=bcc
-    typeatt → rol: 0,1 → to | 2,4 → cc | 3,5 → bcc
-    userltatt == "2" → co-account (user_id krijgt prefix "U")
-    userltatt == "0" → hoofdaccount (user_id = realuserid)
-    """
     if not html:
         return []
 
@@ -469,36 +453,6 @@ def _extract_receivers_from_html(html, role):
     return result
 
 
-def _enrich_receivers_with_names(session, base, receivers, msg_id, box_type=SCHEDULED_BOX):
-    """
-    Vul ontbrekende namen aan door de volledige XML van het bericht te scannen.
-    """
-    if not receivers:
-        return receivers
-
-    if all(r.get("name") for r in receivers):
-        return receivers
-
-    try:
-        xml_text = _get_message_full_xml(session, base, msg_id, box_type)
-        names_map = _extract_names_from_message_xml(xml_text)
-    except Exception:
-        names_map = {}
-
-    for r in receivers:
-        if r.get("name"):
-            continue
-        uid = r.get("user_id", "") or ""
-        if uid in names_map:
-            r["name"] = names_map[uid]
-        elif uid.startswith("U") and uid[1:] in names_map:
-            r["name"] = names_map[uid[1:]]
-        elif not uid.startswith("U") and f"U{uid}" in names_map:
-            r["name"] = names_map[f"U{uid}"]
-
-    return receivers
-
-
 # ============================================================
 # HELPER — naam-string omzetten naar users (fallback)
 # ============================================================
@@ -557,16 +511,9 @@ def _resolve_receivers_from_string(session, base, s, role):
 
 
 # ============================================================
-# HELPER — normaliseer user lijst (user_id mag ontbreken)
+# HELPER — normaliseer user lijst
 # ============================================================
 def _normalize_user_list(session, base, lst, role, old_list=None):
-    """
-    Accepteert users met of zonder user_id.
-    - user_id aanwezig → gebruik die
-    - user_id leeg → match op naam met old_list
-    - geen match → zoek via Smartschool search op naam
-    - niks bruikbaar → skip
-    """
     out = []
     old_list = old_list or []
 
@@ -781,121 +728,75 @@ def message_cancel_scheduled(msg_id, _session=None, _creds=None):
 
 
 # ============================================================
-# SCHEDULED — VOLLEDIG LEZEN
+# SCHEDULED — VOLLEDIG LEZEN (ALLEEN VIA DISPATCHER, veilig)
 # ============================================================
 def _read_scheduled_full(session, base, msg_id):
-    html = ""
-    fields_html = {}
-    for box_name in (SCHEDULED_BOX, "sendLater", "draft"):
-        try:
-            url = (f"/?module=Messages&file=composeMessage"
-                   f"&boxType={box_name}&composeType=5&msgID={msg_id}")
-            r = session.request("GET", url, headers={"Referer": base + "/"})
-            if r.status_code != 200:
-                continue
-            html = r.text
-            fields_html = {}
-            for m in re.finditer(
-                r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>',
-                html,
-            ):
-                fields_html[m.group(1)] = m.group(2)
-            if fields_html.get("randomDir"):
-                break
-        except Exception:
-            continue
+    """
+    Leest een scheduled bericht VOLLEDIG via de dispatcher.
+    Roept NOOIT composeMessage aan — dat zou het bericht naar draft verplaatsen.
+    """
+    # 1. Volledige XML ophalen via dispatcher
+    xml_text = _get_message_full_xml(session, base, msg_id, SCHEDULED_BOX)
+    parsed = _parse_full_message(xml_text)
 
+    # 2. Probeer eventueel receivers uit de compose HTML — MAAR dat verplaatst het.
+    # We doen dit NIET. We vertrouwen volledig op de XML.
     receivers = {
-        "to": _extract_receivers_from_html(html, role=0),
-        "cc": _extract_receivers_from_html(html, role=1),
-        "bcc": _extract_receivers_from_html(html, role=2),
+        "to": [
+            {
+                "user_id": r.get("user_id", ""),
+                "name": r.get("name", ""),
+                "is_co_account": (r.get("user_id", "").startswith("U")),
+                "ss_id": "455",
+            }
+            for r in parsed.get("to_list", [])
+        ],
+        "cc": [
+            {
+                "user_id": r.get("user_id", ""),
+                "name": r.get("name", ""),
+                "is_co_account": (r.get("user_id", "").startswith("U")),
+                "ss_id": "455",
+            }
+            for r in parsed.get("cc_list", [])
+        ],
+        "bcc": [
+            {
+                "user_id": r.get("user_id", ""),
+                "name": r.get("name", ""),
+                "is_co_account": (r.get("user_id", "").startswith("U")),
+                "ss_id": "455",
+            }
+            for r in parsed.get("bcc_list", [])
+        ],
     }
 
-    subject = fields_html.get("subject", "")
-    body_html = ""
-    m = re.search(r'<textarea[^>]*name="message"[^>]*>(.*?)</textarea>',
-                  html, re.DOTALL | re.IGNORECASE)
-    if m:
-        body_html = m.group(1)
-        body_html = (body_html.replace("&lt;", "<").replace("&gt;", ">")
-                              .replace("&quot;", '"').replace("&#39;", "'")
-                              .replace("&amp;", "&").replace("&nbsp;", " "))
-
-    send_date = fields_html.get("sendDate", "") or ""
-    orig_msg_id = fields_html.get("origMsgID", "") or ""
-
-    old = None
-    if not subject or not body_html or not receivers["to"]:
-        try:
-            xml_text = _get_message_full_xml(session, base, msg_id, SCHEDULED_BOX)
-            old = _parse_full_message(xml_text)
-            if not subject:
-                subject = old.get("subject", "") or ""
-            if not body_html:
-                body_html = old.get("body_html", "") or ""
-            if not send_date:
-                send_date = old.get("send_date", "") or ""
-
-            # Vul receivers aan op basis van old.to_list / cc_list / bcc_list
-            if not receivers["to"] and old.get("to_list"):
-                receivers["to"] = [
-                    {
-                        "user_id": r.get("user_id", ""),
-                        "name": r.get("name", ""),
-                        "is_co_account": (r.get("user_id", "").startswith("U")),
-                        "ss_id": "455",
-                    }
-                    for r in old["to_list"]
-                ]
-            if not receivers["cc"] and old.get("cc_list"):
-                receivers["cc"] = [
-                    {
-                        "user_id": r.get("user_id", ""),
-                        "name": r.get("name", ""),
-                        "is_co_account": (r.get("user_id", "").startswith("U")),
-                        "ss_id": "455",
-                    }
-                    for r in old["cc_list"]
-                ]
-            if not receivers["bcc"] and old.get("bcc_list"):
-                receivers["bcc"] = [
-                    {
-                        "user_id": r.get("user_id", ""),
-                        "name": r.get("name", ""),
-                        "is_co_account": (r.get("user_id", "").startswith("U")),
-                        "ss_id": "455",
-                    }
-                    for r in old["bcc_list"]
-                ]
-
-            # Nog steeds geen receivers? Probeer via string
-            if not receivers["to"]:
-                old_to = old.get("to", "") or ""
-                if old_to:
-                    receivers["to"] = _resolve_receivers_from_string(
-                        session, base, old_to, "to")
-            if not receivers["cc"]:
-                old_cc = old.get("cc", "") or ""
-                if old_cc:
-                    receivers["cc"] = _resolve_receivers_from_string(
-                        session, base, old_cc, "cc")
-            if not receivers["bcc"]:
-                old_bcc = old.get("bcc", "") or ""
-                if old_bcc:
-                    receivers["bcc"] = _resolve_receivers_from_string(
-                        session, base, old_bcc, "bcc")
-        except Exception:
-            pass
+    # 3. Fallback: als de lists leeg zijn maar de strings niet, resolve via search
+    if not receivers["to"]:
+        old_to = parsed.get("to", "") or ""
+        if old_to and not re.match(r"^\s*U?\d+\s*$", old_to):
+            receivers["to"] = _resolve_receivers_from_string(
+                session, base, old_to, "to")
+    if not receivers["cc"]:
+        old_cc = parsed.get("cc", "") or ""
+        if old_cc and not re.match(r"^\s*U?\d+\s*$", old_cc):
+            receivers["cc"] = _resolve_receivers_from_string(
+                session, base, old_cc, "cc")
+    if not receivers["bcc"]:
+        old_bcc = parsed.get("bcc", "") or ""
+        if old_bcc and not re.match(r"^\s*U?\d+\s*$", old_bcc):
+            receivers["bcc"] = _resolve_receivers_from_string(
+                session, base, old_bcc, "bcc")
 
     return {
-        "html": html,
-        "fields": fields_html,
+        "html": "",
+        "fields": {},
         "receivers": receivers,
-        "subject": subject,
-        "body_html": body_html,
-        "send_date": send_date,
-        "orig_msg_id": orig_msg_id,
-        "old": old,
+        "subject": parsed.get("subject", "") or "",
+        "body_html": parsed.get("body_html", "") or "",
+        "send_date": parsed.get("send_date", "") or "",
+        "orig_msg_id": "",
+        "old": parsed,
     }
 
 
@@ -908,14 +809,6 @@ def message_read_scheduled(msg_id, _session=None, _creds=None):
     except Exception as e:
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
-    # Verrijk receivers met namen uit de XML
-    to_full  = _enrich_receivers_with_names(
-        _session, base, info["receivers"]["to"], msg_id)
-    cc_full  = _enrich_receivers_with_names(
-        _session, base, info["receivers"]["cc"], msg_id)
-    bcc_full = _enrich_receivers_with_names(
-        _session, base, info["receivers"]["bcc"], msg_id)
-
     return jsonify({
         "msg_id": msg_id,
         "subject": info["subject"],
@@ -926,16 +819,16 @@ def message_read_scheduled(msg_id, _session=None, _creds=None):
         "to": info["receivers"]["to"],
         "cc": info["receivers"]["cc"],
         "bcc": info["receivers"]["bcc"],
-        "to_full": to_full,
-        "cc_full": cc_full,
-        "bcc_full": bcc_full,
-        "has_compose_html": bool(info["html"]),
-        "fields_found": sorted(info["fields"].keys()),
+        "to_full": info["receivers"]["to"],
+        "cc_full": info["receivers"]["cc"],
+        "bcc_full": info["receivers"]["bcc"],
+        "has_compose_html": False,
+        "fields_found": [],
     })
 
 
 # ============================================================
-# SCHEDULED — VOLLEDIG AANPASSEN
+# SCHEDULED — VOLLEDIG AANPASSEN (delete + create nieuw)
 # ============================================================
 @bp.put("/<msg_id>/scheduled")
 @bp.patch("/<msg_id>/scheduled")
@@ -944,6 +837,7 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
     data = request.get_json(force=True, silent=True) or {}
     base = base_url(_creds)
 
+    # Lees origineel via dispatcher (veilig)
     try:
         info = _read_scheduled_full(_session, base, msg_id)
     except Exception as e:
@@ -1009,6 +903,7 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
             "old_to_count": len(old_receivers["to"]),
         }), 400
 
+    # Verwijder oud bericht
     try:
         r_del = _dispatch(_session, base, [{
             "subsystem": "postboxes",
@@ -1029,6 +924,7 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
             "delete_response": body_del[:300],
         }), 500
 
+    # Nieuwe scheduled aanmaken via composeMessage
     try:
         tokens = _get_compose_tokens(_session, base)
     except Exception as e:
@@ -1125,96 +1021,33 @@ def message_reschedule(msg_id, _session=None, _creds=None):
 
     base = base_url(_creds)
 
-    html = ""
-    fields_html = {}
-    for box_name in (SCHEDULED_BOX, "sendLater", "draft"):
-        try:
-            url = (f"/?module=Messages&file=composeMessage"
-                   f"&boxType={box_name}&composeType=5&msgID={msg_id}")
-            r = _session.request("GET", url, headers={"Referer": base + "/"})
-            if r.status_code != 200:
-                continue
-            html = r.text
-            fields_html = {}
-            for m in re.finditer(
-                r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>',
-                html,
-            ):
-                fields_html[m.group(1)] = m.group(2)
-            if fields_html.get("randomDir"):
-                break
-        except Exception:
-            continue
+    # Lees origineel via dispatcher
+    try:
+        info = _read_scheduled_full(_session, base, msg_id)
+    except Exception as e:
+        return jsonify({"error": f"kon bericht niet lezen: {e}"}), 500
 
     new_to = data.get("to")
     new_cc = data.get("cc")
     new_bcc = data.get("bcc")
 
     if new_to is None:
-        new_to = _extract_receivers_from_html(html, role=0)
+        new_to = info["receivers"]["to"]
     if new_cc is None:
-        new_cc = _extract_receivers_from_html(html, role=1)
+        new_cc = info["receivers"]["cc"]
     if new_bcc is None:
-        new_bcc = _extract_receivers_from_html(html, role=2)
-
-    old = None
-    if not new_to:
-        try:
-            xml_text = _get_message_full_xml(_session, base, msg_id, SCHEDULED_BOX)
-            old = _parse_full_message(xml_text)
-            old_to = old.get("to", "") or ""
-            if old_to:
-                new_to = _resolve_receivers_from_string(_session, base, old_to, "to")
-        except Exception:
-            pass
-
-    if not new_to:
-        try:
-            for m in re.finditer(
-                r'realuserid="(\d+)"[^>]*idatt="([^"]*)"[^>]*'
-                r'userltatt="(\d+)"[^>]*typeatt="(\d+)"[^>]*ssidatt="(\d+)"',
-                html, re.DOTALL,
-            ):
-                real_id, idatt, userlt, typeatt, ssid = m.groups()
-                if int(typeatt) in (0, 1):
-                    new_to = [{
-                        "user_id": idatt if userlt == "2" else real_id,
-                        "name": "",
-                        "is_co_account": userlt == "2",
-                        "ss_id": ssid,
-                    }]
-                    break
-        except Exception:
-            pass
+        new_bcc = info["receivers"]["bcc"]
 
     if not new_to:
         return jsonify({
             "error": "kon ontvangers niet bepalen",
             "hint": "geef 'to' mee in de request body",
-            "html_len": len(html),
-            "fields_found": list(fields_html.keys()),
         }), 400
 
-    subject = data.get("subject") or fields_html.get("subject", "") or ""
-    if not subject and old:
-        subject = old.get("subject", "")
-    if not subject:
-        subject = "(geen onderwerp)"
+    subject = data.get("subject") or info["subject"] or "(geen onderwerp)"
+    body_html = data.get("message_html") or info["body_html"] or "<p></p>"
 
-    body_html = data.get("message_html")
-    if not body_html:
-        m = re.search(r'<textarea[^>]*name="message"[^>]*>(.*?)</textarea>',
-                      html, re.DOTALL | re.IGNORECASE)
-        if m:
-            body_html = m.group(1)
-            body_html = (body_html.replace("&lt;", "<").replace("&gt;", ">")
-                                  .replace("&quot;", '"').replace("&#39;", "'")
-                                  .replace("&amp;", "&").replace("&nbsp;", " "))
-    if not body_html and old:
-        body_html = old.get("body_html", "") or f"<p>{old.get('body_text', '')}</p>"
-    if not body_html:
-        body_html = "<p></p>"
-
+    # Verwijder oud
     try:
         r_del = _dispatch(_session, base, [{
             "subsystem": "postboxes",
@@ -1520,8 +1353,8 @@ def messages_search_users(_session=None, _creds=None):
 def messages_get_user(user_id, _session=None, _creds=None):
     """
     Haal user info op basis van user_id.
-    user_id mag met of zonder 'U' prefix komen.
-    Probeert meerdere methodes omdat searchUsers op NAAM zoekt, niet op ID.
+    Zoekt ALLEEN via searchUsers (op naam/id-achtige input).
+    Geen enkele bron die berichten verplaatst.
     """
     base = base_url(_creds)
     raw = (user_id or "").strip()
@@ -1533,67 +1366,7 @@ def messages_get_user(user_id, _session=None, _creds=None):
 
     tried = []
 
-    # Methode 1: Smartschool internal userinfo endpoint
-    for candidate in (clean_id, f"U{clean_id}"):
-        tried.append(f"userinfo:{candidate}")
-        try:
-            r = _session.request(
-                "GET",
-                f"/?module=UserInfo&file=userinfo&userId={candidate}",
-                headers={"Referer": base + "/", "X-Requested-With": "XMLHttpRequest"},
-            )
-            if r.status_code == 200 and r.text.strip():
-                info = _parse_userinfo_response(r.text, clean_id)
-                if info:
-                    info["tried"] = tried
-                    return jsonify(info)
-        except Exception:
-            pass
-
-    # Methode 2: Smartschool profile API
-    for candidate in (clean_id, f"U{clean_id}"):
-        tried.append(f"profile:{candidate}")
-        try:
-            r = _session.request(
-                "GET",
-                f"/?module=Profile&file=profile&userId={candidate}",
-                headers={"Referer": base + "/"},
-            )
-            if r.status_code == 200 and r.text.strip():
-                name = _extract_name_from_html(r.text)
-                if name:
-                    return jsonify({
-                        "found": True,
-                        "user_id": candidate,
-                        "name": name,
-                        "is_co_account": has_u,
-                        "ss_id": "455",
-                        "source": "profile",
-                        "tried": tried,
-                    })
-        except Exception:
-            pass
-
-    # Methode 3: Messages dispatcher "get user info"
-    for candidate in (clean_id, f"U{clean_id}"):
-        tried.append(f"dispatcher:{candidate}")
-        try:
-            r = _dispatch(_session, base, [{
-                "subsystem": "users",
-                "action": "get user",
-                "params": {"userID": candidate},
-            }])
-            if r.status_code == 200 and r.text.strip():
-                m = re.search(r"<user>(.*?)</user>", r.text, re.DOTALL | re.IGNORECASE)
-                if m:
-                    info = _parse_user_block(m.group(1), candidate)
-                    if info and info.get("name"):
-                        info["tried"] = tried
-                        return jsonify(info)
-        except Exception:
-            pass
-
-    # Methode 4: Zoek via searchUsers (meestal faalt voor pure ids)
+    # Zoek via searchUsers — dit verplaatst niks, is puur lezen
     try:
         tokens = _get_compose_tokens(_session, base)
         if tokens.get("unique_usc"):
@@ -1620,7 +1393,6 @@ def messages_get_user(user_id, _session=None, _creds=None):
     except Exception:
         pass
 
-    # Niks gevonden
     return jsonify({
         "found": False,
         "user_id": raw,
@@ -1629,39 +1401,6 @@ def messages_get_user(user_id, _session=None, _creds=None):
         "is_co_account": has_u,
         "ss_id": "455",
     })
-
-
-def _parse_userinfo_response(text, fallback_id):
-    """Parse Smartschool userinfo HTML/JSON."""
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict):
-            name = (data.get("name") or data.get("displayName")
-                    or data.get("fullName") or data.get("userName"))
-            if name:
-                return {
-                    "found": True,
-                    "user_id": str(data.get("userId") or data.get("id") or fallback_id),
-                    "name": name,
-                    "is_co_account": bool(data.get("isCoAccount") or data.get("coAccount")),
-                    "ss_id": str(data.get("ssId") or "455"),
-                    "type_label": data.get("type"),
-                    "source": "userinfo_json",
-                }
-    except Exception:
-        pass
-
-    name = _extract_name_from_html(text)
-    if name:
-        return {
-            "found": True,
-            "user_id": fallback_id,
-            "name": name,
-            "is_co_account": False,
-            "ss_id": "455",
-            "source": "userinfo_html",
-        }
-    return None
 
 
 def _extract_name_from_html(html):
@@ -1687,34 +1426,6 @@ def _extract_name_from_html(html):
                 if name:
                     return name
     return None
-
-
-def _parse_user_block(block, fallback_id):
-    """Parse een <user>...</user> XML block."""
-    def _tag(t):
-        m = re.search(rf"<{t}>(.*?)</{t}>", block, re.DOTALL | re.IGNORECASE)
-        return m.group(1).strip() if m else ""
-
-    uid = _tag("userID") or _tag("id") or fallback_id
-    name = _tag("name") or _tag("value") or _tag("displayName")
-    user_lt = _tag("userLT") or "0"
-    ss_id = _tag("ssID") or "455"
-    classname = _tag("classname")
-    user_type = _tag("userType")
-
-    if not name:
-        return None
-
-    return {
-        "found": True,
-        "user_id": uid,
-        "name": name,
-        "is_co_account": user_lt == "2",
-        "ss_id": ss_id,
-        "type_label": classname or user_type,
-        "classname": classname,
-        "source": "dispatcher",
-    }
 
 
 # ============================================================
