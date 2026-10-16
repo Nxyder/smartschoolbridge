@@ -7,6 +7,7 @@ import calendar
 import json
 import re
 import secrets
+import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -656,7 +657,6 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
             else:
                 continue
 
-        # BELANGRIJK: strip U-prefix — Smartschool verwacht numeriek id
         clean_uid = _strip_u_prefix(uid)
 
         out.append({
@@ -1594,14 +1594,6 @@ def get_draft(draft_id, _session=None, _creds=None):
 # DRAFTS — VOORKOM DUBBELE DRAFTS
 # ============================================================
 def _find_existing_draft(session, base, subject, to_users, cc_users, bcc_users):
-    """
-    Zoekt een bestaande draft in de concepten-box die hetzelfde subject
-    en dezelfde recipients heeft. Retourneert het draft_id of None.
-
-    Wordt gebruikt om te voorkomen dat we een nieuwe draft aanmaken als
-    Smartschool er al automatisch één heeft gemaakt (bv. bij het openen
-    van een scheduled bericht → Smartschool converteert dat naar draft).
-    """
     if not subject:
         return None
 
@@ -1652,18 +1644,6 @@ def _find_existing_draft(session, base, subject, to_users, cc_users, bcc_users):
 @bp.post("/draft/save")
 @with_session
 def message_save_draft(_session=None, _creds=None):
-    """
-    Slaat een draft op via de DISPATCHER (subsystem=draft, action=save draft).
-
-    Smartschool converteert een scheduled bericht automatisch naar een draft
-    zodra het in de compose-UI wordt geopend. Als de frontend ons geen
-    draft_id meegeeft (bv. omdat de gebruiker vanuit 'gepland' komt), dan
-    zoeken we eerst of er al een draft bestaat met hetzelfde subject en
-    dezelfde recipients. Zo ja, dan updaten we die in plaats van een
-    nieuwe aan te maken.
-
-    Dit voorkomt dubbele drafts in de concepten-box.
-    """
     data = request.get_json(force=True, silent=True) or {}
     base = base_url(_creds)
 
@@ -1686,7 +1666,6 @@ def message_save_draft(_session=None, _creds=None):
     if not to_users:
         return jsonify({"error": "minstens één ontvanger (to) verplicht"}), 400
 
-    # ---- FIX: als geen draft_id, check of er al een draft bestaat ----
     auto_found_draft_id = None
     if not draft_id:
         try:
@@ -1698,7 +1677,6 @@ def message_save_draft(_session=None, _creds=None):
         if auto_found_draft_id:
             draft_id = auto_found_draft_id
 
-    # ---- Tokens ophalen ----
     if draft_id:
         try:
             tokens = _get_draft_tokens(_session, base, draft_id)
@@ -1710,16 +1688,13 @@ def message_save_draft(_session=None, _creds=None):
     if not tokens.get("random_dir"):
         return jsonify({"error": "kon compose-tokens niet ophalen"}), 500
 
-    # ---- Wis bestaande recipients ----
     for role_idx in (0, 1, 2):
         _clear_compose_recipients(_session, base, tokens["unique_usc"], role_idx)
 
-    # ---- Voeg nieuwe recipients toe ----
     add_ok, add_debug = _add_users_and_wait(
         _session, base, tokens, to_users, cc_users, bcc_users,
         max_wait=5.0, sleep_between=0.12)
 
-    # ---- Save via DISPATCHER ----
     is_update = bool(draft_id)
     compose_action = "5" if is_update else "0"
 
@@ -2067,6 +2042,162 @@ def messages_search_users(_session=None, _creds=None):
     tokens = _get_compose_tokens(_session, base)
     users = _search_users(_session, base, q, tokens["unique_usc"], st)
     return jsonify({"query": q, "type": st_raw, "users": users})
+
+
+# ============================================================
+# ALLE USERS — alfabet-sweep met 7 dagen cache
+# ============================================================
+_ALL_USERS_CACHE = {
+    "ts": 0,
+    "data": None,
+    "lock": threading.Lock(),
+}
+_ALL_USERS_TTL = 7 * 24 * 60 * 60  # 7 dagen
+
+
+def _sweep_all_users(session, base):
+    """
+    Doorzoekt Smartschool's searchUsers met een set queries die
+    vrijwel alle users dekken (klinkers + veelvoorkomende delen).
+    Retourneert een compacte lijst zonder dubbele entries.
+    """
+    queries = [
+        'a', 'e', 'i', 'o', 'u',
+        'ij', 'aa', 'ee', 'oo', 'uu', 'ie', 'ei', 'ou', 'au', 'eu',
+        'de', 'van', 'den', 'der', 'el', 'ar', 'er', 'en', 'an', 'in', 'on',
+        's', 't', 'n', 'r', 'm', 'k', 'l', 'b', 'd', 'p', 'h', 'v', 'w',
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+        ' ', "'", '-',
+    ]
+
+    try:
+        tokens = _get_compose_tokens(session, base)
+    except Exception:
+        return None
+
+    unique_usc = tokens.get("unique_usc")
+    if not unique_usc:
+        return None
+
+    seen = {}
+
+    for q in queries:
+        try:
+            users = _search_users(session, base, q, unique_usc, "all")
+        except Exception:
+            continue
+
+        for u in users:
+            uid = str(u.get("user_id", "")).strip()
+            if not uid:
+                continue
+
+            user_lt = str(u.get("user_lt", "0"))
+            key = (uid, user_lt)
+
+            if key in seen:
+                continue
+
+            seen[key] = {
+                "user_id": uid,
+                "name": u.get("display_name") or u.get("name") or "",
+                "raw_name": u.get("raw_name") or "",
+                "coaccount_name": u.get("coaccount_name") or "",
+                "is_co_account": bool(u.get("is_co_account")),
+                "user_type": u.get("user_type", "U"),
+                "user_lt": user_lt,
+                "ss_id": u.get("ss_id", "455"),
+                "classname": u.get("classname") or "",
+                "type_label": u.get("type_label") or "",
+            }
+
+    return list(seen.values())
+
+
+@bp.get("/all-users")
+@with_session
+def messages_all_users(_session=None, _creds=None):
+    """
+    Geeft alle users terug die via searchUsers gevonden kunnen worden.
+
+    Query params:
+      ?refresh=1   → forceer nieuwe sweep (bypass 7d cache)
+      ?type=...    → optioneel filter op user_type (U/T/G/...) of 'co'
+      ?search=...  → optioneel substring filter op naam
+
+    Response:
+      {
+        "count": 1234,
+        "cached": true,
+        "age_seconds": 42,
+        "users": [
+          {
+            "user_id": "5060",
+            "name": "Ethan Brasselet",
+            "is_co_account": false,
+            "user_lt": "0",
+            "ss_id": "455",
+            "classname": "Klas: 4NAW",
+            "type_label": "leerling - Klas: 4NAW"
+          },
+          ...
+        ]
+      }
+    """
+    base = base_url(_creds)
+    force = request.args.get("refresh") == "1"
+    filter_type = request.args.get("type", "").strip().lower()
+    filter_search = request.args.get("search", "").strip().lower()
+
+    now = time.time()
+
+    # ---- Cache check ----
+    with _ALL_USERS_CACHE["lock"]:
+        cached = _ALL_USERS_CACHE["data"]
+        age = now - _ALL_USERS_CACHE["ts"]
+        if not force and cached is not None and age < _ALL_USERS_TTL:
+            users = cached
+            cached_flag = True
+        else:
+            users = None
+            cached_flag = False
+
+    # ---- Cache miss: sweep ----
+    if users is None:
+        users = _sweep_all_users(_session, base)
+        if users is None:
+            return jsonify({"error": "kon users niet ophalen"}), 502
+
+        with _ALL_USERS_CACHE["lock"]:
+            _ALL_USERS_CACHE["data"] = users
+            _ALL_USERS_CACHE["ts"] = time.time()
+            age = 0
+        cached_flag = False
+
+    # ---- Filters ----
+    if filter_type:
+        if filter_type == "co":
+            users = [u for u in users if u["is_co_account"]]
+        else:
+            users = [u for u in users if (u["user_type"] or "").lower() == filter_type]
+
+    if filter_search:
+        users = [
+            u for u in users
+            if filter_search in (u["name"] or "").lower()
+            or filter_search in (u["raw_name"] or "").lower()
+            or filter_search in (u["coaccount_name"] or "").lower()
+            or filter_search in (u["user_id"] or "").lower()
+        ]
+
+    users = sorted(users, key=lambda u: (u["name"] or "").lower())
+
+    return jsonify({
+        "count": len(users),
+        "cached": cached_flag,
+        "age_seconds": int(age),
+        "users": users,
+    })
 
 
 # ============================================================
