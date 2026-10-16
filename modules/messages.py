@@ -403,10 +403,10 @@ def _parse_recipients_from_receivers(msg, tag_name):
                 found_any = True
                 m = re.match(r"(.+?)\s*<\s*(U?\d+)\s*>", txt)
                 if m:
-                    name = m.group(1).strip()
+                    name = _clean_recipient_name(m.group(1))
                     uid = m.group(2)
                 else:
-                    name = txt
+                    name = _clean_recipient_name(txt)
                     uid = ""
                 key = (name, uid)
                 if key in seen:
