@@ -170,7 +170,6 @@ def _parse_recipients_from_receivers(msg, tag_name):
 
     LET OP: Smartschool gebruikt in de praktijk <to> als kind-tag
     in ALLE drie de containers (dus ook in ccreceivers/bccreceivers).
-    We zoeken daarom in zowel de verwachte tag als in "to".
     """
     items = []
     seen = set()
@@ -278,10 +277,6 @@ def _get_message_full_xml(session, base, msg_id, box_type="inbox"):
 
 
 def _extract_names_from_message_xml(xml_text):
-    """
-    Zoek naam-user_id paren in de volledige bericht XML.
-    Retourneert dict: user_id (met en zonder U prefix) -> name
-    """
     result = {}
     if not xml_text:
         return result
@@ -468,11 +463,7 @@ def _parse_full_message(xml_text):
 def _extract_receivers_from_html(html, role):
     """
     Parseert receiverSpan divs uit de Smartschool compose-HTML.
-
     role: 0 = to, 1 = cc, 2 = bcc
-
-    De HTML gebruikt zowel enkele als dubbele quotes voor attributen,
-    dus de regexen zijn daarop aangepast.
     """
     if not html:
         return []
@@ -539,14 +530,16 @@ def _extract_receivers_from_html(html, role):
                 .replace("&#39;", "'")
         ).strip()
 
-        is_co = (userlt == "2")
+        is_co = (userlt == "2") or (userlt == "1")
 
         if is_co:
             user_id = idatt if idatt.startswith("U") else f"U{real_id}"
         else:
             user_id = real_id
 
-        key = (user_id, is_co)
+        # Dedup op (user_id, user_lt, name) — zodat Anke (userlt=2) en
+        # Kurt (userlt=1) beide behouden blijven.
+        key = (user_id, userlt, name.lower())
         if key in seen:
             continue
         seen.add(key)
@@ -555,6 +548,7 @@ def _extract_receivers_from_html(html, role):
             "user_id": user_id,
             "name": name,
             "is_co_account": is_co,
+            "user_lt": userlt,
             "ss_id": ssid,
         })
 
@@ -565,9 +559,6 @@ def _extract_receivers_from_html(html, role):
 # HELPER — strip meta van receivers (read-only weergave)
 # ============================================================
 def _strip_receiver_meta(users):
-    """
-    Voor read-only weergave: geef enkel de naam terug als platte string.
-    """
     out = []
     for u in users or []:
         if isinstance(u, str):
@@ -644,6 +635,7 @@ def _resolve_receivers_from_string(session, base, s, role):
             "user_id": best["user_id"],
             "name": best.get("display_name") or best.get("raw_name") or cleaned,
             "is_co_account": bool(best.get("is_co_account")),
+            "user_lt": str(best.get("user_lt", "2" if best.get("is_co_account") else "0")),
             "ss_id": best.get("ss_id", "455"),
         })
 
@@ -668,6 +660,14 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
 
         uid = (u.get("user_id") or u.get("id") or "").strip()
         name = (u.get("name") or u.get("display_name") or "").strip()
+        is_co = bool(u.get("is_co_account"))
+
+        # user_lt: 1 = professionele co, 2 = niet-professionele co,
+        # 0 = hoofdaccount. Fallback op basis van is_co_account.
+        user_lt = u.get("user_lt")
+        if user_lt is None or user_lt == "":
+            user_lt = "2" if is_co else "0"
+        user_lt = str(user_lt)
 
         if not uid:
             matched = False
@@ -693,11 +693,48 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
         out.append({
             "user_id": uid,
             "name": name,
-            "is_co_account": bool(u.get("is_co_account")),
+            "is_co_account": is_co,
+            "user_lt": user_lt,
             "ss_id": str(u.get("ss_id", "455")),
         })
 
     return out
+
+
+# ============================================================
+# HELPER — clear recipients in compose-sessie
+# ============================================================
+def _clear_compose_recipients(session, base, unique_usc, role_idx):
+    """
+    Wist alle ontvangers van een bepaald veld (to/cc/bcc) in de
+    huidige compose-sessie.
+
+    role_idx: 0 = to, 1 = cc, 2 = bcc
+    """
+    if role_idx == 0:
+        field = "to"
+        unique_key = f"msgcompose{unique_usc}"
+    elif role_idx == 1:
+        field = "tocc"
+        unique_key = f"msgCCcompose{unique_usc}"
+    elif role_idx == 2:
+        field = "tobcc"
+        unique_key = f"msgBCCcompose{unique_usc}"
+    else:
+        return
+
+    try:
+        _dispatch(session, base, [{
+            "subsystem": "quickactions",
+            "action": "clearusers",
+            "params": {
+                "type": field,
+                "uniqueKey": unique_key,
+                "field": str(role_idx),
+            },
+        }])
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -728,9 +765,6 @@ def messages_scheduled(_session=None, _creds=None):
 @bp.get("/drafts")
 @with_session
 def messages_drafts(_session=None, _creds=None):
-    """
-    Lijst alle concepten (drafts) op.
-    """
     base = base_url(_creds)
     msgs = _get_message_list(_session, base, DRAFT_BOX)
     return jsonify({
@@ -892,13 +926,6 @@ def message_cancel_scheduled(msg_id, _session=None, _creds=None):
 # SCHEDULED — COMPOSE-HTML (alleen voor edit)
 # ============================================================
 def _get_scheduled_compose_html(session, base, msg_id):
-    """
-    Haalt de compose-HTML op voor een scheduled bericht via boxType=draft.
-    boxType=scheduled geeft een 500, dus we moeten draft gebruiken.
-
-    LET OP: dit verplaatst het bericht naar 'In ontwerp'.
-    Alleen aanroepen bij edit (include_meta=True).
-    """
     url = (f"/?module=Messages&file=composeMessage"
            f"&boxType=draft&composeType=5&msgID={msg_id}")
     r = session.request("GET", url)
@@ -908,10 +935,6 @@ def _get_scheduled_compose_html(session, base, msg_id):
 
 
 def _extract_html_recipients(session, base, msg_id):
-    """
-    Haalt de ontvangers uit de compose-HTML (inclusief co-accounts).
-    Retourneert dict met to/cc/bcc lijsten van dicts.
-    """
     html = _get_scheduled_compose_html(session, base, msg_id)
     if not html:
         return {"to": [], "cc": [], "bcc": []}
@@ -927,16 +950,6 @@ def _extract_html_recipients(session, base, msg_id):
 # SCHEDULED — VOLLEDIG LEZEN
 # ============================================================
 def _read_scheduled_full(session, base, msg_id, include_meta=False):
-    """
-    Leest een scheduled bericht.
-
-    include_meta=False -> ALLEEN XML via dispatcher. Geen HTML call,
-                          geen verplaatsing. Bevat hoofd-ontvangers + send_date.
-    include_meta=True  -> XML + compose-HTML (via boxType=draft).
-                          Dit VERPLAATST het bericht naar 'In ontwerp'.
-                          Nodig voor volledige meta (co-accounts, user_ids).
-                          Wordt gebruikt bij edit en reschedule.
-    """
     xml_text = _get_message_full_xml(session, base, msg_id, SCHEDULED_BOX)
     parsed = _parse_full_message(xml_text)
 
@@ -952,6 +965,7 @@ def _read_scheduled_full(session, base, msg_id, include_meta=False):
                 "name": r.get("name", ""),
                 "is_co_account": bool(r.get("is_co_account"))
                                  or (r.get("user_id", "") or "").startswith("U"),
+                "user_lt": str(r.get("user_lt", "2" if r.get("is_co_account") else "0")),
                 "ss_id": r.get("ss_id", "455"),
             }
             for r in rlist
@@ -961,29 +975,21 @@ def _read_scheduled_full(session, base, msg_id, include_meta=False):
         return _strip_receiver_meta(packed)
 
     def _merge(xml_list, html_list):
-        """
-        Merge XML- en HTML-recipients. HTML heeft voorrang op naam,
-        maar XML kan user_id bevatten die HTML niet heeft.
-
-        Dedup op (user_id, is_co, name-lowercase). Dit is belangrijk
-        omdat Smartschool's XML vaak geen user_id meegeeft — meerdere
-        to-ontvangers hebben dan allemaal user_id="" en zouden zonder
-        de naam in de key onterecht gededupliceerd worden.
-        """
         merged = []
         seen = set()
 
         for r in html_list:
             uid = r.get("user_id", "") or ""
             name = (r.get("name") or "").strip()
-            key = (uid, bool(r.get("is_co_account")), name.lower())
+            key = (uid, str(r.get("user_lt", "")), name.lower())
             if key in seen:
                 continue
             seen.add(key)
             merged.append({
-                "user_id": r.get("user_id", ""),
+                "user_id": uid,
                 "name": name,
                 "is_co_account": bool(r.get("is_co_account")),
+                "user_lt": str(r.get("user_lt", "2" if r.get("is_co_account") else "0")),
                 "ss_id": r.get("ss_id", "455"),
             })
 
@@ -991,7 +997,7 @@ def _read_scheduled_full(session, base, msg_id, include_meta=False):
             uid = r.get("user_id", "") or ""
             name = (r.get("name") or "").strip()
             name_lc = name.lower()
-            key = (uid, bool(r.get("is_co_account")), name_lc)
+            key = (uid, str(r.get("user_lt", "")), name_lc)
             if key in seen:
                 continue
             if not uid and name_lc:
@@ -1007,6 +1013,7 @@ def _read_scheduled_full(session, base, msg_id, include_meta=False):
                 "user_id": uid,
                 "name": name,
                 "is_co_account": bool(r.get("is_co_account")),
+                "user_lt": str(r.get("user_lt", "2" if r.get("is_co_account") else "0")),
                 "ss_id": r.get("ss_id", "455"),
             })
 
@@ -1202,7 +1209,7 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
         for u in user_list:
             is_co = u.get("is_co_account", False)
             dropped = DROPPED_TYPE[(role_idx, is_co)]
-            userlt = "2" if is_co else "0"
+            userlt = str(u.get("user_lt", "2" if is_co else "0")) or ("2" if is_co else "0")
             _add_user_to_selected(_session, base, u["user_id"],
                                   tokens["unique_usc"], dropped,
                                   ssid=u.get("ss_id", "455"), userlt=userlt)
@@ -1343,7 +1350,7 @@ def message_reschedule(msg_id, _session=None, _creds=None):
         for u in user_list:
             is_co = u.get("is_co_account", False)
             dropped = DROPPED_TYPE[(role_idx, is_co)]
-            userlt = "2" if is_co else "0"
+            userlt = str(u.get("user_lt", "2" if is_co else "0")) or ("2" if is_co else "0")
             _add_user_to_selected(_session, base, u["user_id"],
                                   tokens["unique_usc"], dropped,
                                   ssid=u.get("ss_id", "455"), userlt=userlt)
@@ -1448,12 +1455,6 @@ def _get_draft_tokens(session, base, draft_id):
 # DRAFTS — VOLLEDIG LEZEN
 # ============================================================
 def _read_draft_full(session, base, draft_id, include_meta=False):
-    """
-    Leest een draft/concept.
-
-    include_meta=False -> platte namen voor UI-weergave
-    include_meta=True  -> volledige meta (user_id, is_co_account, ss_id)
-    """
     data = _get_draft_tokens(session, base, draft_id)
 
     receivers = {
@@ -1469,6 +1470,7 @@ def _read_draft_full(session, base, draft_id, include_meta=False):
                 "name": r.get("name", ""),
                 "is_co_account": bool(r.get("is_co_account"))
                                  or (r.get("user_id", "") or "").startswith("U"),
+                "user_lt": str(r.get("user_lt", "2" if r.get("is_co_account") else "0")),
                 "ss_id": r.get("ss_id", "455"),
             }
             for r in rlist
@@ -1494,11 +1496,7 @@ def _read_draft_full(session, base, draft_id, include_meta=False):
 @bp.get("/draft/<draft_id>/full")
 @with_session
 def message_read_draft(draft_id, _session=None, _creds=None):
-    """
-    Lees een draft. Gebruik ?edit=1 of ?include_meta=1 voor volledige meta.
-    """
     base = base_url(_creds)
-
     include_meta = (request.args.get("edit") == "1"
                     or request.args.get("include_meta") == "1")
 
@@ -1528,10 +1526,6 @@ def message_read_draft(draft_id, _session=None, _creds=None):
 @bp.get("/draft/<draft_id>")
 @with_session
 def get_draft(draft_id, _session=None, _creds=None):
-    """
-    Lees een draft via de oude route (ruwe tokens).
-    Gebruik liever /draft/<id>/full voor de nieuwe vorm.
-    """
     base = base_url(_creds)
     try:
         data = _get_draft_tokens(_session, base, draft_id)
@@ -1546,17 +1540,6 @@ def get_draft(draft_id, _session=None, _creds=None):
 @bp.post("/draft/save")
 @with_session
 def message_save_draft(_session=None, _creds=None):
-    """
-    Maak een nieuw concept aan of werk een bestaand concept bij.
-
-    Body (JSON):
-      {
-        "draft_id": "3312560" | "",
-        "subject": "...",
-        "message_html": "<p>...</p>",
-        "to":  [...], "cc": [...], "bcc": [...]
-      }
-    """
     data = request.get_json(force=True, silent=True) or {}
     base = base_url(_creds)
 
@@ -1590,11 +1573,16 @@ def message_save_draft(_session=None, _creds=None):
     if not tokens.get("random_dir"):
         return jsonify({"error": "kon compose-tokens niet ophalen"}), 500
 
+    # BELANGRIJK: eerst bestaande recipients wissen, anders blijven
+    # oude + nieuwe door elkaar staan.
+    for role_idx in (0, 1, 2):
+        _clear_compose_recipients(_session, base, tokens["unique_usc"], role_idx)
+
     for role_idx, user_list in [(0, to_users), (1, cc_users), (2, bcc_users)]:
         for u in user_list:
             is_co = u.get("is_co_account", False)
             dropped = DROPPED_TYPE[(role_idx, is_co)]
-            userlt = "2" if is_co else "0"
+            userlt = str(u.get("user_lt", "2" if is_co else "0")) or ("2" if is_co else "0")
             _add_user_to_selected(_session, base, u["user_id"],
                                   tokens["unique_usc"], dropped,
                                   ssid=u.get("ss_id", "455"), userlt=userlt)
@@ -1665,9 +1653,6 @@ def message_save_draft(_session=None, _creds=None):
 @bp.post("/draft/<draft_id>/delete")
 @with_session
 def message_delete_draft(draft_id, _session=None, _creds=None):
-    """
-    Verwijder een concept via quick delete.
-    """
     base = base_url(_creds)
     try:
         r = _dispatch(_session, base, [{
@@ -1697,17 +1682,6 @@ def message_delete_draft(draft_id, _session=None, _creds=None):
 @bp.post("/draft/<draft_id>/schedule")
 @with_session
 def message_schedule_draft(draft_id, _session=None, _creds=None):
-    """
-    Zet een bestaand concept om naar een scheduled bericht.
-
-    Body (JSON):
-      {
-        "send_date": "2026-10-19T07:30",
-        "subject": "...",                    # optioneel
-        "message_html": "...",               # optioneel
-        "to": [...], "cc": [...], "bcc": [...]  # optioneel
-      }
-    """
     data = request.get_json(force=True, silent=True) or {}
     send_date_raw = data.get("send_date") or ""
 
@@ -1764,7 +1738,7 @@ def message_schedule_draft(draft_id, _session=None, _creds=None):
         for u in user_list:
             is_co = u.get("is_co_account", False)
             dropped = DROPPED_TYPE[(role_idx, is_co)]
-            userlt = "2" if is_co else "0"
+            userlt = str(u.get("user_lt", "2" if is_co else "0")) or ("2" if is_co else "0")
             _add_user_to_selected(_session, base, u["user_id"],
                                   tokens["unique_usc"], dropped,
                                   ssid=u.get("ss_id", "455"), userlt=userlt)
@@ -1867,7 +1841,8 @@ def _search_users_single(session, base, query, unique_usc, search_type):
         ss_id = _extract_tag(block, "ssID", "455")
         classname = _extract_tag(block, "classname", "")
 
-        is_co = (user_lt == "2") or bool(co_name)
+        # user_lt: 0 = hoofd, 1 = professionele co, 2 = niet-professionele co
+        is_co = (user_lt in ("1", "2")) or bool(co_name)
 
         if is_co and co_name:
             display_name = co_name
@@ -1879,7 +1854,10 @@ def _search_users_single(session, base, query, unique_usc, search_type):
         full_name = f"Co: {display_name}" if is_co else display_name
 
         if is_co:
-            type_label = "ouder"
+            if user_lt == "1":
+                type_label = "co (professioneel)"
+            else:
+                type_label = "co (familie)"
         elif user_type == "U":
             type_label = f"leerling - {classname}" if classname else "leerling"
         elif user_type == "T":
@@ -1914,7 +1892,7 @@ def _search_users(session, base, query, unique_usc, search_type=None):
         for st in [0, 1, 2, 3, 4, 5]:
             try:
                 for u in _search_users_single(session, base, query, unique_usc, st):
-                    key = (u["user_id"], u["is_co_account"])
+                    key = (u["user_id"], u["is_co_account"], u.get("user_lt", ""))
                     if key in seen:
                         continue
                     seen.add(key)
@@ -1947,7 +1925,8 @@ def _build_receiver_xml(users, receiver_type):
         if u.get("is_co_account"):
             if not uid.startswith("U"):
                 uid = f"U{uid}"
-            userlt = "2"
+            # Gebruik echte userlt (1 = professioneel, 2 = familie)
+            userlt = str(u.get("user_lt", "2")) or "2"
         else:
             if uid.startswith("U"):
                 uid = uid[1:]
@@ -2007,6 +1986,7 @@ def messages_get_user(user_id, _session=None, _creds=None):
                                     "user_id": uid,
                                     "name": u.get("display_name") or u.get("name"),
                                     "is_co_account": bool(u.get("is_co_account")),
+                                    "user_lt": u.get("user_lt", "0"),
                                     "ss_id": u.get("ss_id", "455"),
                                     "type_label": u.get("type_label"),
                                     "source": "search",
@@ -2147,11 +2127,16 @@ def messages_send(_session=None, _creds=None):
     if not tokens.get("random_dir"):
         return jsonify({"error": "kon tokens niet ophalen"}), 500
 
+    # BELANGRIJK: bij draft_id eerst bestaande recipients wissen
+    if draft_id:
+        for role_idx in (0, 1, 2):
+            _clear_compose_recipients(_session, base, tokens["unique_usc"], role_idx)
+
     for role_idx, user_list in [(0, to_users), (1, cc_users), (2, bcc_users)]:
         for u in user_list:
             is_co = u.get("is_co_account", False)
             dropped = DROPPED_TYPE[(role_idx, is_co)]
-            userlt = "2" if is_co else "0"
+            userlt = str(u.get("user_lt", "2" if is_co else "0")) or ("2" if is_co else "0")
             _add_user_to_selected(_session, base, u["user_id"], tokens["unique_usc"],
                                   dropped, ssid=u.get("ss_id", "455"),
                                   userlt=userlt)
