@@ -143,6 +143,95 @@ def _extract_tag(block, tag, default=""):
 
 
 # ============================================================
+# HELPER — strip suffixen van namen voor searchUsers
+# ============================================================
+def _clean_search_name(name):
+    """
+    Smartschool toont namen soms als 'Odne Bontemps - 4NAW'.
+    searchUsers verwacht 'Odne Bontemps'.
+    Strip alles na ' - XXX' of ' – XXX'.
+    """
+    if not name:
+        return ""
+    name = re.sub(r"\s*[-–]\s*[A-Za-z0-9]+\s*$", "", name).strip()
+    return name
+
+
+# ============================================================
+# HELPER — receivers uit de <receivers>/<ccreceivers>/<bccreceivers> containers
+# ============================================================
+def _parse_recipients_from_receivers(msg, tag_name):
+    """
+    Parseert:
+      <receivers><to>Naam</to>...</receivers>
+      <ccreceivers><cc>Naam</cc>...</ccreceivers>
+      <bccreceivers><bcc>Naam</bcc>...</bccreceivers>
+
+    Retourneert lijst van {user_id, name}.
+    """
+    items = []
+    seen = set()
+
+    if tag_name == "to":
+        containers = ["receivers"]
+    elif tag_name == "cc":
+        containers = ["ccreceivers", "ccReceivers"]
+    elif tag_name == "bcc":
+        containers = ["bccreceivers", "bccReceivers"]
+    else:
+        containers = []
+
+    for cname in containers:
+        container = msg.find(cname)
+        if container is None:
+            continue
+
+        # Meerdere <to>/<cc>/<bcc> tags kunnen in de container zitten
+        # (of als directe tekst in container)
+        found_any = False
+        for recip in container.findall(tag_name):
+            txt = (recip.text or "").strip()
+            if not txt:
+                continue
+            found_any = True
+            m = re.match(r"(.+?)\s*<\s*(U?\d+)\s*>", txt)
+            if m:
+                name = m.group(1).strip()
+                uid = m.group(2)
+            else:
+                name = txt
+                uid = ""
+            key = (name, uid)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append({"user_id": uid, "name": name})
+
+        # Soms staat de tekst direct in de container, zonder child tags
+        if not found_any:
+            txt = (container.text or "").strip()
+            if txt:
+                for part in re.split(r"[,;]", txt):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    m = re.match(r"(.+?)\s*<\s*(U?\d+)\s*>", part)
+                    if m:
+                        name = m.group(1).strip()
+                        uid = m.group(2)
+                    else:
+                        name = part
+                        uid = ""
+                    key = (name, uid)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    items.append({"user_id": uid, "name": name})
+
+    return items
+
+
+# ============================================================
 # BERICHTEN LEZEN
 # ============================================================
 def _get_message_list(session, base, box_type="inbox", box_id="0"):
@@ -268,10 +357,19 @@ def _parse_full_message(xml_text):
         result["send_date"] = (msg.findtext("sendDate", "")
                                or msg.findtext("senddate", ""))
 
-        def _parse_recipients(tag_name):
+        # --- EERST: probeer de <receivers>-containers (nieuw formaat) ---
+        result["to_list"]  = _parse_recipients_from_receivers(msg, "to")
+        result["cc_list"]  = _parse_recipients_from_receivers(msg, "cc")
+        result["bcc_list"] = _parse_recipients_from_receivers(msg, "bcc")
+
+        # --- FALLBACK: oude manier via .//to etc. ---
+        def _parse_recipients_legacy(tag_name):
             items = []
             seen = set()
+            # Skip de lege <to /> direct onder <message>
             for recip in msg.findall(f".//{tag_name}"):
+                parent = None
+                # ET heeft geen parent-ref; we filteren op text-inhoud
                 uid = recip.get("id") or recip.get("userID") or ""
                 name = recip.get("name") or ""
                 txt = (recip.text or "").strip()
@@ -283,12 +381,13 @@ def _parse_full_message(xml_text):
                         uid = txt
                     else:
                         name = txt
-                if not uid:
+                if not uid and not name:
                     continue
-                if uid in seen:
+                if uid in seen and uid:
                     continue
-                seen.add(uid)
-                if not name:
+                if uid:
+                    seen.add(uid)
+                if not name and uid:
                     name = names_map.get(uid, "")
                 items.append({"user_id": uid, "name": name})
 
@@ -313,10 +412,14 @@ def _parse_full_message(xml_text):
                         items.append({"user_id": "", "name": part})
             return items
 
-        result["to_list"] = _parse_recipients("to")
-        result["cc_list"] = _parse_recipients("cc")
-        result["bcc_list"] = _parse_recipients("bcc")
+        if not result["to_list"]:
+            result["to_list"] = _parse_recipients_legacy("to")
+        if not result["cc_list"]:
+            result["cc_list"] = _parse_recipients_legacy("cc")
+        if not result["bcc_list"]:
+            result["bcc_list"] = _parse_recipients_legacy("bcc")
 
+        # --- Strings samenstellen ---
         result["to"] = ", ".join(
             (r["name"] or r["user_id"]) for r in result["to_list"]
         ) or msg.findtext("to", "")
@@ -498,35 +601,48 @@ def _resolve_receivers_from_string(session, base, s, role):
 
     result = []
     for name in names:
+        cleaned = _clean_search_name(name)
         try:
-            users = _search_users(session, base, name, tokens["unique_usc"], "all")
+            users = _search_users(session, base, cleaned, tokens["unique_usc"], "all")
         except Exception:
             continue
         if not users:
             continue
 
-        needle = name.lower()
+        needle = cleaned.lower()
+        needle_full = name.lower()
+
         best = None
+        # Exact match op display_name
         for u in users:
             if (u.get("display_name") or "").lower() == needle:
                 best = u
                 break
+        # Exact match op raw_name
         if not best:
             for u in users:
                 if (u.get("raw_name") or "").lower() == needle:
                     best = u
                     break
+        # Substring match op display_name
         if not best:
             for u in users:
                 if needle in (u.get("display_name") or "").lower():
                     best = u
                     break
+        # Substring match op volledige naam (met suffix)
+        if not best:
+            for u in users:
+                if needle_full in (u.get("display_name") or "").lower():
+                    best = u
+                    break
+        # Laatste redmiddel: eerste resultaat
         if not best:
             best = users[0]
 
         result.append({
             "user_id": best["user_id"],
-            "name": best.get("display_name") or best.get("raw_name") or name,
+            "name": best.get("display_name") or best.get("raw_name") or cleaned,
             "is_co_account": bool(best.get("is_co_account")),
             "ss_id": best.get("ss_id", "455"),
         })
@@ -596,16 +712,7 @@ def messages_list(_session=None, _creds=None):
         "messages": _get_message_list(_session, base_url(_creds), box),
     })
 
-@bp.get("/debug-scheduled-xml/<msg_id>")
-@with_session
-def debug_scheduled_xml(msg_id, _session=None, _creds=None):
-    base = base_url(_creds)
-    xml = _get_message_full_xml(_session, base, msg_id, SCHEDULED_BOX)
-    return jsonify({
-        "length": len(xml),
-        "xml": xml[:8000],
-    })
-    
+
 @bp.get("/scheduled")
 @with_session
 def messages_scheduled(_session=None, _creds=None):
@@ -804,22 +911,39 @@ def _read_scheduled_full(session, base, msg_id, include_meta=False):
     }
 
     if include_meta:
-        # Fallback: resolve strings via searchUsers (alleen zinvol bij meta)
-        if not receivers["to"]:
+        # Fallback: resolve strings via searchUsers (voor user_id's)
+        if receivers["to"] and not receivers["to"][0].get("user_id"):
+            old_to = ", ".join(r["name"] for r in receivers["to"] if r.get("name"))
+            if old_to:
+                resolved = _resolve_receivers_from_string(session, base, old_to, "to")
+                if resolved:
+                    receivers["to"] = resolved
+        elif not receivers["to"]:
             old_to = parsed.get("to", "") or ""
             if old_to and not re.match(r"^\s*U?\d+\s*$", old_to):
-                receivers["to"] = _resolve_receivers_from_string(
-                    session, base, old_to, "to")
-        if not receivers["cc"]:
+                receivers["to"] = _resolve_receivers_from_string(session, base, old_to, "to")
+
+        if receivers["cc"] and not receivers["cc"][0].get("user_id"):
+            old_cc = ", ".join(r["name"] for r in receivers["cc"] if r.get("name"))
+            if old_cc:
+                resolved = _resolve_receivers_from_string(session, base, old_cc, "cc")
+                if resolved:
+                    receivers["cc"] = resolved
+        elif not receivers["cc"]:
             old_cc = parsed.get("cc", "") or ""
             if old_cc and not re.match(r"^\s*U?\d+\s*$", old_cc):
-                receivers["cc"] = _resolve_receivers_from_string(
-                    session, base, old_cc, "cc")
-        if not receivers["bcc"]:
+                receivers["cc"] = _resolve_receivers_from_string(session, base, old_cc, "cc")
+
+        if receivers["bcc"] and not receivers["bcc"][0].get("user_id"):
+            old_bcc = ", ".join(r["name"] for r in receivers["bcc"] if r.get("name"))
+            if old_bcc:
+                resolved = _resolve_receivers_from_string(session, base, old_bcc, "bcc")
+                if resolved:
+                    receivers["bcc"] = resolved
+        elif not receivers["bcc"]:
             old_bcc = parsed.get("bcc", "") or ""
             if old_bcc and not re.match(r"^\s*U?\d+\s*$", old_bcc):
-                receivers["bcc"] = _resolve_receivers_from_string(
-                    session, base, old_bcc, "bcc")
+                receivers["bcc"] = _resolve_receivers_from_string(session, base, old_bcc, "bcc")
     else:
         # Read-only: als de XML alleen een platte string gaf, gebruik die direct
         if not receivers["to"]:
