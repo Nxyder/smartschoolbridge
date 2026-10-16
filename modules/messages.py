@@ -263,9 +263,9 @@ def _get_message_list(session, base, box_type="inbox", box_id="0"):
 def _get_message_full_xml(session, base, msg_id, box_type="inbox"):
     r = _dispatch(session, base, [
         {"subsystem": "postboxes", "action": "show message",
-         "params": {"msgID": msg_id, "boxType": box_type, "limitList": "true"}},
+         "params": {"msgID": msg_id, "boxType": box_type, "limitList": "false"}},  # was "true"
         {"subsystem": "postboxes", "action": "attachment list",
-         "params": {"msgID": msg_id, "boxType": box_type, "limitList": "true"}},
+         "params": {"msgID": msg_id, "boxType": box_type, "limitList": "false"}},  # was "true"
     ])
     return r.text
 
