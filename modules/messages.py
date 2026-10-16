@@ -38,6 +38,7 @@ DROPPED_TYPE = {
 }
 
 SCHEDULED_BOX = "scheduled"
+DRAFT_BOX = "draft"
 
 
 # ============================================================
@@ -170,8 +171,6 @@ def _parse_recipients_from_receivers(msg, tag_name):
     LET OP: Smartschool gebruikt in de praktijk <to> als kind-tag
     in ALLE drie de containers (dus ook in ccreceivers/bccreceivers).
     We zoeken daarom in zowel de verwachte tag als in "to".
-
-    Retourneert lijst van {user_id, name}.
     """
     items = []
     seen = set()
@@ -726,6 +725,21 @@ def messages_scheduled(_session=None, _creds=None):
     })
 
 
+@bp.get("/drafts")
+@with_session
+def messages_drafts(_session=None, _creds=None):
+    """
+    Lijst alle concepten (drafts) op.
+    """
+    base = base_url(_creds)
+    msgs = _get_message_list(_session, base, DRAFT_BOX)
+    return jsonify({
+        "box": DRAFT_BOX,
+        "count": len(msgs),
+        "messages": msgs,
+    })
+
+
 @bp.get("/<msg_id>")
 @with_session
 def message_read(msg_id, _session=None, _creds=None):
@@ -923,11 +937,9 @@ def _read_scheduled_full(session, base, msg_id, include_meta=False):
                           Nodig voor volledige meta (co-accounts, user_ids).
                           Wordt gebruikt bij edit en reschedule.
     """
-    # 1. XML via dispatcher (snel, geen verplaatsing)
     xml_text = _get_message_full_xml(session, base, msg_id, SCHEDULED_BOX)
     parsed = _parse_full_message(xml_text)
 
-    # 2. Compose-HTML ALLEEN bij include_meta (verplaatst naar draft)
     if include_meta:
         html_recipients = _extract_html_recipients(session, base, msg_id)
     else:
@@ -982,7 +994,6 @@ def _read_scheduled_full(session, base, msg_id, include_meta=False):
             key = (uid, bool(r.get("is_co_account")), name_lc)
             if key in seen:
                 continue
-            # Extra veiligheid: als user_id leeg is, dedup op naam
             if not uid and name_lc:
                 already = False
                 for m in merged:
@@ -1011,8 +1022,6 @@ def _read_scheduled_full(session, base, msg_id, include_meta=False):
         "bcc": _pack(bcc_list),
     }
 
-    # Als include_meta=True en er zijn entries met naam maar zonder user_id,
-    # probeer user_id te resolven via searchUsers
     if include_meta:
         for role_key in ("to", "cc", "bcc"):
             rlist = receivers[role_key]
@@ -1393,7 +1402,7 @@ def message_reschedule(msg_id, _session=None, _creds=None):
 
 
 # ============================================================
-# DRAFTS
+# DRAFTS — TOKENS
 # ============================================================
 def _get_draft_tokens(session, base, draft_id):
     url = (f"/?module=Messages&file=composeMessage"
@@ -1427,6 +1436,7 @@ def _get_draft_tokens(session, base, draft_id):
         "orig_msg_id": fields.get("origMsgID", draft_id),
         "subject": fields.get("subject", ""),
         "body": body.strip(),
+        "send_date": fields.get("sendDate", ""),
         "random_dir": fields.get("randomDir", ""),
         "unique_usc": fields.get("uniqueUsc", ""),
         "encrypted_sender": fields.get("encryptedSender", ""),
@@ -1434,15 +1444,381 @@ def _get_draft_tokens(session, base, draft_id):
     }
 
 
+# ============================================================
+# DRAFTS — VOLLEDIG LEZEN
+# ============================================================
+def _read_draft_full(session, base, draft_id, include_meta=False):
+    """
+    Leest een draft/concept.
+
+    include_meta=False -> platte namen voor UI-weergave
+    include_meta=True  -> volledige meta (user_id, is_co_account, ss_id)
+    """
+    data = _get_draft_tokens(session, base, draft_id)
+
+    receivers = {
+        "to":  data["receivers"]["to"],
+        "cc":  data["receivers"]["cc"],
+        "bcc": data["receivers"]["bcc"],
+    }
+
+    def _pack(rlist):
+        packed = [
+            {
+                "user_id": r.get("user_id", ""),
+                "name": r.get("name", ""),
+                "is_co_account": bool(r.get("is_co_account"))
+                                 or (r.get("user_id", "") or "").startswith("U"),
+                "ss_id": r.get("ss_id", "455"),
+            }
+            for r in rlist
+        ]
+        if include_meta:
+            return packed
+        return _strip_receiver_meta(packed)
+
+    return {
+        "draft_id": draft_id,
+        "orig_msg_id": data.get("orig_msg_id", draft_id),
+        "subject": data.get("subject", "") or "",
+        "body_html": data.get("body", "") or "",
+        "send_date": data.get("send_date", "") or "",
+        "receivers": {
+            "to":  _pack(receivers["to"]),
+            "cc":  _pack(receivers["cc"]),
+            "bcc": _pack(receivers["bcc"]),
+        },
+    }
+
+
+@bp.get("/draft/<draft_id>/full")
+@with_session
+def message_read_draft(draft_id, _session=None, _creds=None):
+    """
+    Lees een draft. Gebruik ?edit=1 of ?include_meta=1 voor volledige meta.
+    """
+    base = base_url(_creds)
+
+    include_meta = (request.args.get("edit") == "1"
+                    or request.args.get("include_meta") == "1")
+
+    try:
+        info = _read_draft_full(_session, base, draft_id, include_meta=include_meta)
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+    return jsonify({
+        "draft_id": info["draft_id"],
+        "orig_msg_id": info["orig_msg_id"],
+        "subject": info["subject"],
+        "body_html": info["body_html"],
+        "body_text": strip_html(info["body_html"]),
+        "send_date": info["send_date"],
+        "to": info["receivers"]["to"],
+        "cc": info["receivers"]["cc"],
+        "bcc": info["receivers"]["bcc"],
+        "to_full": info["receivers"]["to"],
+        "cc_full": info["receivers"]["cc"],
+        "bcc_full": info["receivers"]["bcc"],
+        "include_meta": include_meta,
+        "is_draft": True,
+    })
+
+
 @bp.get("/draft/<draft_id>")
 @with_session
 def get_draft(draft_id, _session=None, _creds=None):
+    """
+    Lees een draft via de oude route (ruwe tokens).
+    Gebruik liever /draft/<id>/full voor de nieuwe vorm.
+    """
     base = base_url(_creds)
     try:
         data = _get_draft_tokens(_session, base, draft_id)
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+
+# ============================================================
+# DRAFTS — AANMAKEN / UPDATEN
+# ============================================================
+@bp.post("/draft/save")
+@with_session
+def message_save_draft(_session=None, _creds=None):
+    """
+    Maak een nieuw concept aan of werk een bestaand concept bij.
+
+    Body (JSON):
+      {
+        "draft_id": "3312560" | "",
+        "subject": "...",
+        "message_html": "<p>...</p>",
+        "to":  [...], "cc": [...], "bcc": [...]
+      }
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    base = base_url(_creds)
+
+    draft_id = (data.get("draft_id") or "").strip()
+    subject = data.get("subject") or "(geen onderwerp)"
+    message_html = data.get("message_html") or ""
+    message_plain = data.get("message") or ""
+
+    if message_html.strip():
+        body = message_html
+    elif message_plain:
+        body = f"<p>{message_plain}</p>"
+    else:
+        body = "<p></p>"
+
+    to_users  = _normalize_user_list(_session, base, data.get("to") or [],  "to")
+    cc_users  = _normalize_user_list(_session, base, data.get("cc") or [],  "cc")
+    bcc_users = _normalize_user_list(_session, base, data.get("bcc") or [], "bcc")
+
+    if not to_users:
+        return jsonify({"error": "minstens één ontvanger (to) verplicht"}), 400
+
+    if draft_id:
+        try:
+            tokens = _get_draft_tokens(_session, base, draft_id)
+        except Exception as e:
+            return jsonify({"error": f"kon concept niet laden: {e}"}), 500
+    else:
+        tokens = _get_compose_tokens(_session, base)
+
+    if not tokens.get("random_dir"):
+        return jsonify({"error": "kon compose-tokens niet ophalen"}), 500
+
+    for role_idx, user_list in [(0, to_users), (1, cc_users), (2, bcc_users)]:
+        for u in user_list:
+            is_co = u.get("is_co_account", False)
+            dropped = DROPPED_TYPE[(role_idx, is_co)]
+            userlt = "2" if is_co else "0"
+            _add_user_to_selected(_session, base, u["user_id"],
+                                  tokens["unique_usc"], dropped,
+                                  ssid=u.get("ss_id", "455"), userlt=userlt)
+
+    is_update = bool(draft_id)
+    compose_action = "5" if is_update else "0"
+
+    fields = {
+        "send": "refresh",
+        "origMsgID": tokens.get("orig_msg_id", "0") if is_update else "0",
+        "composeAction": compose_action,
+        "randomDir": tokens["random_dir"],
+        "uniqueUsc": tokens["unique_usc"],
+        "showTab": "tab1Container",
+        "delFile": "0",
+        "composeType": "5" if is_update else "0",
+        "msgID": draft_id if is_update else "0",
+        "msgFormSelectedTab": "",
+        "sendDate": "",
+        "subject": subject,
+        "bcc": "1" if bcc_users else "0",
+        "message": body,
+        "encryptedSender": tokens["encrypted_sender"],
+    }
+    if to_users:
+        fields["receiverPart0"] = _build_receiver_xml(to_users, 0)
+    if cc_users:
+        fields["receiverPart1"] = _build_receiver_xml(cc_users, 1)
+    if bcc_users:
+        fields["receiverPart2"] = _build_receiver_xml(bcc_users, 2)
+
+    m = MultipartEncoder(fields=fields)
+    try:
+        r = _session.request(
+            "POST",
+            "/?module=Messages&file=composeMessage&boxType=draft&composeType=5&msgID="
+            + (draft_id if is_update else "undefined"),
+            data=m,
+            headers={"Content-Type": m.content_type,
+                     "Origin": base, "Referer": base + "/"},
+            allow_redirects=False,
+        )
+    except Exception as e:
+        return jsonify({"error": f"opslaan mislukt: {e}"}), 500
+
+    ok = r.status_code in (200, 302, 303)
+    reason = f"HTTP {r.status_code}"
+    if r.status_code in (302, 303):
+        reason = f"redirect → {r.headers.get('Location', '')}"
+
+    return jsonify({
+        "ok": ok,
+        "reason": reason,
+        "status": r.status_code,
+        "draft_id": draft_id or None,
+        "is_update": is_update,
+        "subject": subject,
+        "to_count": len(to_users),
+        "cc_count": len(cc_users),
+        "bcc_count": len(bcc_users),
+        "body_length": len(body),
+    })
+
+
+# ============================================================
+# DRAFTS — VERWIJDEREN
+# ============================================================
+@bp.post("/draft/<draft_id>/delete")
+@with_session
+def message_delete_draft(draft_id, _session=None, _creds=None):
+    """
+    Verwijder een concept via quick delete.
+    """
+    base = base_url(_creds)
+    try:
+        r = _dispatch(_session, base, [{
+            "subsystem": "postboxes",
+            "action": "quick delete",
+            "params": {"msgID": draft_id},
+        }])
+        body = r.text or ""
+        body_low = body.lower()
+        ok = ("<status>ok</status>" in body_low or
+              "<success>1</success>" in body_low or
+              (r.status_code in (200, 204) and "error" not in body_low))
+        return jsonify({
+            "ok": ok,
+            "action": "quick delete",
+            "draft_id": draft_id,
+            "status": r.status_code,
+            "response": body[:300],
+        })
+    except Exception as e:
+        return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
+
+
+# ============================================================
+# DRAFTS — VERZENDEN ALS SCHEDULED
+# ============================================================
+@bp.post("/draft/<draft_id>/schedule")
+@with_session
+def message_schedule_draft(draft_id, _session=None, _creds=None):
+    """
+    Zet een bestaand concept om naar een scheduled bericht.
+
+    Body (JSON):
+      {
+        "send_date": "2026-10-19T07:30",
+        "subject": "...",                    # optioneel
+        "message_html": "...",               # optioneel
+        "to": [...], "cc": [...], "bcc": [...]  # optioneel
+      }
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    send_date_raw = data.get("send_date") or ""
+
+    if not send_date_raw:
+        return jsonify({"error": "send_date verplicht"}), 400
+
+    try:
+        send_date = _format_send_date(send_date_raw)
+    except ValueError as e:
+        return jsonify({"error": f"ongeldige send_date: {e}"}), 400
+
+    base = base_url(_creds)
+
+    try:
+        info = _read_draft_full(_session, base, draft_id, include_meta=True)
+    except Exception as e:
+        return jsonify({"error": f"kon concept niet lezen: {e}"}), 500
+
+    subject = data.get("subject") or info["subject"] or "(geen onderwerp)"
+    body_html = data.get("message_html") or info["body_html"] or "<p></p>"
+
+    if "to" in data:
+        new_to = _normalize_user_list(_session, base, data.get("to") or [], "to")
+    else:
+        new_to = info["receivers"]["to"]
+
+    if "cc" in data:
+        new_cc = _normalize_user_list(_session, base, data.get("cc") or [], "cc")
+    else:
+        new_cc = info["receivers"]["cc"]
+
+    if "bcc" in data:
+        new_bcc = _normalize_user_list(_session, base, data.get("bcc") or [], "bcc")
+    else:
+        new_bcc = info["receivers"]["bcc"]
+
+    if not new_to:
+        return jsonify({"error": "geen ontvangers (to) in concept"}), 400
+
+    try:
+        _dispatch(_session, base, [{
+            "subsystem": "postboxes",
+            "action": "quick delete",
+            "params": {"msgID": draft_id},
+        }])
+    except Exception:
+        pass
+
+    tokens = _get_compose_tokens(_session, base)
+    if not tokens.get("random_dir"):
+        return jsonify({"error": "geen compose-tokens"}), 500
+
+    for role_idx, user_list in [(0, new_to), (1, new_cc), (2, new_bcc)]:
+        for u in user_list:
+            is_co = u.get("is_co_account", False)
+            dropped = DROPPED_TYPE[(role_idx, is_co)]
+            userlt = "2" if is_co else "0"
+            _add_user_to_selected(_session, base, u["user_id"],
+                                  tokens["unique_usc"], dropped,
+                                  ssid=u.get("ss_id", "455"), userlt=userlt)
+
+    fields = {
+        "send": "send",
+        "origMsgID": "0",
+        "composeAction": "0",
+        "randomDir": tokens["random_dir"],
+        "uniqueUsc": tokens["unique_usc"],
+        "showTab": "tab1Container",
+        "delFile": "0",
+        "composeType": "0",
+        "msgID": "0",
+        "msgFormSelectedTab": "",
+        "sendDate": send_date,
+        "subject": subject,
+        "bcc": "1" if new_bcc else "0",
+        "message": body_html,
+        "encryptedSender": tokens["encrypted_sender"],
+    }
+    if new_to:
+        fields["receiverPart0"] = _build_receiver_xml(new_to, 0)
+    if new_cc:
+        fields["receiverPart1"] = _build_receiver_xml(new_cc, 1)
+    if new_bcc:
+        fields["receiverPart2"] = _build_receiver_xml(new_bcc, 2)
+
+    m = MultipartEncoder(fields=fields)
+    try:
+        r = _session.request(
+            "POST",
+            "/?module=Messages&file=composeMessage&boxType=inbox&composeType=0&msgID=undefined",
+            data=m,
+            headers={"Content-Type": m.content_type,
+                     "Origin": base, "Referer": base + "/"},
+            allow_redirects=False,
+        )
+    except Exception as e:
+        return jsonify({"error": f"verzenden mislukt: {e}"}), 500
+
+    ok, reason = _is_send_success(r)
+
+    return jsonify({
+        "ok": ok,
+        "reason": reason,
+        "draft_id": draft_id,
+        "send_date": send_date,
+        "status": r.status_code,
+        "to_count": len(new_to),
+        "cc_count": len(new_cc or []),
+        "bcc_count": len(new_bcc or []),
+        "subject": subject,
+    })
 
 
 # ============================================================
