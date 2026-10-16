@@ -720,14 +720,6 @@ def _count_compose_users(session, base, unique_usc):
 # ============================================================
 def _add_users_and_wait(session, base, tokens, to_users, cc_users, bcc_users,
                         max_wait=5.0, poll_interval=0.15, sleep_between=0.12):
-    """
-    Voegt alle ontvangers toe en WACHT tot Smartschool ze allemaal heeft
-    geregistreerd (via countUsers polling).
-
-    sleep_between: pauze tussen opeenvolgende addUserToSelected calls.
-
-    Retourneert (success: bool, debug: dict).
-    """
     unique_usc = tokens["unique_usc"]
 
     debug = {
@@ -1599,7 +1591,63 @@ def get_draft(draft_id, _session=None, _creds=None):
 
 
 # ============================================================
-# DRAFTS — SAVE (DISPATCHER-BASED)
+# DRAFTS — VOORKOM DUBBELE DRAFTS
+# ============================================================
+def _find_existing_draft(session, base, subject, to_users, cc_users, bcc_users):
+    """
+    Zoekt een bestaande draft in de concepten-box die hetzelfde subject
+    en dezelfde recipients heeft. Retourneert het draft_id of None.
+
+    Wordt gebruikt om te voorkomen dat we een nieuwe draft aanmaken als
+    Smartschool er al automatisch één heeft gemaakt (bv. bij het openen
+    van een scheduled bericht → Smartschool converteert dat naar draft).
+    """
+    if not subject:
+        return None
+
+    try:
+        drafts = _get_message_list(session, base, DRAFT_BOX)
+    except Exception:
+        return None
+
+    if not drafts:
+        return None
+
+    subject_norm = (subject or "").strip().lower()
+
+    new_to_ids = set()
+    for u in (to_users or []):
+        uid = _strip_u_prefix(u.get("user_id", ""))
+        lt = str(u.get("user_lt", "0"))
+        new_to_ids.add((uid, lt))
+
+    if not new_to_ids:
+        return None
+
+    for d in drafts:
+        d_subject = (d.get("subject") or "").strip().lower()
+        if d_subject != subject_norm:
+            continue
+
+        try:
+            info = _read_draft_full(session, base, d["id"], include_meta=True)
+        except Exception:
+            continue
+
+        draft_to_ids = set()
+        for u in (info.get("receivers", {}).get("to") or []):
+            uid = _strip_u_prefix(u.get("user_id", ""))
+            lt = str(u.get("user_lt", "0"))
+            draft_to_ids.add((uid, lt))
+
+        if draft_to_ids == new_to_ids:
+            return d["id"]
+
+    return None
+
+
+# ============================================================
+# DRAFTS — SAVE (DISPATCHER + AUTO-FIND BESTAANDE DRAFT)
 # ============================================================
 @bp.post("/draft/save")
 @with_session
@@ -1607,14 +1655,14 @@ def message_save_draft(_session=None, _creds=None):
     """
     Slaat een draft op via de DISPATCHER (subsystem=draft, action=save draft).
 
-    BELANGRIJK: Smartschool verwacht GEEN receiverPart XML in deze call.
-    De recipients zitten al in de Smartschool-sessie via addUserToSelected.
-    De dispatcher leest ze uit de sessie en slaat ze op.
+    Smartschool converteert een scheduled bericht automatisch naar een draft
+    zodra het in de compose-UI wordt geopend. Als de frontend ons geen
+    draft_id meegeeft (bv. omdat de gebruiker vanuit 'gepland' komt), dan
+    zoeken we eerst of er al een draft bestaat met hetzelfde subject en
+    dezelfde recipients. Zo ja, dan updaten we die in plaats van een
+    nieuwe aan te maken.
 
-    Dit is exact wat Smartschool's eigen UI doet:
-      1. GET composeMessage → opent compose-sessie (uniqueUsc, randomDir)
-      2. addUserToSelected voor elke recipient
-      3. dispatcher 'save draft' → leest recipients uit sessie, slaat op
+    Dit voorkomt dubbele drafts in de concepten-box.
     """
     data = request.get_json(force=True, silent=True) or {}
     base = base_url(_creds)
@@ -1638,9 +1686,19 @@ def message_save_draft(_session=None, _creds=None):
     if not to_users:
         return jsonify({"error": "minstens één ontvanger (to) verplicht"}), 400
 
-    # BELANGRIJK: de draft bestaat al → we openen de compose-sessie van die
-    # draft (via _get_draft_tokens). Dat geeft ons de juiste uniqueUsc/randomDir
-    # die Smartschool voor DEZE draft heeft gereserveerd.
+    # ---- FIX: als geen draft_id, check of er al een draft bestaat ----
+    auto_found_draft_id = None
+    if not draft_id:
+        try:
+            auto_found_draft_id = _find_existing_draft(
+                _session, base, subject, to_users, cc_users, bcc_users
+            )
+        except Exception:
+            auto_found_draft_id = None
+        if auto_found_draft_id:
+            draft_id = auto_found_draft_id
+
+    # ---- Tokens ophalen ----
     if draft_id:
         try:
             tokens = _get_draft_tokens(_session, base, draft_id)
@@ -1652,16 +1710,16 @@ def message_save_draft(_session=None, _creds=None):
     if not tokens.get("random_dir"):
         return jsonify({"error": "kon compose-tokens niet ophalen"}), 500
 
-    # 1. Wis bestaande recipients in de sessie
+    # ---- Wis bestaande recipients ----
     for role_idx in (0, 1, 2):
         _clear_compose_recipients(_session, base, tokens["unique_usc"], role_idx)
 
-    # 2. Voeg nieuwe recipients toe
+    # ---- Voeg nieuwe recipients toe ----
     add_ok, add_debug = _add_users_and_wait(
         _session, base, tokens, to_users, cc_users, bcc_users,
         max_wait=5.0, sleep_between=0.12)
 
-    # 3. Save via DISPATCHER (subsystem=draft, action=save draft)
+    # ---- Save via DISPATCHER ----
     is_update = bool(draft_id)
     compose_action = "5" if is_update else "0"
 
@@ -1698,6 +1756,7 @@ def message_save_draft(_session=None, _creds=None):
         "ok": ok,
         "status": r.status_code,
         "draft_id": draft_id or None,
+        "auto_found_draft_id": auto_found_draft_id,
         "is_update": is_update,
         "subject": subject,
         "to_count": len(to_users),
