@@ -703,6 +703,28 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
 # ============================================================
 # ROUTE — LIJST
 # ============================================================
+@bp.get("/debug-receivers-html/<msg_id>")
+@with_session
+def debug_receivers_html(msg_id, _session=None, _creds=None):
+    base = base_url(_creds)
+    url = (f"/?module=Messages&file=composeMessage"
+           f"&boxType=draft&composeType=5&msgID={msg_id}")
+    r = _session.request("GET", url)
+    html = r.text
+
+    # Zoek alle receiverSpan blokken ruw
+    spans = re.findall(
+        r'<div[^>]*class="[^"]*receiverSpan\b[^"]*"[^>]*>.*?</div>\s*</div>',
+        html, re.DOTALL
+    )
+
+    return jsonify({
+        "status": r.status_code,
+        "html_length": len(html),
+        "span_count": len(spans),
+        "spans": spans[:5],
+    })
+    
 @bp.get("/debug-scheduled-compose/<msg_id>")
 @with_session
 def debug_scheduled_compose(msg_id, _session=None, _creds=None):
