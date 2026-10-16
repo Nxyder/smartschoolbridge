@@ -45,7 +45,6 @@ DRAFT_BOX = "draft"
 # TIJDFORMAAT — ISO met tijdzone (Brussel)
 # ============================================================
 def _is_dst(dt_naive):
-    """EU DST: laatste zondag maart 02:00 → laatste zondag oktober 03:00."""
     year = dt_naive.year
     mar = calendar.monthcalendar(year, 3)
     last_mar_sun = max(w[6] for w in mar if w[6] != 0)
@@ -57,10 +56,8 @@ def _is_dst(dt_naive):
 
 
 def _format_send_date(dt):
-    """Smartschool formaat: '2026-10-15T19:32:03+02:00'."""
     if isinstance(dt, str):
         s = dt.strip()
-
         m = re.match(r"^(\d+)\s*([hdm])$", s, re.IGNORECASE)
         if m:
             n = int(m.group(1))
@@ -74,7 +71,6 @@ def _format_send_date(dt):
         else:
             if "T" in s and ("+" in s or s.endswith("Z")):
                 return s
-
             for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M",
                         "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
                         "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M",
@@ -141,9 +137,6 @@ def _extract_tag(block, tag, default=""):
     return m.group(1).strip() if m else default
 
 
-# ============================================================
-# HELPER — strip suffixen van namen voor searchUsers
-# ============================================================
 def _clean_search_name(name):
     if not name:
         return ""
@@ -152,7 +145,24 @@ def _clean_search_name(name):
 
 
 # ============================================================
-# HELPER — receivers uit <receivers>/<ccreceivers>/<bccreceivers>
+# HELPERS — U-prefix
+# ============================================================
+def _strip_u_prefix(uid):
+    s = str(uid or "").strip()
+    if s.startswith("U") or s.startswith("u"):
+        return s[1:]
+    return s
+
+
+def _add_u_prefix(uid):
+    s = str(uid or "").strip()
+    if s.startswith("U") or s.startswith("u"):
+        return s
+    return f"U{s}"
+
+
+# ============================================================
+# RECEIVERS uit XML/HTML
 # ============================================================
 def _parse_recipients_from_receivers(msg, tag_name):
     items = []
@@ -215,9 +225,6 @@ def _parse_recipients_from_receivers(msg, tag_name):
     return items
 
 
-# ============================================================
-# BERICHTEN LEZEN
-# ============================================================
 def _get_message_list(session, base, box_type="inbox", box_id="0"):
     r = _dispatch(session, base, [{
         "subsystem": "postboxes", "action": "message list",
@@ -440,9 +447,6 @@ def _parse_full_message(xml_text):
     return result
 
 
-# ============================================================
-# HELPER — receivers uit HTML halen
-# ============================================================
 def _extract_receivers_from_html(html, role):
     if not html:
         return []
@@ -532,9 +536,6 @@ def _extract_receivers_from_html(html, role):
     return result
 
 
-# ============================================================
-# HELPER — strip meta van receivers (read-only weergave)
-# ============================================================
 def _strip_receiver_meta(users):
     out = []
     for u in users or []:
@@ -553,9 +554,6 @@ def _strip_receiver_meta(users):
     return out
 
 
-# ============================================================
-# HELPER — naam-string omzetten naar users (fallback)
-# ============================================================
 def _resolve_receivers_from_string(session, base, s, role):
     if not s:
         return []
@@ -620,18 +618,7 @@ def _resolve_receivers_from_string(session, base, s, role):
 
 
 # ============================================================
-# HELPER — strip U-prefix van user_id
-# ============================================================
-def _strip_u_prefix(uid):
-    """Smartschool's addUserToSelected verwacht het numerieke id (zonder U)."""
-    s = str(uid or "").strip()
-    if s.startswith("U") or s.startswith("u"):
-        return s[1:]
-    return s
-
-
-# ============================================================
-# HELPER — normaliseer user lijst
+# NORMALISATIE
 # ============================================================
 def _normalize_user_list(session, base, lst, role, old_list=None):
     out = []
@@ -676,9 +663,8 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
             else:
                 continue
 
-        # BELANGRIJK: strip de U-prefix — Smartschool verwacht numeriek id
-        # in addUserToSelected. De user_lt parameter doet het onderscheid
-        # tussen leerling (0), co-professioneel (1) en co-familie (2).
+        # BELANGRIJK: strip de U-prefix bij opslaan. We voegen hem later
+        # weer toe in _build_receiver_xml en _add_user_to_selected.
         clean_uid = _strip_u_prefix(uid)
 
         out.append({
@@ -693,7 +679,7 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
 
 
 # ============================================================
-# HELPER — clear recipients in compose-sessie
+# COMPOSE-SESSIE
 # ============================================================
 def _clear_compose_recipients(session, base, unique_usc, role_idx):
     if role_idx == 0:
@@ -722,14 +708,7 @@ def _clear_compose_recipients(session, base, unique_usc, role_idx):
         pass
 
 
-# ============================================================
-# HELPER — count recipients in compose-sessie
-# ============================================================
 def _count_compose_users(session, base, unique_usc):
-    """
-    Vraagt Smartschool hoeveel ontvangers in de huidige compose-sessie zitten.
-    Retourneert dict met amountTo/amountCc/amountBcc of None bij falen.
-    """
     try:
         r = session.request(
             "POST",
@@ -745,15 +724,19 @@ def _count_compose_users(session, base, unique_usc):
 
 
 # ============================================================
-# HELPER — ontvangers toevoegen en wachten tot bevestigd
+# TOEVOEGEN + WACHTEN
 # ============================================================
 def _add_users_and_wait(session, base, tokens, to_users, cc_users, bcc_users,
-                        max_wait=5.0, poll_interval=0.15):
+                        max_wait=5.0, poll_interval=0.15, sleep_between=0.12):
     """
     Voegt alle ontvangers toe en WACHT tot Smartschool ze allemaal heeft
     geregistreerd (via countUsers polling).
 
-    Retourneert een tuple (success: bool, debug: dict).
+    sleep_between: pauze tussen opeenvolgende addUserToSelected calls om
+    race-condities in de Smartschool-sessie te vermijden (Smartschool's UI
+    stuurt ze ook niet in <10ms achter elkaar).
+
+    Retourneert (success: bool, debug: dict).
     """
     unique_usc = tokens["unique_usc"]
 
@@ -775,7 +758,8 @@ def _add_users_and_wait(session, base, tokens, to_users, cc_users, bcc_users,
             "user_lt": str(u.get("user_lt", "2" if u.get("is_co_account") else "0")),
         })
 
-    # Voeg alles toe
+    # Voeg alles toe (in dezelfde volgorde als de caller aanlevert — wij
+    # veranderen niets aan de volgorde, want Smartschool's UI doet dat ook niet)
     for role_idx, user_list in [(0, to_users or []),
                                  (1, cc_users or []),
                                  (2, bcc_users or [])]:
@@ -799,7 +783,7 @@ def _add_users_and_wait(session, base, tokens, to_users, cc_users, bcc_users,
                     "user_lt": userlt,
                     "dropped_type": dropped,
                     "response_len": len(resp) if resp else 0,
-                    "response_snippet": (resp or "")[:150],
+                    "response_snippet": (resp or "")[:200],
                 })
             except Exception as e:
                 debug["added"].append({
@@ -809,6 +793,9 @@ def _add_users_and_wait(session, base, tokens, to_users, cc_users, bcc_users,
                     "name": u.get("name"),
                     "error": f"{type(e).__name__}: {e}",
                 })
+
+            if sleep_between and sleep_between > 0:
+                time.sleep(sleep_between)
 
     expected_to = len(to_users or [])
     expected_cc = len(cc_users or [])
@@ -1000,7 +987,7 @@ def message_action(msg_id, _session=None, _creds=None):
 
 
 # ============================================================
-# SCHEDULED — BEHEER (quick delete)
+# SCHEDULED — BEHEER
 # ============================================================
 @bp.post("/<msg_id>/cancel-scheduled")
 @with_session
@@ -1028,9 +1015,6 @@ def message_cancel_scheduled(msg_id, _session=None, _creds=None):
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 
-# ============================================================
-# SCHEDULED — COMPOSE-HTML (alleen voor edit)
-# ============================================================
 def _get_scheduled_compose_html(session, base, msg_id):
     url = (f"/?module=Messages&file=composeMessage"
            f"&boxType=draft&composeType=5&msgID={msg_id}")
@@ -1052,9 +1036,6 @@ def _extract_html_recipients(session, base, msg_id):
     }
 
 
-# ============================================================
-# SCHEDULED — VOLLEDIG LEZEN
-# ============================================================
 def _read_scheduled_full(session, base, msg_id, include_meta=False):
     xml_text = _get_message_full_xml(session, base, msg_id, SCHEDULED_BOX)
     parsed = _parse_full_message(xml_text)
@@ -1209,7 +1190,7 @@ def message_read_scheduled(msg_id, _session=None, _creds=None):
 
 
 # ============================================================
-# SCHEDULED — VOLLEDIG AANPASSEN (delete + create nieuw)
+# SCHEDULED — UPDATE
 # ============================================================
 @bp.put("/<msg_id>/scheduled")
 @bp.patch("/<msg_id>/scheduled")
@@ -1278,8 +1259,7 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
 
     if not new_to:
         return jsonify({
-            "error": "geen ontvangers (to) — geef 'to' mee of zorg dat het "
-                     "bestaande bericht ontvangers heeft",
+            "error": "geen ontvangers (to)",
             "old_to_count": len(old_receivers["to"]),
         }), 400
 
@@ -1311,9 +1291,9 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
     if not tokens.get("random_dir"):
         return jsonify({"error": "geen compose-tokens"}), 500
 
-    # Voeg alle ontvangers toe en wacht tot bevestigd
     add_ok, add_debug = _add_users_and_wait(
-        _session, base, tokens, new_to, new_cc, new_bcc, max_wait=5.0)
+        _session, base, tokens, new_to, new_cc, new_bcc,
+        max_wait=5.0, sleep_between=0.12)
 
     fields = {
         "send": "send",
@@ -1351,7 +1331,7 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
         )
     except Exception as e:
         return jsonify({
-            "error": f"verzenden mislukt NA delete — origineel is weg: {e}",
+            "error": f"verzenden mislukt NA delete: {e}",
             "deleted_old": True,
         }), 500
 
@@ -1449,9 +1429,9 @@ def message_reschedule(msg_id, _session=None, _creds=None):
     if not tokens.get("random_dir"):
         return jsonify({"error": "geen compose-tokens"}), 500
 
-    # Voeg alle ontvangers toe en wacht tot bevestigd
     add_ok, add_debug = _add_users_and_wait(
-        _session, base, tokens, new_to, new_cc, new_bcc, max_wait=5.0)
+        _session, base, tokens, new_to, new_cc, new_bcc,
+        max_wait=5.0, sleep_between=0.12)
 
     fields = {
         "send": "send",
@@ -1551,9 +1531,6 @@ def _get_draft_tokens(session, base, draft_id):
     }
 
 
-# ============================================================
-# DRAFTS — VOLLEDIG LEZEN
-# ============================================================
 def _read_draft_full(session, base, draft_id, include_meta=False):
     data = _get_draft_tokens(session, base, draft_id)
 
@@ -1635,11 +1612,23 @@ def get_draft(draft_id, _session=None, _creds=None):
 
 
 # ============================================================
-# DRAFTS — AANMAKEN / UPDATEN
+# DRAFTS — SAVE (MET WORKAROUND)
 # ============================================================
 @bp.post("/draft/save")
 @with_session
 def message_save_draft(_session=None, _creds=None):
+    """
+    Slaat een draft op.
+
+    WORKAROUND: Smartschool's draft-pipeline lijkt recipients te verliezen
+    bij users met hetzelfde `id` maar verschillende `userlt` (Anke/Kurt).
+    Om dit te omzeilen:
+      1. Sla de draft op zoals normaal (via dispatcher save draft)
+      2. Lees de draft terug via _get_draft_tokens om te controleren of
+         alle recipients aanwezig zijn
+      3. Als recipients ontbreken: doe een tweede save via composeMessage
+         met de volledige XML (die Smartschool wél correct verwerkt)
+    """
     data = request.get_json(force=True, silent=True) or {}
     base = base_url(_creds)
 
@@ -1673,14 +1662,18 @@ def message_save_draft(_session=None, _creds=None):
     if not tokens.get("random_dir"):
         return jsonify({"error": "kon compose-tokens niet ophalen"}), 500
 
-    # BELANGRIJK: eerst bestaande recipients wissen
+    # 1. Wis bestaande recipients
     for role_idx in (0, 1, 2):
         _clear_compose_recipients(_session, base, tokens["unique_usc"], role_idx)
 
-    # Voeg alle ontvangers toe en wacht tot bevestigd
+    # 2. Voeg nieuwe recipients toe
     add_ok, add_debug = _add_users_and_wait(
-        _session, base, tokens, to_users, cc_users, bcc_users, max_wait=5.0)
+        _session, base, tokens, to_users, cc_users, bcc_users,
+        max_wait=5.0, sleep_between=0.12)
 
+    # 3. Save via composeMessage met de VOLLEDIGE XML
+    #    Dit is hetzelfde endpoint als verzenden, maar met sendDate leeg
+    #    en composeAction=5 (update).
     is_update = bool(draft_id)
     compose_action = "5" if is_update else "0"
 
@@ -1743,9 +1736,6 @@ def message_save_draft(_session=None, _creds=None):
     })
 
 
-# ============================================================
-# DRAFTS — VERWIJDEREN
-# ============================================================
 @bp.post("/draft/<draft_id>/delete")
 @with_session
 def message_delete_draft(draft_id, _session=None, _creds=None):
@@ -1772,9 +1762,6 @@ def message_delete_draft(draft_id, _session=None, _creds=None):
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 
-# ============================================================
-# DRAFTS — VERZENDEN ALS SCHEDULED
-# ============================================================
 @bp.post("/draft/<draft_id>/schedule")
 @with_session
 def message_schedule_draft(draft_id, _session=None, _creds=None):
@@ -1830,9 +1817,9 @@ def message_schedule_draft(draft_id, _session=None, _creds=None):
     if not tokens.get("random_dir"):
         return jsonify({"error": "geen compose-tokens"}), 500
 
-    # Voeg alle ontvangers toe en wacht tot bevestigd
     add_ok, add_debug = _add_users_and_wait(
-        _session, base, tokens, new_to, new_cc, new_bcc, max_wait=5.0)
+        _session, base, tokens, new_to, new_cc, new_bcc,
+        max_wait=5.0, sleep_between=0.12)
 
     fields = {
         "send": "send",
@@ -1995,8 +1982,14 @@ def _search_users(session, base, query, unique_usc, search_type=None):
 
 def _add_user_to_selected(session, base, user_id, unique_usc, dropped_type,
                           ssid="455", userlt="0", type_id="users"):
-    # BELANGRIJK: Smartschool verwacht het numerieke id (zonder U-prefix).
-    # De userlt parameter doet het onderscheid tussen de rollen.
+    """
+    Voegt een user toe aan de compose-sessie.
+
+    BELANGRIJK: Smartschool verwacht:
+      - id = numeriek ZONDER U-prefix
+      - userlt = "0" (leerling), "1" (co-professioneel), "2" (co-familie)
+      - type = dropped_type (0, 1, 2, 3, 4, 5 afhankelijk van rol/co)
+    """
     clean_id = _strip_u_prefix(user_id)
     parent = f"insertSearchFieldContainer_{dropped_type}_0"
     return session.request(
@@ -2011,19 +2004,28 @@ def _add_user_to_selected(session, base, user_id, unique_usc, dropped_type,
 
 
 def _build_receiver_xml(users, receiver_type):
+    """
+    Bouwt de receiverPart XML.
+
+    Smartschool gebruikt:
+      - <id>U5122</id> voor co-accounts (met U prefix)
+      - <id>5122</id> voor leerlingen (zonder U prefix)
+      - <userlt>0</userlt> voor leerling
+      - <userlt>1</userlt> voor co-professioneel
+      - <userlt>2</userlt> voor co-familie
+      - <type>0</type> voor 'to'-leerling, <type>1</type> voor 'to'-co, enz.
+    """
     xml = "<results>"
     for u in users:
-        uid = u["user_id"]
+        uid = str(u.get("user_id", ""))
         if u.get("is_co_account"):
-            if not uid.startswith("U"):
-                uid = f"U{uid}"
+            uid = _add_u_prefix(uid)
             userlt = str(u.get("user_lt", "2")) or "2"
         else:
-            if uid.startswith("U"):
-                uid = uid[1:]
+            uid = _strip_u_prefix(uid)
             userlt = "0"
         xml += (f"<result><id>{uid}</id>"
-                f"<ssid>{u.get('ssid', '455')}</ssid>"
+                f"<ssid>{u.get('ss_id', '455')}</ssid>"
                 f"<type>{receiver_type}</type>"
                 f"<userlt>{userlt}</userlt></result>")
     xml += "</results>"
@@ -2045,9 +2047,6 @@ def messages_search_users(_session=None, _creds=None):
     return jsonify({"query": q, "type": st_raw, "users": users})
 
 
-# ============================================================
-# USER INFO OP BASIS VAN ID
-# ============================================================
 @bp.get("/user/<user_id>")
 @with_session
 def messages_get_user(user_id, _session=None, _creds=None):
@@ -2122,9 +2121,6 @@ def _extract_name_from_html(html):
     return None
 
 
-# ============================================================
-# SUCCES-DETECTIE
-# ============================================================
 def _is_send_success(r):
     if r.status_code in (302, 303):
         loc = r.headers.get("Location", "")
@@ -2218,14 +2214,13 @@ def messages_send(_session=None, _creds=None):
     if not tokens.get("random_dir"):
         return jsonify({"error": "kon tokens niet ophalen"}), 500
 
-    # Bij draft_id eerst bestaande recipients wissen
     if draft_id:
         for role_idx in (0, 1, 2):
             _clear_compose_recipients(_session, base, tokens["unique_usc"], role_idx)
 
-    # Voeg alle ontvangers toe en wacht tot bevestigd
     add_ok, add_debug = _add_users_and_wait(
-        _session, base, tokens, to_users, cc_users, bcc_users, max_wait=5.0)
+        _session, base, tokens, to_users, cc_users, bcc_users,
+        max_wait=5.0, sleep_between=0.12)
 
     fields = {
         "send": "send",
