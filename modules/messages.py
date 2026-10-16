@@ -620,6 +620,17 @@ def _resolve_receivers_from_string(session, base, s, role):
 
 
 # ============================================================
+# HELPER — strip U-prefix van user_id
+# ============================================================
+def _strip_u_prefix(uid):
+    """Smartschool's addUserToSelected verwacht het numerieke id (zonder U)."""
+    s = str(uid or "").strip()
+    if s.startswith("U") or s.startswith("u"):
+        return s[1:]
+    return s
+
+
+# ============================================================
 # HELPER — normaliseer user lijst
 # ============================================================
 def _normalize_user_list(session, base, lst, role, old_list=None):
@@ -665,8 +676,13 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
             else:
                 continue
 
+        # BELANGRIJK: strip de U-prefix — Smartschool verwacht numeriek id
+        # in addUserToSelected. De user_lt parameter doet het onderscheid
+        # tussen leerling (0), co-professioneel (1) en co-familie (2).
+        clean_uid = _strip_u_prefix(uid)
+
         out.append({
-            "user_id": uid,
+            "user_id": clean_uid,
             "name": name,
             "is_co_account": is_co,
             "user_lt": user_lt,
@@ -767,14 +783,17 @@ def _add_users_and_wait(session, base, tokens, to_users, cc_users, bcc_users,
             is_co = u.get("is_co_account", False)
             dropped = DROPPED_TYPE[(role_idx, is_co)]
             userlt = str(u.get("user_lt", "2" if is_co else "0")) or ("2" if is_co else "0")
+            uid_raw = u.get("user_id", "")
+            clean_id = _strip_u_prefix(uid_raw)
             try:
                 resp = _add_user_to_selected(
-                    session, base, u["user_id"], unique_usc, dropped,
+                    session, base, clean_id, unique_usc, dropped,
                     ssid=u.get("ss_id", "455"), userlt=userlt,
                 )
                 debug["added"].append({
                     "role": role_idx,
-                    "user_id": u.get("user_id"),
+                    "user_id_raw": uid_raw,
+                    "user_id_clean": clean_id,
                     "name": u.get("name"),
                     "is_co": is_co,
                     "user_lt": userlt,
@@ -785,7 +804,9 @@ def _add_users_and_wait(session, base, tokens, to_users, cc_users, bcc_users,
             except Exception as e:
                 debug["added"].append({
                     "role": role_idx,
-                    "user_id": u.get("user_id"),
+                    "user_id_raw": uid_raw,
+                    "user_id_clean": clean_id,
+                    "name": u.get("name"),
                     "error": f"{type(e).__name__}: {e}",
                 })
 
@@ -1291,9 +1312,8 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
         return jsonify({"error": "geen compose-tokens"}), 500
 
     # Voeg alle ontvangers toe en wacht tot bevestigd
-    _add_users_and_wait(_session, base, tokens,
-                        new_to, new_cc, new_bcc,
-                        max_wait=5.0)
+    add_ok, add_debug = _add_users_and_wait(
+        _session, base, tokens, new_to, new_cc, new_bcc, max_wait=5.0)
 
     fields = {
         "send": "send",
@@ -1352,6 +1372,8 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
         "cc": new_cc,
         "bcc": new_bcc,
         "status": r_send.status_code,
+        "add_debug": add_debug,
+        "add_ok": add_ok,
     })
 
 
@@ -1428,9 +1450,8 @@ def message_reschedule(msg_id, _session=None, _creds=None):
         return jsonify({"error": "geen compose-tokens"}), 500
 
     # Voeg alle ontvangers toe en wacht tot bevestigd
-    _add_users_and_wait(_session, base, tokens,
-                        new_to, new_cc, new_bcc,
-                        max_wait=5.0)
+    add_ok, add_debug = _add_users_and_wait(
+        _session, base, tokens, new_to, new_cc, new_bcc, max_wait=5.0)
 
     fields = {
         "send": "send",
@@ -1482,6 +1503,8 @@ def message_reschedule(msg_id, _session=None, _creds=None):
         "cc_count": len(new_cc or []),
         "bcc_count": len(new_bcc or []),
         "subject": subject,
+        "add_debug": add_debug,
+        "add_ok": add_ok,
     })
 
 
@@ -1655,9 +1678,8 @@ def message_save_draft(_session=None, _creds=None):
         _clear_compose_recipients(_session, base, tokens["unique_usc"], role_idx)
 
     # Voeg alle ontvangers toe en wacht tot bevestigd
-    _add_users_and_wait(_session, base, tokens,
-                        to_users, cc_users, bcc_users,
-                        max_wait=5.0)
+    add_ok, add_debug = _add_users_and_wait(
+        _session, base, tokens, to_users, cc_users, bcc_users, max_wait=5.0)
 
     is_update = bool(draft_id)
     compose_action = "5" if is_update else "0"
@@ -1716,6 +1738,8 @@ def message_save_draft(_session=None, _creds=None):
         "cc_count": len(cc_users),
         "bcc_count": len(bcc_users),
         "body_length": len(body),
+        "add_debug": add_debug,
+        "add_ok": add_ok,
     })
 
 
@@ -1807,9 +1831,8 @@ def message_schedule_draft(draft_id, _session=None, _creds=None):
         return jsonify({"error": "geen compose-tokens"}), 500
 
     # Voeg alle ontvangers toe en wacht tot bevestigd
-    _add_users_and_wait(_session, base, tokens,
-                        new_to, new_cc, new_bcc,
-                        max_wait=5.0)
+    add_ok, add_debug = _add_users_and_wait(
+        _session, base, tokens, new_to, new_cc, new_bcc, max_wait=5.0)
 
     fields = {
         "send": "send",
@@ -1860,6 +1883,8 @@ def message_schedule_draft(draft_id, _session=None, _creds=None):
         "cc_count": len(new_cc or []),
         "bcc_count": len(new_bcc or []),
         "subject": subject,
+        "add_debug": add_debug,
+        "add_ok": add_ok,
     })
 
 
@@ -1970,10 +1995,13 @@ def _search_users(session, base, query, unique_usc, search_type=None):
 
 def _add_user_to_selected(session, base, user_id, unique_usc, dropped_type,
                           ssid="455", userlt="0", type_id="users"):
+    # BELANGRIJK: Smartschool verwacht het numerieke id (zonder U-prefix).
+    # De userlt parameter doet het onderscheid tussen de rollen.
+    clean_id = _strip_u_prefix(user_id)
     parent = f"insertSearchFieldContainer_{dropped_type}_0"
     return session.request(
         "POST", "/?module=Messages&file=searchUsers&function=addUserToSelected",
-        data={"id": user_id, "typeId": type_id, "type": str(dropped_type),
+        data={"id": clean_id, "typeId": type_id, "type": str(dropped_type),
               "parentNodeId": parent, "ssid": ssid, "userlt": userlt,
               "uniqueUsc": unique_usc},
         headers={"Content-Type": "application/x-www-form-urlencoded",
@@ -2196,9 +2224,8 @@ def messages_send(_session=None, _creds=None):
             _clear_compose_recipients(_session, base, tokens["unique_usc"], role_idx)
 
     # Voeg alle ontvangers toe en wacht tot bevestigd
-    _add_users_and_wait(_session, base, tokens,
-                        to_users, cc_users, bcc_users,
-                        max_wait=5.0)
+    add_ok, add_debug = _add_users_and_wait(
+        _session, base, tokens, to_users, cc_users, bcc_users, max_wait=5.0)
 
     fields = {
         "send": "send",
@@ -2248,6 +2275,8 @@ def messages_send(_session=None, _creds=None):
         "cc_count": len(cc_users),
         "bcc_count": len(bcc_users),
         "body_length": len(body),
+        "add_debug": add_debug,
+        "add_ok": add_ok,
     })
 
 
