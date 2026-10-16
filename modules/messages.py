@@ -454,6 +454,30 @@ def _extract_receivers_from_html(html, role):
 
 
 # ============================================================
+# HELPER — strip meta van receivers (read-only weergave)
+# ============================================================
+def _strip_receiver_meta(users):
+    """
+    Voor read-only weergave: geef enkel de naam terug als platte string.
+    """
+    out = []
+    for u in users or []:
+        if isinstance(u, str):
+            s = u.strip()
+            if s:
+                out.append(s)
+            continue
+        if not isinstance(u, dict):
+            continue
+        name = (u.get("name") or "").strip()
+        if not name:
+            name = (u.get("user_id") or "").strip()
+        if name:
+            out.append(name)
+    return out
+
+
+# ============================================================
 # HELPER — naam-string omzetten naar users (fallback)
 # ============================================================
 def _resolve_receivers_from_string(session, base, s, role):
@@ -590,7 +614,14 @@ def messages_scheduled(_session=None, _creds=None):
 def message_read(msg_id, _session=None, _creds=None):
     box = request.args.get("box", "inbox")
     xml_text = _get_message_full_xml(_session, base_url(_creds), msg_id, box)
-    return jsonify(_parse_full_message(xml_text))
+    parsed = _parse_full_message(xml_text)
+
+    # Read-only weergave: platte namen, geen meta
+    parsed["to_list"]  = _strip_receiver_meta(parsed.get("to_list", []))
+    parsed["cc_list"]  = _strip_receiver_meta(parsed.get("cc_list", []))
+    parsed["bcc_list"] = _strip_receiver_meta(parsed.get("bcc_list", []))
+
+    return jsonify(parsed)
 
 
 @bp.post("/<msg_id>/read")
@@ -730,63 +761,64 @@ def message_cancel_scheduled(msg_id, _session=None, _creds=None):
 # ============================================================
 # SCHEDULED — VOLLEDIG LEZEN (ALLEEN VIA DISPATCHER, veilig)
 # ============================================================
-def _read_scheduled_full(session, base, msg_id):
+def _read_scheduled_full(session, base, msg_id, include_meta=False):
     """
     Leest een scheduled bericht VOLLEDIG via de dispatcher.
     Roept NOOIT composeMessage aan — dat zou het bericht naar draft verplaatsen.
+
+    include_meta=False -> receivers bevatten enkel namen (read-only weergave)
+    include_meta=True  -> receivers bevatten user_id/name/is_co_account/ss_id
+                          (nodig voor bewerken / reschedule)
     """
     # 1. Volledige XML ophalen via dispatcher
     xml_text = _get_message_full_xml(session, base, msg_id, SCHEDULED_BOX)
     parsed = _parse_full_message(xml_text)
 
-    # 2. Probeer eventueel receivers uit de compose HTML — MAAR dat verplaatst het.
-    # We doen dit NIET. We vertrouwen volledig op de XML.
+    def _pack(rlist):
+        packed = [
+            {
+                "user_id": r.get("user_id", ""),
+                "name": r.get("name", ""),
+                "is_co_account": (r.get("user_id", "") or "").startswith("U"),
+                "ss_id": "455",
+            }
+            for r in rlist
+        ]
+        if include_meta:
+            return packed
+        return _strip_receiver_meta(packed)
+
     receivers = {
-        "to": [
-            {
-                "user_id": r.get("user_id", ""),
-                "name": r.get("name", ""),
-                "is_co_account": (r.get("user_id", "").startswith("U")),
-                "ss_id": "455",
-            }
-            for r in parsed.get("to_list", [])
-        ],
-        "cc": [
-            {
-                "user_id": r.get("user_id", ""),
-                "name": r.get("name", ""),
-                "is_co_account": (r.get("user_id", "").startswith("U")),
-                "ss_id": "455",
-            }
-            for r in parsed.get("cc_list", [])
-        ],
-        "bcc": [
-            {
-                "user_id": r.get("user_id", ""),
-                "name": r.get("name", ""),
-                "is_co_account": (r.get("user_id", "").startswith("U")),
-                "ss_id": "455",
-            }
-            for r in parsed.get("bcc_list", [])
-        ],
+        "to":  _pack(parsed.get("to_list", [])),
+        "cc":  _pack(parsed.get("cc_list", [])),
+        "bcc": _pack(parsed.get("bcc_list", [])),
     }
 
-    # 3. Fallback: als de lists leeg zijn maar de strings niet, resolve via search
-    if not receivers["to"]:
-        old_to = parsed.get("to", "") or ""
-        if old_to and not re.match(r"^\s*U?\d+\s*$", old_to):
-            receivers["to"] = _resolve_receivers_from_string(
-                session, base, old_to, "to")
-    if not receivers["cc"]:
-        old_cc = parsed.get("cc", "") or ""
-        if old_cc and not re.match(r"^\s*U?\d+\s*$", old_cc):
-            receivers["cc"] = _resolve_receivers_from_string(
-                session, base, old_cc, "cc")
-    if not receivers["bcc"]:
-        old_bcc = parsed.get("bcc", "") or ""
-        if old_bcc and not re.match(r"^\s*U?\d+\s*$", old_bcc):
-            receivers["bcc"] = _resolve_receivers_from_string(
-                session, base, old_bcc, "bcc")
+    if include_meta:
+        # Fallback: resolve strings via searchUsers (alleen zinvol bij meta)
+        if not receivers["to"]:
+            old_to = parsed.get("to", "") or ""
+            if old_to and not re.match(r"^\s*U?\d+\s*$", old_to):
+                receivers["to"] = _resolve_receivers_from_string(
+                    session, base, old_to, "to")
+        if not receivers["cc"]:
+            old_cc = parsed.get("cc", "") or ""
+            if old_cc and not re.match(r"^\s*U?\d+\s*$", old_cc):
+                receivers["cc"] = _resolve_receivers_from_string(
+                    session, base, old_cc, "cc")
+        if not receivers["bcc"]:
+            old_bcc = parsed.get("bcc", "") or ""
+            if old_bcc and not re.match(r"^\s*U?\d+\s*$", old_bcc):
+                receivers["bcc"] = _resolve_receivers_from_string(
+                    session, base, old_bcc, "bcc")
+    else:
+        # Read-only: als de XML alleen een platte string gaf, gebruik die direct
+        if not receivers["to"]:
+            receivers["to"] = _strip_receiver_meta([parsed.get("to", "")])
+        if not receivers["cc"]:
+            receivers["cc"] = _strip_receiver_meta([parsed.get("cc", "")])
+        if not receivers["bcc"]:
+            receivers["bcc"] = _strip_receiver_meta([parsed.get("bcc", "")])
 
     return {
         "html": "",
@@ -797,6 +829,7 @@ def _read_scheduled_full(session, base, msg_id):
         "send_date": parsed.get("send_date", "") or "",
         "orig_msg_id": "",
         "old": parsed,
+        "include_meta": include_meta,
     }
 
 
@@ -804,8 +837,13 @@ def _read_scheduled_full(session, base, msg_id):
 @with_session
 def message_read_scheduled(msg_id, _session=None, _creds=None):
     base = base_url(_creds)
+
+    # ?edit=1 of ?include_meta=1 -> volledige meta (voor bewerken)
+    include_meta = (request.args.get("edit") == "1"
+                    or request.args.get("include_meta") == "1")
+
     try:
-        info = _read_scheduled_full(_session, base, msg_id)
+        info = _read_scheduled_full(_session, base, msg_id, include_meta=include_meta)
     except Exception as e:
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
@@ -822,6 +860,7 @@ def message_read_scheduled(msg_id, _session=None, _creds=None):
         "to_full": info["receivers"]["to"],
         "cc_full": info["receivers"]["cc"],
         "bcc_full": info["receivers"]["bcc"],
+        "include_meta": include_meta,
         "has_compose_html": False,
         "fields_found": [],
     })
@@ -837,9 +876,9 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
     data = request.get_json(force=True, silent=True) or {}
     base = base_url(_creds)
 
-    # Lees origineel via dispatcher (veilig)
+    # Lees origineel via dispatcher (veilig) — META NODIG voor delete+recreate
     try:
-        info = _read_scheduled_full(_session, base, msg_id)
+        info = _read_scheduled_full(_session, base, msg_id, include_meta=True)
     except Exception as e:
         return jsonify({"error": f"kon bericht niet lezen: {e}"}), 500
 
@@ -1021,9 +1060,9 @@ def message_reschedule(msg_id, _session=None, _creds=None):
 
     base = base_url(_creds)
 
-    # Lees origineel via dispatcher
+    # Lees origineel via dispatcher — META NODIG voor herverzenden
     try:
-        info = _read_scheduled_full(_session, base, msg_id)
+        info = _read_scheduled_full(_session, base, msg_id, include_meta=True)
     except Exception as e:
         return jsonify({"error": f"kon bericht niet lezen: {e}"}), 500
 
