@@ -57,9 +57,7 @@ def _is_dst(dt_naive):
 
 
 def _format_send_date(dt):
-    """
-    Smartschool formaat: '2026-10-15T19:32:03+02:00'
-    """
+    """Smartschool formaat: '2026-10-15T19:32:03+02:00'."""
     if isinstance(dt, str):
         s = dt.strip()
 
@@ -147,11 +145,6 @@ def _extract_tag(block, tag, default=""):
 # HELPER — strip suffixen van namen voor searchUsers
 # ============================================================
 def _clean_search_name(name):
-    """
-    Smartschool toont namen soms als 'Odne Bontemps - 4NAW'.
-    searchUsers verwacht 'Odne Bontemps'.
-    Strip alles na ' - XXX' of ' – XXX'.
-    """
     if not name:
         return ""
     name = re.sub(r"\s*[-–]\s*[A-Za-z0-9]+\s*$", "", name).strip()
@@ -159,18 +152,9 @@ def _clean_search_name(name):
 
 
 # ============================================================
-# HELPER — receivers uit de <receivers>/<ccreceivers>/<bccreceivers> containers
+# HELPER — receivers uit <receivers>/<ccreceivers>/<bccreceivers>
 # ============================================================
 def _parse_recipients_from_receivers(msg, tag_name):
-    """
-    Parseert:
-      <receivers><to>Naam</to>...</receivers>
-      <ccreceivers><to>Naam</to>...</ccreceivers>
-      <bccreceivers><to>Naam</to>...</bccreceivers>
-
-    LET OP: Smartschool gebruikt in de praktijk <to> als kind-tag
-    in ALLE drie de containers (dus ook in ccreceivers/bccreceivers).
-    """
     items = []
     seen = set()
 
@@ -189,7 +173,6 @@ def _parse_recipients_from_receivers(msg, tag_name):
             continue
 
         found_any = False
-
         for recip_tag in (tag_name, "to"):
             for recip in container.findall(recip_tag):
                 txt = (recip.text or "").strip()
@@ -461,10 +444,6 @@ def _parse_full_message(xml_text):
 # HELPER — receivers uit HTML halen
 # ============================================================
 def _extract_receivers_from_html(html, role):
-    """
-    Parseert receiverSpan divs uit de Smartschool compose-HTML.
-    role: 0 = to, 1 = cc, 2 = bcc
-    """
     if not html:
         return []
 
@@ -537,8 +516,6 @@ def _extract_receivers_from_html(html, role):
         else:
             user_id = real_id
 
-        # Dedup op (user_id, user_lt, name) — zodat Anke (userlt=2) en
-        # Kurt (userlt=1) beide behouden blijven.
         key = (user_id, userlt, name.lower())
         if key in seen:
             continue
@@ -662,8 +639,6 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
         name = (u.get("name") or u.get("display_name") or "").strip()
         is_co = bool(u.get("is_co_account"))
 
-        # user_lt: 1 = professionele co, 2 = niet-professionele co,
-        # 0 = hoofdaccount. Fallback op basis van is_co_account.
         user_lt = u.get("user_lt")
         if user_lt is None or user_lt == "":
             user_lt = "2" if is_co else "0"
@@ -705,12 +680,6 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
 # HELPER — clear recipients in compose-sessie
 # ============================================================
 def _clear_compose_recipients(session, base, unique_usc, role_idx):
-    """
-    Wist alle ontvangers van een bepaald veld (to/cc/bcc) in de
-    huidige compose-sessie.
-
-    role_idx: 0 = to, 1 = cc, 2 = bcc
-    """
     if role_idx == 0:
         field = "to"
         unique_key = f"msgcompose{unique_usc}"
@@ -735,6 +704,81 @@ def _clear_compose_recipients(session, base, unique_usc, role_idx):
         }])
     except Exception:
         pass
+
+
+# ============================================================
+# HELPER — count recipients in compose-sessie
+# ============================================================
+def _count_compose_users(session, base, unique_usc):
+    """
+    Vraagt Smartschool hoeveel ontvangers in de huidige compose-sessie zitten.
+    Retourneert dict met amountTo/amountCc/amountBcc of None bij falen.
+    """
+    try:
+        r = session.request(
+            "POST",
+            "/?module=Messages&file=searchUsers&function=countUsers",
+            data={"uniqueUsc": unique_usc},
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "X-Requested-With": "XMLHttpRequest",
+                     "Origin": base, "Referer": base + "/"},
+        )
+        return json.loads(r.text)
+    except Exception:
+        return None
+
+
+# ============================================================
+# HELPER — ontvangers toevoegen en wachten tot bevestigd
+# ============================================================
+def _add_users_and_wait(session, base, tokens, to_users, cc_users, bcc_users,
+                        max_wait=5.0, poll_interval=0.15):
+    """
+    Voegt alle ontvangers toe en WACHT tot Smartschool ze allemaal heeft
+    geregistreerd (via countUsers polling).
+
+    Retourneert True als alle gebruikers bevestigd zijn, anders False.
+    """
+    unique_usc = tokens["unique_usc"]
+
+    # Voeg alles toe
+    for role_idx, user_list in [(0, to_users or []),
+                                 (1, cc_users or []),
+                                 (2, bcc_users or [])]:
+        for u in user_list:
+            is_co = u.get("is_co_account", False)
+            dropped = DROPPED_TYPE[(role_idx, is_co)]
+            userlt = str(u.get("user_lt", "2" if is_co else "0")) or ("2" if is_co else "0")
+            _add_user_to_selected(
+                session, base, u["user_id"], unique_usc, dropped,
+                ssid=u.get("ss_id", "455"), userlt=userlt,
+            )
+
+    # Verwachte aantallen
+    expected_to = len(to_users or [])
+    expected_cc = len(cc_users or [])
+    expected_bcc = len(bcc_users or [])
+
+    # Poll tot Smartschool de juiste aantallen rapporteert
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        counts = _count_compose_users(session, base, unique_usc)
+        if counts:
+            try:
+                got_to = int(counts.get("amountTo", 0))
+                got_cc = int(counts.get("amountCc", 0))
+                got_bcc = int(counts.get("amountBcc", 0))
+            except (ValueError, TypeError):
+                got_to = got_cc = got_bcc = 0
+
+            if (got_to >= expected_to and
+                got_cc >= expected_cc and
+                got_bcc >= expected_bcc):
+                return True
+
+        time.sleep(poll_interval)
+
+    return False
 
 
 # ============================================================
@@ -1205,14 +1249,10 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
     if not tokens.get("random_dir"):
         return jsonify({"error": "geen compose-tokens"}), 500
 
-    for role_idx, user_list in [(0, new_to), (1, new_cc), (2, new_bcc)]:
-        for u in user_list:
-            is_co = u.get("is_co_account", False)
-            dropped = DROPPED_TYPE[(role_idx, is_co)]
-            userlt = str(u.get("user_lt", "2" if is_co else "0")) or ("2" if is_co else "0")
-            _add_user_to_selected(_session, base, u["user_id"],
-                                  tokens["unique_usc"], dropped,
-                                  ssid=u.get("ss_id", "455"), userlt=userlt)
+    # Voeg alle ontvangers toe en wacht tot bevestigd
+    _add_users_and_wait(_session, base, tokens,
+                        new_to, new_cc, new_bcc,
+                        max_wait=5.0)
 
     fields = {
         "send": "send",
@@ -1346,14 +1386,10 @@ def message_reschedule(msg_id, _session=None, _creds=None):
     if not tokens.get("random_dir"):
         return jsonify({"error": "geen compose-tokens"}), 500
 
-    for role_idx, user_list in [(0, new_to), (1, new_cc or []), (2, new_bcc or [])]:
-        for u in user_list:
-            is_co = u.get("is_co_account", False)
-            dropped = DROPPED_TYPE[(role_idx, is_co)]
-            userlt = str(u.get("user_lt", "2" if is_co else "0")) or ("2" if is_co else "0")
-            _add_user_to_selected(_session, base, u["user_id"],
-                                  tokens["unique_usc"], dropped,
-                                  ssid=u.get("ss_id", "455"), userlt=userlt)
+    # Voeg alle ontvangers toe en wacht tot bevestigd
+    _add_users_and_wait(_session, base, tokens,
+                        new_to, new_cc, new_bcc,
+                        max_wait=5.0)
 
     fields = {
         "send": "send",
@@ -1573,19 +1609,14 @@ def message_save_draft(_session=None, _creds=None):
     if not tokens.get("random_dir"):
         return jsonify({"error": "kon compose-tokens niet ophalen"}), 500
 
-    # BELANGRIJK: eerst bestaande recipients wissen, anders blijven
-    # oude + nieuwe door elkaar staan.
+    # BELANGRIJK: eerst bestaande recipients wissen
     for role_idx in (0, 1, 2):
         _clear_compose_recipients(_session, base, tokens["unique_usc"], role_idx)
 
-    for role_idx, user_list in [(0, to_users), (1, cc_users), (2, bcc_users)]:
-        for u in user_list:
-            is_co = u.get("is_co_account", False)
-            dropped = DROPPED_TYPE[(role_idx, is_co)]
-            userlt = str(u.get("user_lt", "2" if is_co else "0")) or ("2" if is_co else "0")
-            _add_user_to_selected(_session, base, u["user_id"],
-                                  tokens["unique_usc"], dropped,
-                                  ssid=u.get("ss_id", "455"), userlt=userlt)
+    # Voeg alle ontvangers toe en wacht tot bevestigd
+    _add_users_and_wait(_session, base, tokens,
+                        to_users, cc_users, bcc_users,
+                        max_wait=5.0)
 
     is_update = bool(draft_id)
     compose_action = "5" if is_update else "0"
@@ -1734,14 +1765,10 @@ def message_schedule_draft(draft_id, _session=None, _creds=None):
     if not tokens.get("random_dir"):
         return jsonify({"error": "geen compose-tokens"}), 500
 
-    for role_idx, user_list in [(0, new_to), (1, new_cc), (2, new_bcc)]:
-        for u in user_list:
-            is_co = u.get("is_co_account", False)
-            dropped = DROPPED_TYPE[(role_idx, is_co)]
-            userlt = str(u.get("user_lt", "2" if is_co else "0")) or ("2" if is_co else "0")
-            _add_user_to_selected(_session, base, u["user_id"],
-                                  tokens["unique_usc"], dropped,
-                                  ssid=u.get("ss_id", "455"), userlt=userlt)
+    # Voeg alle ontvangers toe en wacht tot bevestigd
+    _add_users_and_wait(_session, base, tokens,
+                        new_to, new_cc, new_bcc,
+                        max_wait=5.0)
 
     fields = {
         "send": "send",
@@ -1841,7 +1868,6 @@ def _search_users_single(session, base, query, unique_usc, search_type):
         ss_id = _extract_tag(block, "ssID", "455")
         classname = _extract_tag(block, "classname", "")
 
-        # user_lt: 0 = hoofd, 1 = professionele co, 2 = niet-professionele co
         is_co = (user_lt in ("1", "2")) or bool(co_name)
 
         if is_co and co_name:
@@ -1854,10 +1880,7 @@ def _search_users_single(session, base, query, unique_usc, search_type):
         full_name = f"Co: {display_name}" if is_co else display_name
 
         if is_co:
-            if user_lt == "1":
-                type_label = "co (professioneel)"
-            else:
-                type_label = "co (familie)"
+            type_label = "co (professioneel)" if user_lt == "1" else "co (familie)"
         elif user_type == "U":
             type_label = f"leerling - {classname}" if classname else "leerling"
         elif user_type == "T":
@@ -1925,7 +1948,6 @@ def _build_receiver_xml(users, receiver_type):
         if u.get("is_co_account"):
             if not uid.startswith("U"):
                 uid = f"U{uid}"
-            # Gebruik echte userlt (1 = professioneel, 2 = familie)
             userlt = str(u.get("user_lt", "2")) or "2"
         else:
             if uid.startswith("U"):
@@ -2127,19 +2149,15 @@ def messages_send(_session=None, _creds=None):
     if not tokens.get("random_dir"):
         return jsonify({"error": "kon tokens niet ophalen"}), 500
 
-    # BELANGRIJK: bij draft_id eerst bestaande recipients wissen
+    # Bij draft_id eerst bestaande recipients wissen
     if draft_id:
         for role_idx in (0, 1, 2):
             _clear_compose_recipients(_session, base, tokens["unique_usc"], role_idx)
 
-    for role_idx, user_list in [(0, to_users), (1, cc_users), (2, bcc_users)]:
-        for u in user_list:
-            is_co = u.get("is_co_account", False)
-            dropped = DROPPED_TYPE[(role_idx, is_co)]
-            userlt = str(u.get("user_lt", "2" if is_co else "0")) or ("2" if is_co else "0")
-            _add_user_to_selected(_session, base, u["user_id"], tokens["unique_usc"],
-                                  dropped, ssid=u.get("ss_id", "455"),
-                                  userlt=userlt)
+    # Voeg alle ontvangers toe en wacht tot bevestigd
+    _add_users_and_wait(_session, base, tokens,
+                        to_users, cc_users, bcc_users,
+                        max_wait=5.0)
 
     fields = {
         "send": "send",
