@@ -154,13 +154,6 @@ def _strip_u_prefix(uid):
     return s
 
 
-def _add_u_prefix(uid):
-    s = str(uid or "").strip()
-    if s.startswith("U") or s.startswith("u"):
-        return s
-    return f"U{s}"
-
-
 # ============================================================
 # RECEIVERS uit XML/HTML
 # ============================================================
@@ -663,8 +656,7 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
             else:
                 continue
 
-        # BELANGRIJK: strip de U-prefix bij opslaan. We voegen hem later
-        # weer toe in _build_receiver_xml en _add_user_to_selected.
+        # BELANGRIJK: strip U-prefix — Smartschool verwacht numeriek id
         clean_uid = _strip_u_prefix(uid)
 
         out.append({
@@ -732,9 +724,7 @@ def _add_users_and_wait(session, base, tokens, to_users, cc_users, bcc_users,
     Voegt alle ontvangers toe en WACHT tot Smartschool ze allemaal heeft
     geregistreerd (via countUsers polling).
 
-    sleep_between: pauze tussen opeenvolgende addUserToSelected calls om
-    race-condities in de Smartschool-sessie te vermijden (Smartschool's UI
-    stuurt ze ook niet in <10ms achter elkaar).
+    sleep_between: pauze tussen opeenvolgende addUserToSelected calls.
 
     Retourneert (success: bool, debug: dict).
     """
@@ -758,8 +748,6 @@ def _add_users_and_wait(session, base, tokens, to_users, cc_users, bcc_users,
             "user_lt": str(u.get("user_lt", "2" if u.get("is_co_account") else "0")),
         })
 
-    # Voeg alles toe (in dezelfde volgorde als de caller aanlevert — wij
-    # veranderen niets aan de volgorde, want Smartschool's UI doet dat ook niet)
     for role_idx, user_list in [(0, to_users or []),
                                  (1, cc_users or []),
                                  (2, bcc_users or [])]:
@@ -802,7 +790,6 @@ def _add_users_and_wait(session, base, tokens, to_users, cc_users, bcc_users,
     expected_bcc = len(bcc_users or [])
     debug["expected"] = {"to": expected_to, "cc": expected_cc, "bcc": expected_bcc}
 
-    # Poll tot Smartschool de juiste aantallen rapporteert
     deadline = time.time() + max_wait
     while time.time() < deadline:
         counts = _count_compose_users(session, base, unique_usc)
@@ -1612,22 +1599,22 @@ def get_draft(draft_id, _session=None, _creds=None):
 
 
 # ============================================================
-# DRAFTS — SAVE (MET WORKAROUND)
+# DRAFTS — SAVE (DISPATCHER-BASED)
 # ============================================================
 @bp.post("/draft/save")
 @with_session
 def message_save_draft(_session=None, _creds=None):
     """
-    Slaat een draft op.
+    Slaat een draft op via de DISPATCHER (subsystem=draft, action=save draft).
 
-    WORKAROUND: Smartschool's draft-pipeline lijkt recipients te verliezen
-    bij users met hetzelfde `id` maar verschillende `userlt` (Anke/Kurt).
-    Om dit te omzeilen:
-      1. Sla de draft op zoals normaal (via dispatcher save draft)
-      2. Lees de draft terug via _get_draft_tokens om te controleren of
-         alle recipients aanwezig zijn
-      3. Als recipients ontbreken: doe een tweede save via composeMessage
-         met de volledige XML (die Smartschool wél correct verwerkt)
+    BELANGRIJK: Smartschool verwacht GEEN receiverPart XML in deze call.
+    De recipients zitten al in de Smartschool-sessie via addUserToSelected.
+    De dispatcher leest ze uit de sessie en slaat ze op.
+
+    Dit is exact wat Smartschool's eigen UI doet:
+      1. GET composeMessage → opent compose-sessie (uniqueUsc, randomDir)
+      2. addUserToSelected voor elke recipient
+      3. dispatcher 'save draft' → leest recipients uit sessie, slaat op
     """
     data = request.get_json(force=True, silent=True) or {}
     base = base_url(_creds)
@@ -1651,6 +1638,9 @@ def message_save_draft(_session=None, _creds=None):
     if not to_users:
         return jsonify({"error": "minstens één ontvanger (to) verplicht"}), 400
 
+    # BELANGRIJK: de draft bestaat al → we openen de compose-sessie van die
+    # draft (via _get_draft_tokens). Dat geeft ons de juiste uniqueUsc/randomDir
+    # die Smartschool voor DEZE draft heeft gereserveerd.
     if draft_id:
         try:
             tokens = _get_draft_tokens(_session, base, draft_id)
@@ -1662,7 +1652,7 @@ def message_save_draft(_session=None, _creds=None):
     if not tokens.get("random_dir"):
         return jsonify({"error": "kon compose-tokens niet ophalen"}), 500
 
-    # 1. Wis bestaande recipients
+    # 1. Wis bestaande recipients in de sessie
     for role_idx in (0, 1, 2):
         _clear_compose_recipients(_session, base, tokens["unique_usc"], role_idx)
 
@@ -1671,58 +1661,41 @@ def message_save_draft(_session=None, _creds=None):
         _session, base, tokens, to_users, cc_users, bcc_users,
         max_wait=5.0, sleep_between=0.12)
 
-    # 3. Save via composeMessage met de VOLLEDIGE XML
-    #    Dit is hetzelfde endpoint als verzenden, maar met sendDate leeg
-    #    en composeAction=5 (update).
+    # 3. Save via DISPATCHER (subsystem=draft, action=save draft)
     is_update = bool(draft_id)
     compose_action = "5" if is_update else "0"
 
-    fields = {
-        "send": "refresh",
-        "origMsgID": tokens.get("orig_msg_id", "0") if is_update else "0",
-        "composeAction": compose_action,
-        "randomDir": tokens["random_dir"],
-        "uniqueUsc": tokens["unique_usc"],
-        "showTab": "tab1Container",
-        "delFile": "0",
-        "composeType": "5" if is_update else "0",
-        "msgID": draft_id if is_update else "0",
-        "msgFormSelectedTab": "",
-        "sendDate": "",
-        "subject": subject,
-        "bcc": "1" if bcc_users else "0",
-        "message": body,
-        "encryptedSender": tokens["encrypted_sender"],
-    }
-    if to_users:
-        fields["receiverPart0"] = _build_receiver_xml(to_users, 0)
-    if cc_users:
-        fields["receiverPart1"] = _build_receiver_xml(cc_users, 1)
-    if bcc_users:
-        fields["receiverPart2"] = _build_receiver_xml(bcc_users, 2)
-
-    m = MultipartEncoder(fields=fields)
     try:
-        r = _session.request(
-            "POST",
-            "/?module=Messages&file=composeMessage&boxType=draft&composeType=5&msgID="
-            + (draft_id if is_update else "undefined"),
-            data=m,
-            headers={"Content-Type": m.content_type,
-                     "Origin": base, "Referer": base + "/"},
-            allow_redirects=False,
-        )
+        r = _dispatch(_session, base, [{
+            "subsystem": "draft",
+            "action": "save draft",
+            "params": {
+                "draftID": draft_id if is_update else "0",
+                "send": "refresh",
+                "origMsgID": "0",
+                "composeAction": compose_action,
+                "randomDir": tokens["random_dir"],
+                "uniqueUsc": tokens["unique_usc"],
+                "subject": subject,
+                "bcc": "1" if bcc_users else "0",
+                "composeType": "0",
+                "msgID": "0",
+                "message": body,
+                "preload_type": "",
+                "encryptedSender": tokens["encrypted_sender"],
+                "sendDate": "",
+            },
+        }])
     except Exception as e:
         return jsonify({"error": f"opslaan mislukt: {e}"}), 500
 
-    ok = r.status_code in (200, 302, 303)
-    reason = f"HTTP {r.status_code}"
-    if r.status_code in (302, 303):
-        reason = f"redirect → {r.headers.get('Location', '')}"
+    body_low = (r.text or "").lower()
+    ok = ("<status>ok</status>" in body_low or
+          "<success>1</success>" in body_low or
+          (r.status_code in (200, 204) and "error" not in body_low))
 
     return jsonify({
         "ok": ok,
-        "reason": reason,
         "status": r.status_code,
         "draft_id": draft_id or None,
         "is_update": is_update,
@@ -1731,11 +1704,15 @@ def message_save_draft(_session=None, _creds=None):
         "cc_count": len(cc_users),
         "bcc_count": len(bcc_users),
         "body_length": len(body),
+        "response_preview": (r.text or "")[:300],
         "add_debug": add_debug,
         "add_ok": add_ok,
     })
 
 
+# ============================================================
+# DRAFTS — DELETE
+# ============================================================
 @bp.post("/draft/<draft_id>/delete")
 @with_session
 def message_delete_draft(draft_id, _session=None, _creds=None):
@@ -1762,6 +1739,9 @@ def message_delete_draft(draft_id, _session=None, _creds=None):
         return jsonify({"error": f"{type(e).__name__}: {e}"}), 500
 
 
+# ============================================================
+# DRAFTS — SCHEDULE
+# ============================================================
 @bp.post("/draft/<draft_id>/schedule")
 @with_session
 def message_schedule_draft(draft_id, _session=None, _creds=None):
@@ -1982,14 +1962,6 @@ def _search_users(session, base, query, unique_usc, search_type=None):
 
 def _add_user_to_selected(session, base, user_id, unique_usc, dropped_type,
                           ssid="455", userlt="0", type_id="users"):
-    """
-    Voegt een user toe aan de compose-sessie.
-
-    BELANGRIJK: Smartschool verwacht:
-      - id = numeriek ZONDER U-prefix
-      - userlt = "0" (leerling), "1" (co-professioneel), "2" (co-familie)
-      - type = dropped_type (0, 1, 2, 3, 4, 5 afhankelijk van rol/co)
-    """
     clean_id = _strip_u_prefix(user_id)
     parent = f"insertSearchFieldContainer_{dropped_type}_0"
     return session.request(
@@ -2004,25 +1976,16 @@ def _add_user_to_selected(session, base, user_id, unique_usc, dropped_type,
 
 
 def _build_receiver_xml(users, receiver_type):
-    """
-    Bouwt de receiverPart XML.
-
-    Smartschool gebruikt:
-      - <id>U5122</id> voor co-accounts (met U prefix)
-      - <id>5122</id> voor leerlingen (zonder U prefix)
-      - <userlt>0</userlt> voor leerling
-      - <userlt>1</userlt> voor co-professioneel
-      - <userlt>2</userlt> voor co-familie
-      - <type>0</type> voor 'to'-leerling, <type>1</type> voor 'to'-co, enz.
-    """
     xml = "<results>"
     for u in users:
         uid = str(u.get("user_id", ""))
         if u.get("is_co_account"):
-            uid = _add_u_prefix(uid)
+            if not uid.startswith("U"):
+                uid = f"U{uid}"
             userlt = str(u.get("user_lt", "2")) or "2"
         else:
-            uid = _strip_u_prefix(uid)
+            if uid.startswith("U"):
+                uid = uid[1:]
             userlt = "0"
         xml += (f"<result><id>{uid}</id>"
                 f"<ssid>{u.get('ss_id', '455')}</ssid>"
@@ -2047,6 +2010,9 @@ def messages_search_users(_session=None, _creds=None):
     return jsonify({"query": q, "type": st_raw, "users": users})
 
 
+# ============================================================
+# USER INFO
+# ============================================================
 @bp.get("/user/<user_id>")
 @with_session
 def messages_get_user(user_id, _session=None, _creds=None):
