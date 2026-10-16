@@ -7,7 +7,6 @@ import calendar
 import json
 import re
 import secrets
-import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -40,6 +39,13 @@ DROPPED_TYPE = {
 
 SCHEDULED_BOX = "scheduled"
 DRAFT_BOX = "draft"
+
+# Max bytes die we van een enkele searchUsers-response accepteren.
+# Alles groter = weigeren, om OOM op de gratis Render tier te vermijden.
+MAX_SEARCH_BYTES = 2 * 1024 * 1024  # 2 MB per query
+
+# Standaard request timeout in seconden.
+REQUEST_TIMEOUT = 15
 
 
 # ============================================================
@@ -130,7 +136,8 @@ def _dispatch(session, base, commands):
         "Referer": base + "/",
     }
     return session.request("POST", "/?module=Messages&file=dispatcher",
-                           data=f"command={encoded}", headers=headers)
+                           data=f"command={encoded}", headers=headers,
+                           timeout=REQUEST_TIMEOUT)
 
 
 def _extract_tag(block, tag, default=""):
@@ -709,6 +716,7 @@ def _count_compose_users(session, base, unique_usc):
             headers={"Content-Type": "application/x-www-form-urlencoded",
                      "X-Requested-With": "XMLHttpRequest",
                      "Origin": base, "Referer": base + "/"},
+            timeout=REQUEST_TIMEOUT,
         )
         return json.loads(r.text)
     except Exception:
@@ -928,7 +936,8 @@ def message_attachment(msg_id, file_id, _session=None, _creds=None):
     url = f"/?module=Messages&file=download&fileID={file_id}&target=0"
     r = _session.request("GET", url,
                          headers={"Referer": base + "/"},
-                         allow_redirects=True)
+                         allow_redirects=True,
+                         timeout=60)
     if r.status_code != 200:
         return jsonify({"error": f"status {r.status_code}"}), 502
     return send_file(BytesIO(r.content), as_attachment=True,
@@ -997,7 +1006,7 @@ def message_cancel_scheduled(msg_id, _session=None, _creds=None):
 def _get_scheduled_compose_html(session, base, msg_id):
     url = (f"/?module=Messages&file=composeMessage"
            f"&boxType=draft&composeType=5&msgID={msg_id}")
-    r = session.request("GET", url)
+    r = session.request("GET", url, timeout=REQUEST_TIMEOUT)
     if r.status_code != 200:
         return None
     return r.text
@@ -1307,6 +1316,7 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
             headers={"Content-Type": m.content_type,
                      "Origin": base, "Referer": base + "/"},
             allow_redirects=False,
+            timeout=30,
         )
     except Exception as e:
         return jsonify({
@@ -1445,6 +1455,7 @@ def message_reschedule(msg_id, _session=None, _creds=None):
             headers={"Content-Type": m.content_type,
                      "Origin": base, "Referer": base + "/"},
             allow_redirects=False,
+            timeout=30,
         )
     except Exception as e:
         return jsonify({"error": f"verzenden mislukt: {e}"}), 500
@@ -1473,7 +1484,7 @@ def message_reschedule(msg_id, _session=None, _creds=None):
 def _get_draft_tokens(session, base, draft_id):
     url = (f"/?module=Messages&file=composeMessage"
            f"&boxType=draft&composeType=5&msgID={draft_id}")
-    r = session.request("GET", url)
+    r = session.request("GET", url, timeout=REQUEST_TIMEOUT)
     html = r.text
 
     fields = {}
@@ -1639,7 +1650,7 @@ def _find_existing_draft(session, base, subject, to_users, cc_users, bcc_users):
 
 
 # ============================================================
-# DRAFTS — SAVE (DISPATCHER + AUTO-FIND BESTAANDE DRAFT)
+# DRAFTS — SAVE
 # ============================================================
 @bp.post("/draft/save")
 @with_session
@@ -1868,6 +1879,7 @@ def message_schedule_draft(draft_id, _session=None, _creds=None):
             headers={"Content-Type": m.content_type,
                      "Origin": base, "Referer": base + "/"},
             allow_redirects=False,
+            timeout=30,
         )
     except Exception as e:
         return jsonify({"error": f"verzenden mislukt: {e}"}), 500
@@ -1896,6 +1908,7 @@ def _get_compose_tokens(session, base):
     r = session.request(
         "GET",
         "/?module=Messages&file=composeMessage&boxType=inbox&composeType=0&msgID=undefined",
+        timeout=REQUEST_TIMEOUT,
     )
     fields = {}
     for m in re.finditer(r'<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"[^>]*>', r.text):
@@ -1907,21 +1920,58 @@ def _get_compose_tokens(session, base):
     }
 
 
+def _read_response_safely(r, max_bytes=MAX_SEARCH_BYTES):
+    """
+    Leest de response in chunks en stopt zodra max_bytes is bereikt.
+    Retourneert (text, truncated).
+    """
+    chunks = []
+    total = 0
+    try:
+        for chunk in r.iter_content(chunk_size=16384):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > max_bytes:
+                chunks.append(chunk[:max(0, max_bytes - (total - len(chunk)))])
+                return b"".join(chunks).decode("utf-8", errors="ignore"), True
+            chunks.append(chunk)
+    except Exception:
+        # Bij netwerkfout: retourneer wat we hebben
+        pass
+    finally:
+        try:
+            r.close()
+        except Exception:
+            pass
+    return b"".join(chunks).decode("utf-8", errors="ignore"), False
+
+
 def _search_users_single(session, base, query, unique_usc, search_type):
     parent = f"insertSearchFieldContainer_{search_type}_0"
-    r = session.request(
-        "POST", "/?module=Messages&file=searchUsers",
-        data={"val": query, "type": str(search_type),
-              "parentNodeId": parent,
-              "xml": "<results></results>",
-              "uniqueUsc": unique_usc},
-        headers={"Content-Type": "application/x-www-form-urlencoded",
-                 "X-Requested-With": "XMLHttpRequest",
-                 "Origin": base, "Referer": base + "/"},
-    )
+    try:
+        r = session.request(
+            "POST", "/?module=Messages&file=searchUsers",
+            data={"val": query, "type": str(search_type),
+                  "parentNodeId": parent,
+                  "xml": "<results></results>",
+                  "uniqueUsc": unique_usc},
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "X-Requested-With": "XMLHttpRequest",
+                     "Origin": base, "Referer": base + "/"},
+            timeout=REQUEST_TIMEOUT,
+            stream=True,
+        )
+    except Exception:
+        return []
+
+    text, truncated = _read_response_safely(r)
+    if truncated:
+        # Response te groot — geef niets terug in plaats van OOM
+        return []
 
     users = []
-    for um in re.finditer(r"<user>(.*?)</user>", r.text, re.DOTALL):
+    for um in re.finditer(r"<user>(.*?)</user>", text, re.DOTALL):
         block = um.group(1)
         uid = _extract_tag(block, "userID")
         if not uid:
@@ -2006,6 +2056,7 @@ def _add_user_to_selected(session, base, user_id, unique_usc, dropped_type,
         headers={"Content-Type": "application/x-www-form-urlencoded",
                  "X-Requested-With": "XMLHttpRequest",
                  "Origin": base, "Referer": base + "/"},
+        timeout=REQUEST_TIMEOUT,
     ).text
 
 
@@ -2042,162 +2093,6 @@ def messages_search_users(_session=None, _creds=None):
     tokens = _get_compose_tokens(_session, base)
     users = _search_users(_session, base, q, tokens["unique_usc"], st)
     return jsonify({"query": q, "type": st_raw, "users": users})
-
-
-# ============================================================
-# ALLE USERS — alfabet-sweep met 7 dagen cache
-# ============================================================
-_ALL_USERS_CACHE = {
-    "ts": 0,
-    "data": None,
-    "lock": threading.Lock(),
-}
-_ALL_USERS_TTL = 7 * 24 * 60 * 60  # 7 dagen
-
-
-def _sweep_all_users(session, base):
-    """
-    Doorzoekt Smartschool's searchUsers met een set queries die
-    vrijwel alle users dekken (klinkers + veelvoorkomende delen).
-    Retourneert een compacte lijst zonder dubbele entries.
-    """
-    queries = [
-        'a', 'e', 'i', 'o', 'u',
-        'ij', 'aa', 'ee', 'oo', 'uu', 'ie', 'ei', 'ou', 'au', 'eu',
-        'de', 'van', 'den', 'der', 'el', 'ar', 'er', 'en', 'an', 'in', 'on',
-        's', 't', 'n', 'r', 'm', 'k', 'l', 'b', 'd', 'p', 'h', 'v', 'w',
-        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
-        ' ', "'", '-',
-    ]
-
-    try:
-        tokens = _get_compose_tokens(session, base)
-    except Exception:
-        return None
-
-    unique_usc = tokens.get("unique_usc")
-    if not unique_usc:
-        return None
-
-    seen = {}
-
-    for q in queries:
-        try:
-            users = _search_users(session, base, q, unique_usc, "all")
-        except Exception:
-            continue
-
-        for u in users:
-            uid = str(u.get("user_id", "")).strip()
-            if not uid:
-                continue
-
-            user_lt = str(u.get("user_lt", "0"))
-            key = (uid, user_lt)
-
-            if key in seen:
-                continue
-
-            seen[key] = {
-                "user_id": uid,
-                "name": u.get("display_name") or u.get("name") or "",
-                "raw_name": u.get("raw_name") or "",
-                "coaccount_name": u.get("coaccount_name") or "",
-                "is_co_account": bool(u.get("is_co_account")),
-                "user_type": u.get("user_type", "U"),
-                "user_lt": user_lt,
-                "ss_id": u.get("ss_id", "455"),
-                "classname": u.get("classname") or "",
-                "type_label": u.get("type_label") or "",
-            }
-
-    return list(seen.values())
-
-
-@bp.get("/all-users")
-@with_session
-def messages_all_users(_session=None, _creds=None):
-    """
-    Geeft alle users terug die via searchUsers gevonden kunnen worden.
-
-    Query params:
-      ?refresh=1   → forceer nieuwe sweep (bypass 7d cache)
-      ?type=...    → optioneel filter op user_type (U/T/G/...) of 'co'
-      ?search=...  → optioneel substring filter op naam
-
-    Response:
-      {
-        "count": 1234,
-        "cached": true,
-        "age_seconds": 42,
-        "users": [
-          {
-            "user_id": "5060",
-            "name": "Ethan Brasselet",
-            "is_co_account": false,
-            "user_lt": "0",
-            "ss_id": "455",
-            "classname": "Klas: 4NAW",
-            "type_label": "leerling - Klas: 4NAW"
-          },
-          ...
-        ]
-      }
-    """
-    base = base_url(_creds)
-    force = request.args.get("refresh") == "1"
-    filter_type = request.args.get("type", "").strip().lower()
-    filter_search = request.args.get("search", "").strip().lower()
-
-    now = time.time()
-
-    # ---- Cache check ----
-    with _ALL_USERS_CACHE["lock"]:
-        cached = _ALL_USERS_CACHE["data"]
-        age = now - _ALL_USERS_CACHE["ts"]
-        if not force and cached is not None and age < _ALL_USERS_TTL:
-            users = cached
-            cached_flag = True
-        else:
-            users = None
-            cached_flag = False
-
-    # ---- Cache miss: sweep ----
-    if users is None:
-        users = _sweep_all_users(_session, base)
-        if users is None:
-            return jsonify({"error": "kon users niet ophalen"}), 502
-
-        with _ALL_USERS_CACHE["lock"]:
-            _ALL_USERS_CACHE["data"] = users
-            _ALL_USERS_CACHE["ts"] = time.time()
-            age = 0
-        cached_flag = False
-
-    # ---- Filters ----
-    if filter_type:
-        if filter_type == "co":
-            users = [u for u in users if u["is_co_account"]]
-        else:
-            users = [u for u in users if (u["user_type"] or "").lower() == filter_type]
-
-    if filter_search:
-        users = [
-            u for u in users
-            if filter_search in (u["name"] or "").lower()
-            or filter_search in (u["raw_name"] or "").lower()
-            or filter_search in (u["coaccount_name"] or "").lower()
-            or filter_search in (u["user_id"] or "").lower()
-        ]
-
-    users = sorted(users, key=lambda u: (u["name"] or "").lower())
-
-    return jsonify({
-        "count": len(users),
-        "cached": cached_flag,
-        "age_seconds": int(age),
-        "users": users,
-    })
 
 
 # ============================================================
@@ -2410,6 +2305,7 @@ def messages_send(_session=None, _creds=None):
         headers={"Content-Type": m.content_type, "Origin": base,
                  "Referer": base + "/"},
         allow_redirects=False,
+        timeout=60,
     )
 
     ok, reason = _is_send_success(r)
@@ -2576,6 +2472,7 @@ def upload_smartschool(_session=None, _creds=None):
                 "Origin": base,
                 "Referer": base + "/",
             },
+            timeout=120,
         )
 
         if r.status_code not in (200, 201):
