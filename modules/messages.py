@@ -186,8 +186,6 @@ def _parse_recipients_from_receivers(msg, tag_name):
         if container is None:
             continue
 
-        # Meerdere <to>/<cc>/<bcc> tags kunnen in de container zitten
-        # (of als directe tekst in container)
         found_any = False
         for recip in container.findall(tag_name):
             txt = (recip.text or "").strip()
@@ -366,10 +364,7 @@ def _parse_full_message(xml_text):
         def _parse_recipients_legacy(tag_name):
             items = []
             seen = set()
-            # Skip de lege <to /> direct onder <message>
             for recip in msg.findall(f".//{tag_name}"):
-                parent = None
-                # ET heeft geen parent-ref; we filteren op text-inhoud
                 uid = recip.get("id") or recip.get("userID") or ""
                 name = recip.get("name") or ""
                 txt = (recip.text or "").strip()
@@ -468,20 +463,30 @@ def _parse_full_message(xml_text):
 # HELPER — receivers uit HTML halen
 # ============================================================
 def _extract_receivers_from_html(html, role):
+    """
+    Parseert receiverSpan divs uit de Smartschool compose-HTML.
+
+    role: 0 = to, 1 = cc, 2 = bcc
+
+    De HTML gebruikt zowel enkele als dubbele quotes voor attributen,
+    dus de regexen zijn daarop aangepast.
+    """
     if not html:
         return []
 
     result = []
+    seen = set()
 
     span_re = re.compile(
-        r'<div\b(?P<attrs>[^>]*?\bclass="[^"]*receiverSpan\b[^"]*"[^>]*)>'
+        r'<div\b(?P<attrs>[^>]*?\bclass=["\']receiverSpan\b[^"\']*["\'][^>]*)>'
         r'(?P<inner>.*?)'
-        r'(?=<div\b[^>]*\bclass="[^"]*receiverSpan\b|</div>\s*</div>|\Z)',
+        r'(?=<div\b[^>]*\bclass=["\']receiverSpan\b|</div>\s*</div>|\Z)',
         re.DOTALL | re.IGNORECASE,
     )
 
     def get_attr(attrs, name):
-        m = re.search(rf'\b{name}="([^"]*)"', attrs, re.IGNORECASE)
+        # accepteert zowel ' als " rond de waarde
+        m = re.search(rf'\b{name}=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
         return m.group(1) if m else ""
 
     for span in span_re.finditer(html):
@@ -514,20 +519,14 @@ def _extract_receivers_from_html(html, role):
         if this_role != role:
             continue
 
+        # Naam zoeken — zowel div als span, zowel ' als "
         name = ""
         nm = re.search(
-            r'<div[^>]*class="[^"]*receiverSpanName[^"]*"[^>]*>(.*?)</div>',
+            r'<(?:div|span)[^>]*class=["\']receiverSpanName[^"\']*["\'][^>]*>(.*?)</(?:div|span)>',
             inner, re.DOTALL | re.IGNORECASE,
         )
         if nm:
             name = nm.group(1)
-        else:
-            nm = re.search(
-                r'<span[^>]*class="[^"]*receiverSpanName[^"]*"[^>]*>(.*?)</span>',
-                inner, re.DOTALL | re.IGNORECASE,
-            )
-            if nm:
-                name = nm.group(1)
 
         name = re.sub(r"<[^>]+>", "", name)
         name = (
@@ -545,6 +544,11 @@ def _extract_receivers_from_html(html, role):
             user_id = idatt if idatt.startswith("U") else f"U{real_id}"
         else:
             user_id = real_id
+
+        key = (user_id, is_co)
+        if key in seen:
+            continue
+        seen.add(key)
 
         result.append({
             "user_id": user_id,
@@ -613,30 +617,25 @@ def _resolve_receivers_from_string(session, base, s, role):
         needle_full = name.lower()
 
         best = None
-        # Exact match op display_name
         for u in users:
             if (u.get("display_name") or "").lower() == needle:
                 best = u
                 break
-        # Exact match op raw_name
         if not best:
             for u in users:
                 if (u.get("raw_name") or "").lower() == needle:
                     best = u
                     break
-        # Substring match op display_name
         if not best:
             for u in users:
                 if needle in (u.get("display_name") or "").lower():
                     best = u
                     break
-        # Substring match op volledige naam (met suffix)
         if not best:
             for u in users:
                 if needle_full in (u.get("display_name") or "").lower():
                     best = u
                     break
-        # Laatste redmiddel: eerste resultaat
         if not best:
             best = users[0]
 
@@ -703,108 +702,6 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
 # ============================================================
 # ROUTE — LIJST
 # ============================================================
-@bp.get("/debug-receivers-html/<msg_id>")
-@with_session
-def debug_receivers_html(msg_id, _session=None, _creds=None):
-    base = base_url(_creds)
-    url = (f"/?module=Messages&file=composeMessage"
-           f"&boxType=draft&composeType=5&msgID={msg_id}")
-    r = _session.request("GET", url)
-    html = r.text
-
-    # Zoek alle receiverSpan blokken ruw
-    spans = re.findall(
-        r'<div[^>]*class="[^"]*receiverSpan\b[^"]*"[^>]*>.*?</div>\s*</div>',
-        html, re.DOTALL
-    )
-
-    return jsonify({
-        "status": r.status_code,
-        "html_length": len(html),
-        "span_count": len(spans),
-        "spans": spans[:5],
-    })
-    
-@bp.get("/debug-scheduled-compose/<msg_id>")
-@with_session
-def debug_scheduled_compose(msg_id, _session=None, _creds=None):
-    base = base_url(_creds)
-    results = {}
-    for boxtype in ("scheduled", "draft"):
-        url = (f"/?module=Messages&file=composeMessage"
-               f"&boxType={boxtype}&composeType=5&msgID={msg_id}")
-        try:
-            r = _session.request("GET", url)
-            html = r.text
-            results[boxtype] = {
-                "status": r.status_code,
-                "length": len(html),
-                "has_receiverSpan": "receiverSpan" in html,
-                "has_toco": 'id="toco"' in html,
-                "to":  _extract_receivers_from_html(html, role=0),
-                "cc":  _extract_receivers_from_html(html, role=1),
-                "bcc": _extract_receivers_from_html(html, role=2),
-            }
-        except Exception as e:
-            results[boxtype] = {"error": f"{type(e).__name__}: {e}"}
-    return jsonify(results)
-    
-@bp.get("/debug-scheduled-tree/<msg_id>")
-@with_session
-def debug_scheduled_tree(msg_id, _session=None, _creds=None):
-    base = base_url(_creds)
-    xml_text = _get_message_full_xml(_session, base, msg_id, SCHEDULED_BOX)
-
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError as e:
-        return jsonify({"error": f"parse: {e}", "raw": xml_text[:2000]})
-
-    msg = root.find(".//message")
-    if msg is None:
-        return jsonify({"error": "no <message>", "raw": xml_text[:2000]})
-
-    # Dump alle directe children van <message>
-    children = []
-    for child in msg:
-        children.append({
-            "tag": child.tag,
-            "text": (child.text or "")[:200],
-            "attrib": dict(child.attrib),
-            "children": [
-                {"tag": c.tag, "text": (c.text or "")[:200], "attrib": dict(c.attrib)}
-                for c in child
-            ],
-        })
-
-    # Test de find direct
-    receivers = msg.find("receivers")
-    ccreceivers = msg.find("ccreceivers")
-    bccreceivers = msg.find("bccreceivers")
-
-    return jsonify({
-        "message_children": children,
-        "find_receivers": {
-            "found": receivers is not None,
-            "text": (receivers.text or "") if receivers is not None else None,
-            "children": [
-                {"tag": c.tag, "text": (c.text or "")[:200]} for c in (receivers or [])
-            ] if receivers is not None else [],
-        },
-        "find_ccreceivers": {
-            "found": ccreceivers is not None,
-            "children": [
-                {"tag": c.tag, "text": (c.text or "")[:200]} for c in (ccreceivers or [])
-            ] if ccreceivers is not None else [],
-        },
-        "find_bccreceivers": {
-            "found": bccreceivers is not None,
-            "children": [
-                {"tag": c.tag, "text": (c.text or "")[:200]} for c in (bccreceivers or [])
-            ] if bccreceivers is not None else [],
-        },
-    })
-    
 @bp.get("")
 @with_session
 def messages_list(_session=None, _creds=None):
@@ -977,28 +874,70 @@ def message_cancel_scheduled(msg_id, _session=None, _creds=None):
 
 
 # ============================================================
+# SCHEDULED — COMPOSE-HTML (alleen voor uitlezen ontvangers)
+# ============================================================
+def _get_scheduled_compose_html(session, base, msg_id):
+    """
+    Haalt de compose-HTML op voor een scheduled bericht via boxType=draft.
+    boxType=scheduled geeft een 500, dus we moeten draft gebruiken.
+
+    LET OP: dit verplaatst het bericht naar 'In ontwerp' als het nog
+    in 'Gepland' stond. De caller moet het daarna terugzetten.
+    """
+    url = (f"/?module=Messages&file=composeMessage"
+           f"&boxType=draft&composeType=5&msgID={msg_id}")
+    r = session.request("GET", url)
+    if r.status_code != 200:
+        return None
+    return r.text
+
+
+def _extract_html_recipients(session, base, msg_id):
+    """
+    Haalt de ontvangers uit de compose-HTML (inclusief co-accounts).
+    Retourneert dict met to/cc/bcc lijsten van dicts.
+    """
+    html = _get_scheduled_compose_html(session, base, msg_id)
+    if not html:
+        return {"to": [], "cc": [], "bcc": []}
+
+    return {
+        "to":  _extract_receivers_from_html(html, role=0),
+        "cc":  _extract_receivers_from_html(html, role=1),
+        "bcc": _extract_receivers_from_html(html, role=2),
+    }
+
+
+# ============================================================
 # SCHEDULED — VOLLEDIG LEZEN (ALLEEN VIA DISPATCHER, veilig)
 # ============================================================
 def _read_scheduled_full(session, base, msg_id, include_meta=False):
     """
     Leest een scheduled bericht VOLLEDIG via de dispatcher.
-    Roept NOOIT composeMessage aan — dat zou het bericht naar draft verplaatsen.
 
     include_meta=False -> receivers bevatten enkel namen (read-only weergave)
     include_meta=True  -> receivers bevatten user_id/name/is_co_account/ss_id
                           (nodig voor bewerken / reschedule)
+
+    Ontvangers komen uit twee bronnen:
+      1. De message-XML <receivers>-container (hoofd-ontvangers)
+      2. De compose-HTML via boxType=draft (inclusief co-accounts)
     """
     # 1. Volledige XML ophalen via dispatcher
     xml_text = _get_message_full_xml(session, base, msg_id, SCHEDULED_BOX)
     parsed = _parse_full_message(xml_text)
+
+    # 2. Compose-HTML voor co-accounts (en fallback voor hoofd)
+    html_recipients = _extract_html_recipients(session, base, msg_id)
 
     def _pack(rlist):
         packed = [
             {
                 "user_id": r.get("user_id", ""),
                 "name": r.get("name", ""),
-                "is_co_account": (r.get("user_id", "") or "").startswith("U"),
-                "ss_id": "455",
+                "is_co_account": bool(r.get("is_co_account"))
+                                 or (r.get("user_id", "") or "").startswith("U"),
+                "ss_id": r.get("ss_id", "455"),
             }
             for r in rlist
         ]
@@ -1006,54 +945,96 @@ def _read_scheduled_full(session, base, msg_id, include_meta=False):
             return packed
         return _strip_receiver_meta(packed)
 
+    def _merge(xml_list, html_list):
+        """
+        Merge XML- en HTML-recipients. HTML heeft voorrang op naam,
+        maar XML kan user_id bevatten die HTML niet heeft.
+        Dedup op (user_id, is_co_account).
+        """
+        merged = []
+        seen = set()
+
+        # Eerst HTML (rijkere data, inclusief co-accounts)
+        for r in html_list:
+            key = (r.get("user_id", ""), bool(r.get("is_co_account")))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append({
+                "user_id": r.get("user_id", ""),
+                "name": r.get("name", ""),
+                "is_co_account": bool(r.get("is_co_account")),
+                "ss_id": r.get("ss_id", "455"),
+            })
+
+        # Dan XML (aanvullen waar HTML niks had)
+        for r in xml_list:
+            uid = r.get("user_id", "") or ""
+            key = (uid, bool(r.get("is_co_account")))
+            if key in seen:
+                continue
+            # Als de naam overeenkomt met een HTML-entry, skip
+            name = (r.get("name") or "").strip()
+            if name:
+                dup_name = False
+                for m in merged:
+                    if (m.get("name") or "").strip().lower() == name.lower():
+                        dup_name = True
+                        break
+                if dup_name:
+                    continue
+            seen.add(key)
+            merged.append({
+                "user_id": uid,
+                "name": name,
+                "is_co_account": bool(r.get("is_co_account")),
+                "ss_id": r.get("ss_id", "455"),
+            })
+
+        return merged
+
+    to_list  = _merge(parsed.get("to_list", []),  html_recipients["to"])
+    cc_list  = _merge(parsed.get("cc_list", []),  html_recipients["cc"])
+    bcc_list = _merge(parsed.get("bcc_list", []), html_recipients["bcc"])
+
     receivers = {
-        "to":  _pack(parsed.get("to_list", [])),
-        "cc":  _pack(parsed.get("cc_list", [])),
-        "bcc": _pack(parsed.get("bcc_list", [])),
+        "to":  _pack(to_list),
+        "cc":  _pack(cc_list),
+        "bcc": _pack(bcc_list),
     }
 
+    # Als include_meta=True en er zijn entries met naam maar zonder user_id,
+    # probeer user_id te resolven via searchUsers
     if include_meta:
-        # Fallback: resolve strings via searchUsers (voor user_id's)
-        if receivers["to"] and not receivers["to"][0].get("user_id"):
-            old_to = ", ".join(r["name"] for r in receivers["to"] if r.get("name"))
-            if old_to:
-                resolved = _resolve_receivers_from_string(session, base, old_to, "to")
-                if resolved:
-                    receivers["to"] = resolved
-        elif not receivers["to"]:
-            old_to = parsed.get("to", "") or ""
-            if old_to and not re.match(r"^\s*U?\d+\s*$", old_to):
-                receivers["to"] = _resolve_receivers_from_string(session, base, old_to, "to")
-
-        if receivers["cc"] and not receivers["cc"][0].get("user_id"):
-            old_cc = ", ".join(r["name"] for r in receivers["cc"] if r.get("name"))
-            if old_cc:
-                resolved = _resolve_receivers_from_string(session, base, old_cc, "cc")
-                if resolved:
-                    receivers["cc"] = resolved
-        elif not receivers["cc"]:
-            old_cc = parsed.get("cc", "") or ""
-            if old_cc and not re.match(r"^\s*U?\d+\s*$", old_cc):
-                receivers["cc"] = _resolve_receivers_from_string(session, base, old_cc, "cc")
-
-        if receivers["bcc"] and not receivers["bcc"][0].get("user_id"):
-            old_bcc = ", ".join(r["name"] for r in receivers["bcc"] if r.get("name"))
-            if old_bcc:
-                resolved = _resolve_receivers_from_string(session, base, old_bcc, "bcc")
-                if resolved:
-                    receivers["bcc"] = resolved
-        elif not receivers["bcc"]:
-            old_bcc = parsed.get("bcc", "") or ""
-            if old_bcc and not re.match(r"^\s*U?\d+\s*$", old_bcc):
-                receivers["bcc"] = _resolve_receivers_from_string(session, base, old_bcc, "bcc")
-    else:
-        # Read-only: als de XML alleen een platte string gaf, gebruik die direct
-        if not receivers["to"]:
-            receivers["to"] = _strip_receiver_meta([parsed.get("to", "")])
-        if not receivers["cc"]:
-            receivers["cc"] = _strip_receiver_meta([parsed.get("cc", "")])
-        if not receivers["bcc"]:
-            receivers["bcc"] = _strip_receiver_meta([parsed.get("bcc", "")])
+        for role_key in ("to", "cc", "bcc"):
+            rlist = receivers[role_key]
+            if not rlist:
+                continue
+            if all(r.get("user_id") for r in rlist):
+                continue
+            names_str = ", ".join(r["name"] for r in rlist if r.get("name") and not r.get("user_id"))
+            if not names_str:
+                continue
+            resolved = _resolve_receivers_from_string(session, base, names_str, role_key)
+            if resolved:
+                # Vervang alleen de entries zonder user_id
+                new_list = []
+                used = set()
+                for r in rlist:
+                    if r.get("user_id"):
+                        new_list.append(r)
+                    else:
+                        # Zoek match in resolved
+                        match = None
+                        for rr in resolved:
+                            if (rr.get("name") or "").lower() == (r.get("name") or "").lower():
+                                match = rr
+                                break
+                        if match:
+                            new_list.append(match)
+                        else:
+                            new_list.append(r)
+                receivers[role_key] = new_list
 
     return {
         "html": "",
@@ -1640,7 +1621,6 @@ def messages_get_user(user_id, _session=None, _creds=None):
 
     tried = []
 
-    # Zoek via searchUsers — dit verplaatst niks, is puur lezen
     try:
         tokens = _get_compose_tokens(_session, base)
         if tokens.get("unique_usc"):
