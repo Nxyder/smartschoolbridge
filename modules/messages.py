@@ -164,8 +164,12 @@ def _parse_recipients_from_receivers(msg, tag_name):
     """
     Parseert:
       <receivers><to>Naam</to>...</receivers>
-      <ccreceivers><cc>Naam</cc>...</ccreceivers>
-      <bccreceivers><bcc>Naam</bcc>...</bccreceivers>
+      <ccreceivers><to>Naam</to>...</ccreceivers>
+      <bccreceivers><to>Naam</to>...</bccreceivers>
+
+    LET OP: Smartschool gebruikt in de praktijk <to> als kind-tag
+    in ALLE drie de containers (dus ook in ccreceivers/bccreceivers).
+    We zoeken daarom in zowel de verwachte tag als in "to".
 
     Retourneert lijst van {user_id, name}.
     """
@@ -187,24 +191,29 @@ def _parse_recipients_from_receivers(msg, tag_name):
             continue
 
         found_any = False
-        for recip in container.findall(tag_name):
-            txt = (recip.text or "").strip()
-            if not txt:
-                continue
-            found_any = True
-            m = re.match(r"(.+?)\s*<\s*(U?\d+)\s*>", txt)
-            if m:
-                name = m.group(1).strip()
-                uid = m.group(2)
-            else:
-                name = txt
-                uid = ""
-            key = (name, uid)
-            if key in seen:
-                continue
-            seen.add(key)
-            items.append({"user_id": uid, "name": name})
 
+        # Zoek in zowel de verwachte tag als in "to" (fallback).
+        # Dedup binnen (name, uid) zodat we niet dubbel toevoegen.
+        for recip_tag in (tag_name, "to"):
+            for recip in container.findall(recip_tag):
+                txt = (recip.text or "").strip()
+                if not txt:
+                    continue
+                found_any = True
+                m = re.match(r"(.+?)\s*<\s*(U?\d+)\s*>", txt)
+                if m:
+                    name = m.group(1).strip()
+                    uid = m.group(2)
+                else:
+                    name = txt
+                    uid = ""
+                key = (name, uid)
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append({"user_id": uid, "name": name})
+
+        # Soms staat de tekst direct in de container, zonder child tags
         if not found_any:
             txt = (container.text or "").strip()
             if txt:
@@ -264,10 +273,10 @@ def _get_message_full_xml(session, base, msg_id, box_type="inbox"):
     r = _dispatch(session, base, [
         {"subsystem": "postboxes", "action": "show message",
          "params": {"msgID": msg_id, "boxType": box_type,
-                    "limitList": "false", "limitListNr": "1000"}},
+                    "limitList": "false", "limitListNr": "501"}},
         {"subsystem": "postboxes", "action": "attachment list",
          "params": {"msgID": msg_id, "boxType": box_type,
-                    "limitList": "false", "limitListNr": "1000"}},
+                    "limitList": "false", "limitListNr": "501"}},
     ])
     return r.text
 
@@ -698,41 +707,6 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
 # ============================================================
 # ROUTE — LIJST
 # ============================================================
-@bp.get("/debug-receivers/<msg_id>")
-@with_session
-def debug_receivers(msg_id, _session=None, _creds=None):
-    base = base_url(_creds)
-    results = {}
-
-    # Call 1: standaard (krijg waarschijnlijk 1 to)
-    r1 = _dispatch(_session, base, [
-        {"subsystem": "postboxes", "action": "show message",
-         "params": {"msgID": msg_id, "boxType": SCHEDULED_BOX,
-                    "limitList": "true"}},
-    ])
-    results["call1_raw_xml_snippet"] = r1.text[:3000]
-
-    # Call 2: limitList=false + limitListNr=501 (Smartschool's eigen truc)
-    r2 = _dispatch(_session, base, [
-        {"subsystem": "postboxes", "action": "show message",
-         "params": {"msgID": msg_id, "boxType": SCHEDULED_BOX,
-                    "limitList": "false", "limitListNr": "501"}},
-    ])
-    results["call2_raw_xml_snippet"] = r2.text[:3000]
-
-    # Tel hoeveel <to> tags in elke call
-    def _count(xml, tag):
-        return len(re.findall(rf"<{tag}>[^<]+</{tag}>", xml))
-
-    results["call1_to_count"] = _count(r1.text, "to")
-    results["call1_cc_count"] = _count(r1.text, "cc")
-    results["call1_bcc_count"] = _count(r1.text, "bcc")
-    results["call2_to_count"] = _count(r2.text, "to")
-    results["call2_cc_count"] = _count(r2.text, "cc")
-    results["call2_bcc_count"] = _count(r2.text, "bcc")
-
-    return jsonify(results)
-    
 @bp.get("")
 @with_session
 def messages_list(_session=None, _creds=None):
@@ -1602,7 +1576,7 @@ def _build_receiver_xml(users, receiver_type):
                 uid = uid[1:]
             userlt = "0"
         xml += (f"<result><id>{uid}</id>"
-                f"<ssid>{u.get('ss_id', '455')}</ssid>"
+                f"<ssid>{u.get('ssid', '455')}</ssid>"
                 f"<type>{receiver_type}</type>"
                 f"<userlt>{userlt}</userlt></result>")
     xml += "</results>"
