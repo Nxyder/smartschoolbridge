@@ -192,8 +192,6 @@ def _parse_recipients_from_receivers(msg, tag_name):
 
         found_any = False
 
-        # Zoek in zowel de verwachte tag als in "to" (fallback).
-        # Dedup binnen (name, uid) zodat we niet dubbel toevoegen.
         for recip_tag in (tag_name, "to"):
             for recip in container.findall(recip_tag):
                 txt = (recip.text or "").strip()
@@ -213,7 +211,6 @@ def _parse_recipients_from_receivers(msg, tag_name):
                 seen.add(key)
                 items.append({"user_id": uid, "name": name})
 
-        # Soms staat de tekst direct in de container, zonder child tags
         if not found_any:
             txt = (container.text or "").strip()
             if txt:
@@ -707,25 +704,6 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
 # ============================================================
 # ROUTE — LIJST
 # ============================================================
-@bp.get("/debug-current-xml/<msg_id>")
-@with_session
-def debug_current_xml(msg_id, _session=None, _creds=None):
-    base = base_url(_creds)
-    xml_text = _get_message_full_xml(_session, base, msg_id, SCHEDULED_BOX)
-    # Toon alleen het <receivers>-blok
-    import re
-    m = re.search(r"<receivers>.*?</receivers>", xml_text, re.DOTALL)
-    m2 = re.search(r"<ccreceivers>.*?</ccreceivers>", xml_text, re.DOTALL)
-    m3 = re.search(r"<bccreceivers>.*?</bccreceivers>", xml_text, re.DOTALL)
-    m4 = re.search(r"<totalNrOtherToReciviers>[^<]*</totalNrOtherToReciviers>", xml_text)
-
-    return jsonify({
-        "receivers_raw": m.group(0) if m else None,
-        "ccreceivers_raw": m2.group(0) if m2 else None,
-        "bccreceivers_raw": m3.group(0) if m3 else None,
-        "other_to": m4.group(0) if m4 else None,
-    })
-    
 @bp.get("")
 @with_session
 def messages_list(_session=None, _creds=None):
@@ -944,10 +922,6 @@ def _read_scheduled_full(session, base, msg_id, include_meta=False):
                           Dit VERPLAATST het bericht naar 'In ontwerp'.
                           Nodig voor volledige meta (co-accounts, user_ids).
                           Wordt gebruikt bij edit en reschedule.
-
-    Bij include_meta=True wordt het bericht na het lezen in draft gezet.
-    De caller (update_scheduled / reschedule) doet daarna delete+create
-    om het terug in scheduled te zetten.
     """
     # 1. XML via dispatcher (snel, geen verplaatsing)
     xml_text = _get_message_full_xml(session, base, msg_id, SCHEDULED_BOX)
@@ -978,36 +952,44 @@ def _read_scheduled_full(session, base, msg_id, include_meta=False):
         """
         Merge XML- en HTML-recipients. HTML heeft voorrang op naam,
         maar XML kan user_id bevatten die HTML niet heeft.
-        Dedup op (user_id, is_co_account).
+
+        Dedup op (user_id, is_co, name-lowercase). Dit is belangrijk
+        omdat Smartschool's XML vaak geen user_id meegeeft — meerdere
+        to-ontvangers hebben dan allemaal user_id="" en zouden zonder
+        de naam in de key onterecht gededupliceerd worden.
         """
         merged = []
         seen = set()
 
         for r in html_list:
-            key = (r.get("user_id", ""), bool(r.get("is_co_account")))
+            uid = r.get("user_id", "") or ""
+            name = (r.get("name") or "").strip()
+            key = (uid, bool(r.get("is_co_account")), name.lower())
             if key in seen:
                 continue
             seen.add(key)
             merged.append({
                 "user_id": r.get("user_id", ""),
-                "name": r.get("name", ""),
+                "name": name,
                 "is_co_account": bool(r.get("is_co_account")),
                 "ss_id": r.get("ss_id", "455"),
             })
 
         for r in xml_list:
             uid = r.get("user_id", "") or ""
-            key = (uid, bool(r.get("is_co_account")))
+            name = (r.get("name") or "").strip()
+            name_lc = name.lower()
+            key = (uid, bool(r.get("is_co_account")), name_lc)
             if key in seen:
                 continue
-            name = (r.get("name") or "").strip()
-            if name:
-                dup_name = False
+            # Extra veiligheid: als user_id leeg is, dedup op naam
+            if not uid and name_lc:
+                already = False
                 for m in merged:
-                    if (m.get("name") or "").strip().lower() == name.lower():
-                        dup_name = True
+                    if (m.get("name") or "").strip().lower() == name_lc:
+                        already = True
                         break
-                if dup_name:
+                if already:
                     continue
             seen.add(key)
             merged.append({
