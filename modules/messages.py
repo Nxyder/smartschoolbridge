@@ -707,6 +707,25 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
 # ============================================================
 # ROUTE — LIJST
 # ============================================================
+@bp.get("/debug-current-xml/<msg_id>")
+@with_session
+def debug_current_xml(msg_id, _session=None, _creds=None):
+    base = base_url(_creds)
+    xml_text = _get_message_full_xml(_session, base, msg_id, SCHEDULED_BOX)
+    # Toon alleen het <receivers>-blok
+    import re
+    m = re.search(r"<receivers>.*?</receivers>", xml_text, re.DOTALL)
+    m2 = re.search(r"<ccreceivers>.*?</ccreceivers>", xml_text, re.DOTALL)
+    m3 = re.search(r"<bccreceivers>.*?</bccreceivers>", xml_text, re.DOTALL)
+    m4 = re.search(r"<totalNrOtherToReciviers>[^<]*</totalNrOtherToReciviers>", xml_text)
+
+    return jsonify({
+        "receivers_raw": m.group(0) if m else None,
+        "ccreceivers_raw": m2.group(0) if m2 else None,
+        "bccreceivers_raw": m3.group(0) if m3 else None,
+        "other_to": m4.group(0) if m4 else None,
+    })
+    
 @bp.get("")
 @with_session
 def messages_list(_session=None, _creds=None):
