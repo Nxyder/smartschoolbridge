@@ -733,50 +733,93 @@ def _count_compose_users(session, base, unique_usc):
 # ============================================================
 def _add_users_and_wait(session, base, tokens, to_users, cc_users, bcc_users,
                         max_wait=5.0, poll_interval=0.15):
+    """
+    Voegt alle ontvangers toe en WACHT tot Smartschool ze allemaal heeft
+    geregistreerd (via countUsers polling).
+
+    Retourneert een tuple (success: bool, debug: dict).
+    """
     unique_usc = tokens["unique_usc"]
-    
-    # === DEBUG ===
-    print(f"[ADD-WAIT] Start: to={len(to_users or [])} cc={len(cc_users or [])} bcc={len(bcc_users or [])}")
-    print(f"[ADD-WAIT] tokens: random_dir={tokens.get('random_dir','')[:20]}... unique_usc={unique_usc[:20]}...")
-    
-    for role_idx, user_list in [(0, to_users or []), (1, cc_users or []), (2, bcc_users or [])]:
+
+    debug = {
+        "to_users": [],
+        "added": [],
+        "counts_history": [],
+        "expected": {},
+        "final_counts": None,
+        "success": False,
+        "error": None,
+    }
+
+    for u in (to_users or []):
+        debug["to_users"].append({
+            "user_id": u.get("user_id"),
+            "name": u.get("name"),
+            "is_co_account": bool(u.get("is_co_account")),
+            "user_lt": str(u.get("user_lt", "2" if u.get("is_co_account") else "0")),
+        })
+
+    # Voeg alles toe
+    for role_idx, user_list in [(0, to_users or []),
+                                 (1, cc_users or []),
+                                 (2, bcc_users or [])]:
         for u in user_list:
             is_co = u.get("is_co_account", False)
             dropped = DROPPED_TYPE[(role_idx, is_co)]
             userlt = str(u.get("user_lt", "2" if is_co else "0")) or ("2" if is_co else "0")
-            print(f"[ADD] role={role_idx} uid={u.get('user_id')} name={u.get('name','')[:30]} is_co={is_co} userlt={userlt} dropped={dropped}")
-            result = _add_user_to_selected(
-                session, base, u["user_id"], unique_usc, dropped,
-                ssid=u.get("ss_id", "455"), userlt=userlt,
-            )
-            print(f"[ADD] response={str(result)[:200]}")
+            try:
+                resp = _add_user_to_selected(
+                    session, base, u["user_id"], unique_usc, dropped,
+                    ssid=u.get("ss_id", "455"), userlt=userlt,
+                )
+                debug["added"].append({
+                    "role": role_idx,
+                    "user_id": u.get("user_id"),
+                    "name": u.get("name"),
+                    "is_co": is_co,
+                    "user_lt": userlt,
+                    "dropped_type": dropped,
+                    "response_len": len(resp) if resp else 0,
+                    "response_snippet": (resp or "")[:150],
+                })
+            except Exception as e:
+                debug["added"].append({
+                    "role": role_idx,
+                    "user_id": u.get("user_id"),
+                    "error": f"{type(e).__name__}: {e}",
+                })
 
     expected_to = len(to_users or [])
     expected_cc = len(cc_users or [])
     expected_bcc = len(bcc_users or [])
+    debug["expected"] = {"to": expected_to, "cc": expected_cc, "bcc": expected_bcc}
 
+    # Poll tot Smartschool de juiste aantallen rapporteert
     deadline = time.time() + max_wait
-    last_counts = None
     while time.time() < deadline:
         counts = _count_compose_users(session, base, unique_usc)
         if counts:
-            last_counts = counts
             try:
-                got_to = int(counts.get("amountTo", 0))
-                got_cc = int(counts.get("amountCc", 0))
-                got_bcc = int(counts.get("amountBcc", 0))
+                got = {
+                    "to": int(counts.get("amountTo", 0)),
+                    "cc": int(counts.get("amountCc", 0)),
+                    "bcc": int(counts.get("amountBcc", 0)),
+                    "raw": counts,
+                }
             except (ValueError, TypeError):
-                got_to = got_cc = got_bcc = 0
-            print(f"[WAIT] got=({got_to},{got_cc},{got_bcc}) expected=({expected_to},{expected_cc},{expected_bcc})")
-            if (got_to >= expected_to and got_cc >= expected_cc and got_bcc >= expected_bcc):
-                print("[WAIT] OK")
-                return True
-        else:
-            print(f"[WAIT] countUsers returned None")
+                got = {"to": 0, "cc": 0, "bcc": 0, "raw": counts}
+            debug["counts_history"].append(got)
+            debug["final_counts"] = got
+
+            if (got["to"] >= expected_to and
+                got["cc"] >= expected_cc and
+                got["bcc"] >= expected_bcc):
+                debug["success"] = True
+                return True, debug
+
         time.sleep(poll_interval)
 
-    print(f"[WAIT] TIMEOUT last_counts={last_counts}")
-    return False
+    return False, debug
 
 
 # ============================================================
