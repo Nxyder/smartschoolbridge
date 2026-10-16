@@ -703,6 +703,30 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
 # ============================================================
 # ROUTE — LIJST
 # ============================================================
+@bp.get("/debug-scheduled-compose/<msg_id>")
+@with_session
+def debug_scheduled_compose(msg_id, _session=None, _creds=None):
+    base = base_url(_creds)
+    results = {}
+    for boxtype in ("scheduled", "draft"):
+        url = (f"/?module=Messages&file=composeMessage"
+               f"&boxType={boxtype}&composeType=5&msgID={msg_id}")
+        try:
+            r = _session.request("GET", url)
+            html = r.text
+            results[boxtype] = {
+                "status": r.status_code,
+                "length": len(html),
+                "has_receiverSpan": "receiverSpan" in html,
+                "has_toco": 'id="toco"' in html,
+                "to":  _extract_receivers_from_html(html, role=0),
+                "cc":  _extract_receivers_from_html(html, role=1),
+                "bcc": _extract_receivers_from_html(html, role=2),
+            }
+        except Exception as e:
+            results[boxtype] = {"error": f"{type(e).__name__}: {e}"}
+    return jsonify(results)
+    
 @bp.get("/debug-scheduled-tree/<msg_id>")
 @with_session
 def debug_scheduled_tree(msg_id, _session=None, _creds=None):
