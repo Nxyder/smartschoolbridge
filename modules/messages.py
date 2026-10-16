@@ -596,7 +596,16 @@ def messages_list(_session=None, _creds=None):
         "messages": _get_message_list(_session, base_url(_creds), box),
     })
 
-
+@bp.get("/debug-scheduled-xml/<msg_id>")
+@with_session
+def debug_scheduled_xml(msg_id, _session=None, _creds=None):
+    base = base_url(_creds)
+    xml = _get_message_full_xml(_session, base, msg_id, SCHEDULED_BOX)
+    return jsonify({
+        "length": len(xml),
+        "xml": xml[:8000],
+    })
+    
 @bp.get("/scheduled")
 @with_session
 def messages_scheduled(_session=None, _creds=None):
