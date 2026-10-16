@@ -205,7 +205,6 @@ def _parse_recipients_from_receivers(msg, tag_name):
             seen.add(key)
             items.append({"user_id": uid, "name": name})
 
-        # Soms staat de tekst direct in de container, zonder child tags
         if not found_any:
             txt = (container.text or "").strip()
             if txt:
@@ -355,12 +354,10 @@ def _parse_full_message(xml_text):
         result["send_date"] = (msg.findtext("sendDate", "")
                                or msg.findtext("senddate", ""))
 
-        # --- EERST: probeer de <receivers>-containers (nieuw formaat) ---
         result["to_list"]  = _parse_recipients_from_receivers(msg, "to")
         result["cc_list"]  = _parse_recipients_from_receivers(msg, "cc")
         result["bcc_list"] = _parse_recipients_from_receivers(msg, "bcc")
 
-        # --- FALLBACK: oude manier via .//to etc. ---
         def _parse_recipients_legacy(tag_name):
             items = []
             seen = set()
@@ -414,7 +411,6 @@ def _parse_full_message(xml_text):
         if not result["bcc_list"]:
             result["bcc_list"] = _parse_recipients_legacy("bcc")
 
-        # --- Strings samenstellen ---
         result["to"] = ", ".join(
             (r["name"] or r["user_id"]) for r in result["to_list"]
         ) or msg.findtext("to", "")
@@ -485,7 +481,6 @@ def _extract_receivers_from_html(html, role):
     )
 
     def get_attr(attrs, name):
-        # accepteert zowel ' als " rond de waarde
         m = re.search(rf'\b{name}=["\']([^"\']*)["\']', attrs, re.IGNORECASE)
         return m.group(1) if m else ""
 
@@ -519,7 +514,6 @@ def _extract_receivers_from_html(html, role):
         if this_role != role:
             continue
 
-        # Naam zoeken — zowel div als span, zowel ' als "
         name = ""
         nm = re.search(
             r'<(?:div|span)[^>]*class=["\']receiverSpanName[^"\']*["\'][^>]*>(.*?)</(?:div|span)>',
@@ -731,7 +725,6 @@ def message_read(msg_id, _session=None, _creds=None):
     xml_text = _get_message_full_xml(_session, base_url(_creds), msg_id, box)
     parsed = _parse_full_message(xml_text)
 
-    # Read-only weergave: platte namen, geen meta
     parsed["to_list"]  = _strip_receiver_meta(parsed.get("to_list", []))
     parsed["cc_list"]  = _strip_receiver_meta(parsed.get("cc_list", []))
     parsed["bcc_list"] = _strip_receiver_meta(parsed.get("bcc_list", []))
@@ -874,15 +867,15 @@ def message_cancel_scheduled(msg_id, _session=None, _creds=None):
 
 
 # ============================================================
-# SCHEDULED — COMPOSE-HTML (alleen voor uitlezen ontvangers)
+# SCHEDULED — COMPOSE-HTML (alleen voor edit)
 # ============================================================
 def _get_scheduled_compose_html(session, base, msg_id):
     """
     Haalt de compose-HTML op voor een scheduled bericht via boxType=draft.
     boxType=scheduled geeft een 500, dus we moeten draft gebruiken.
 
-    LET OP: dit verplaatst het bericht naar 'In ontwerp' als het nog
-    in 'Gepland' stond. De caller moet het daarna terugzetten.
+    LET OP: dit verplaatst het bericht naar 'In ontwerp'.
+    Alleen aanroepen bij edit (include_meta=True).
     """
     url = (f"/?module=Messages&file=composeMessage"
            f"&boxType=draft&composeType=5&msgID={msg_id}")
@@ -909,26 +902,32 @@ def _extract_html_recipients(session, base, msg_id):
 
 
 # ============================================================
-# SCHEDULED — VOLLEDIG LEZEN (ALLEEN VIA DISPATCHER, veilig)
+# SCHEDULED — VOLLEDIG LEZEN
 # ============================================================
 def _read_scheduled_full(session, base, msg_id, include_meta=False):
     """
-    Leest een scheduled bericht VOLLEDIG via de dispatcher.
+    Leest een scheduled bericht.
 
-    include_meta=False -> receivers bevatten enkel namen (read-only weergave)
-    include_meta=True  -> receivers bevatten user_id/name/is_co_account/ss_id
-                          (nodig voor bewerken / reschedule)
+    include_meta=False -> ALLEEN XML via dispatcher. Geen HTML call,
+                          geen verplaatsing. Bevat hoofd-ontvangers + send_date.
+    include_meta=True  -> XML + compose-HTML (via boxType=draft).
+                          Dit VERPLAATST het bericht naar 'In ontwerp'.
+                          Nodig voor volledige meta (co-accounts, user_ids).
+                          Wordt gebruikt bij edit en reschedule.
 
-    Ontvangers komen uit twee bronnen:
-      1. De message-XML <receivers>-container (hoofd-ontvangers)
-      2. De compose-HTML via boxType=draft (inclusief co-accounts)
+    Bij include_meta=True wordt het bericht na het lezen in draft gezet.
+    De caller (update_scheduled / reschedule) doet daarna delete+create
+    om het terug in scheduled te zetten.
     """
-    # 1. Volledige XML ophalen via dispatcher
+    # 1. XML via dispatcher (snel, geen verplaatsing)
     xml_text = _get_message_full_xml(session, base, msg_id, SCHEDULED_BOX)
     parsed = _parse_full_message(xml_text)
 
-    # 2. Compose-HTML voor co-accounts (en fallback voor hoofd)
-    html_recipients = _extract_html_recipients(session, base, msg_id)
+    # 2. Compose-HTML ALLEEN bij include_meta (verplaatst naar draft)
+    if include_meta:
+        html_recipients = _extract_html_recipients(session, base, msg_id)
+    else:
+        html_recipients = {"to": [], "cc": [], "bcc": []}
 
     def _pack(rlist):
         packed = [
@@ -954,7 +953,6 @@ def _read_scheduled_full(session, base, msg_id, include_meta=False):
         merged = []
         seen = set()
 
-        # Eerst HTML (rijkere data, inclusief co-accounts)
         for r in html_list:
             key = (r.get("user_id", ""), bool(r.get("is_co_account")))
             if key in seen:
@@ -967,13 +965,11 @@ def _read_scheduled_full(session, base, msg_id, include_meta=False):
                 "ss_id": r.get("ss_id", "455"),
             })
 
-        # Dan XML (aanvullen waar HTML niks had)
         for r in xml_list:
             uid = r.get("user_id", "") or ""
             key = (uid, bool(r.get("is_co_account")))
             if key in seen:
                 continue
-            # Als de naam overeenkomt met een HTML-entry, skip
             name = (r.get("name") or "").strip()
             if name:
                 dup_name = False
@@ -1017,14 +1013,11 @@ def _read_scheduled_full(session, base, msg_id, include_meta=False):
                 continue
             resolved = _resolve_receivers_from_string(session, base, names_str, role_key)
             if resolved:
-                # Vervang alleen de entries zonder user_id
                 new_list = []
-                used = set()
                 for r in rlist:
                     if r.get("user_id"):
                         new_list.append(r)
                     else:
-                        # Zoek match in resolved
                         match = None
                         for rr in resolved:
                             if (rr.get("name") or "").lower() == (r.get("name") or "").lower():
@@ -1054,7 +1047,6 @@ def _read_scheduled_full(session, base, msg_id, include_meta=False):
 def message_read_scheduled(msg_id, _session=None, _creds=None):
     base = base_url(_creds)
 
-    # ?edit=1 of ?include_meta=1 -> volledige meta (voor bewerken)
     include_meta = (request.args.get("edit") == "1"
                     or request.args.get("include_meta") == "1")
 
@@ -1077,7 +1069,7 @@ def message_read_scheduled(msg_id, _session=None, _creds=None):
         "cc_full": info["receivers"]["cc"],
         "bcc_full": info["receivers"]["bcc"],
         "include_meta": include_meta,
-        "has_compose_html": False,
+        "has_compose_html": include_meta,
         "fields_found": [],
     })
 
@@ -1092,7 +1084,6 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
     data = request.get_json(force=True, silent=True) or {}
     base = base_url(_creds)
 
-    # Lees origineel via dispatcher (veilig) — META NODIG voor delete+recreate
     try:
         info = _read_scheduled_full(_session, base, msg_id, include_meta=True)
     except Exception as e:
@@ -1158,7 +1149,6 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
             "old_to_count": len(old_receivers["to"]),
         }), 400
 
-    # Verwijder oud bericht
     try:
         r_del = _dispatch(_session, base, [{
             "subsystem": "postboxes",
@@ -1179,7 +1169,6 @@ def message_update_scheduled(msg_id, _session=None, _creds=None):
             "delete_response": body_del[:300],
         }), 500
 
-    # Nieuwe scheduled aanmaken via composeMessage
     try:
         tokens = _get_compose_tokens(_session, base)
     except Exception as e:
@@ -1276,7 +1265,6 @@ def message_reschedule(msg_id, _session=None, _creds=None):
 
     base = base_url(_creds)
 
-    # Lees origineel via dispatcher — META NODIG voor herverzenden
     try:
         info = _read_scheduled_full(_session, base, msg_id, include_meta=True)
     except Exception as e:
@@ -1302,7 +1290,6 @@ def message_reschedule(msg_id, _session=None, _creds=None):
     subject = data.get("subject") or info["subject"] or "(geen onderwerp)"
     body_html = data.get("message_html") or info["body_html"] or "<p></p>"
 
-    # Verwijder oud
     try:
         r_del = _dispatch(_session, base, [{
             "subsystem": "postboxes",
@@ -1606,11 +1593,6 @@ def messages_search_users(_session=None, _creds=None):
 @bp.get("/user/<user_id>")
 @with_session
 def messages_get_user(user_id, _session=None, _creds=None):
-    """
-    Haal user info op basis van user_id.
-    Zoekt ALLEEN via searchUsers (op naam/id-achtige input).
-    Geen enkele bron die berichten verplaatst.
-    """
     base = base_url(_creds)
     raw = (user_id or "").strip()
     if not raw:
@@ -1658,7 +1640,6 @@ def messages_get_user(user_id, _session=None, _creds=None):
 
 
 def _extract_name_from_html(html):
-    """Probeer een naam te vinden in Smartschool HTML."""
     patterns = [
         r'<h1[^>]*class="[^"]*user[^"]*name[^"]*"[^>]*>(.*?)</h1>',
         r'<span[^>]*class="[^"]*displayName[^"]*"[^>]*>(.*?)</span>',
