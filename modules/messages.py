@@ -703,6 +703,62 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
 # ============================================================
 # ROUTE — LIJST
 # ============================================================
+@bp.get("/debug-scheduled-tree/<msg_id>")
+@with_session
+def debug_scheduled_tree(msg_id, _session=None, _creds=None):
+    base = base_url(_creds)
+    xml_text = _get_message_full_xml(_session, base, msg_id, SCHEDULED_BOX)
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as e:
+        return jsonify({"error": f"parse: {e}", "raw": xml_text[:2000]})
+
+    msg = root.find(".//message")
+    if msg is None:
+        return jsonify({"error": "no <message>", "raw": xml_text[:2000]})
+
+    # Dump alle directe children van <message>
+    children = []
+    for child in msg:
+        children.append({
+            "tag": child.tag,
+            "text": (child.text or "")[:200],
+            "attrib": dict(child.attrib),
+            "children": [
+                {"tag": c.tag, "text": (c.text or "")[:200], "attrib": dict(c.attrib)}
+                for c in child
+            ],
+        })
+
+    # Test de find direct
+    receivers = msg.find("receivers")
+    ccreceivers = msg.find("ccreceivers")
+    bccreceivers = msg.find("bccreceivers")
+
+    return jsonify({
+        "message_children": children,
+        "find_receivers": {
+            "found": receivers is not None,
+            "text": (receivers.text or "") if receivers is not None else None,
+            "children": [
+                {"tag": c.tag, "text": (c.text or "")[:200]} for c in (receivers or [])
+            ] if receivers is not None else [],
+        },
+        "find_ccreceivers": {
+            "found": ccreceivers is not None,
+            "children": [
+                {"tag": c.tag, "text": (c.text or "")[:200]} for c in (ccreceivers or [])
+            ] if ccreceivers is not None else [],
+        },
+        "find_bccreceivers": {
+            "found": bccreceivers is not None,
+            "children": [
+                {"tag": c.tag, "text": (c.text or "")[:200]} for c in (bccreceivers or [])
+            ] if bccreceivers is not None else [],
+        },
+    })
+    
 @bp.get("")
 @with_session
 def messages_list(_session=None, _creds=None):
