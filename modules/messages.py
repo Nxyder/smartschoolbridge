@@ -10,6 +10,7 @@ Belangrijkste wijzigingen t.o.v. vorige versie:
 - Kleine LRU cache op search-users resultaten (60s TTL, per unique_usc)
 - Timeouts strakker: REQUEST_TIMEOUT=12, SEARCH_TIMEOUT=8
 - Compacte responses (zoals vorige versie)
+- Leading markers (+/-/•) uit ontvanger-namen gestript
 """
 
 import calendar
@@ -85,15 +86,16 @@ def _full_mode():
 _TOKENS_ATTR = "_ss_compose_tokens_cache"
 
 
-def _get_compose_tokens_cached(session, base):
+def _get_compose_tokens_cached(session, base, force=False):
     """
     Haalt compose-tokens op, met 5-min cache per sessie.
     Bespaart 1 HTTP call per search-users request.
+    Met force=True wordt de cache genegeerd (voor verzendingen).
     """
     cache = getattr(session, _TOKENS_ATTR, None)
     now = time.time()
 
-    if cache and (now - cache.get("ts", 0)) < COMPOSE_TOKENS_TTL:
+    if not force and cache and (now - cache.get("ts", 0)) < COMPOSE_TOKENS_TTL:
         t = cache.get("tokens") or {}
         if t.get("random_dir"):
             return t
@@ -355,6 +357,19 @@ def _strip_u_prefix(uid):
     return s
 
 
+# Smartschool plakt soms markers zoals "+", "-", "•" aan ontvanger-namen.
+_RE_LEADING_MARKER = re.compile(r"^[+\-–—•·]\s*")
+
+
+def _clean_recipient_name(name):
+    """Verwijdert leidende markers zoals '+' die Smartschool aan namen plakt."""
+    if not name:
+        return ""
+    s = str(name).strip()
+    s = _RE_LEADING_MARKER.sub("", s)
+    return s.strip()
+
+
 # ============================================================
 # XML parsing (lxml-compatible)
 # ============================================================
@@ -423,10 +438,10 @@ def _parse_recipients_from_receivers(msg, tag_name):
                         continue
                     m = re.match(r"(.+?)\s*<\s*(U?\d+)\s*>", part)
                     if m:
-                        name = m.group(1).strip()
+                        name = _clean_recipient_name(m.group(1))
                         uid = m.group(2)
                     else:
-                        name = part
+                        name = _clean_recipient_name(part)
                         uid = ""
                     key = (name, uid)
                     if key in seen:
@@ -523,7 +538,7 @@ def _extract_names_from_message_xml(xml_text):
 
     def _store(uid, name):
         uid = (uid or "").strip()
-        name = (name or "").strip()
+        name = _clean_recipient_name(name)
         if not uid or not name:
             return
         if name.isdigit() or (name[0] in "Uu" and name[1:].isdigit()):
@@ -631,11 +646,12 @@ def _parse_full_message(xml_text):
                 if not uid and txt:
                     m = re.match(r"(.+?)\s*<\s*(U?\d+)\s*>", txt)
                     if m:
-                        name, uid = m.group(1).strip(), m.group(2)
+                        name = _clean_recipient_name(m.group(1))
+                        uid = m.group(2)
                     elif txt.isdigit() or re.match(r"^U\d+$", txt):
                         uid = txt
                     else:
-                        name = txt
+                        name = _clean_recipient_name(txt)
                 if not uid and not name:
                     continue
                 if uid and uid in seen:
@@ -656,7 +672,7 @@ def _parse_full_message(xml_text):
                     if m:
                         items.append({
                             "user_id": m.group(2),
-                            "name": m.group(1).strip(),
+                            "name": _clean_recipient_name(m.group(1)),
                         })
                     elif part.isdigit() or re.match(r"^U\d+$", part):
                         items.append({
@@ -664,7 +680,10 @@ def _parse_full_message(xml_text):
                             "name": names_map.get(part, ""),
                         })
                     else:
-                        items.append({"user_id": "", "name": part})
+                        items.append({
+                            "user_id": "",
+                            "name": _clean_recipient_name(part),
+                        })
             return items
 
         if not result["to_list"]:
@@ -786,7 +805,7 @@ def _extract_receivers_from_html(html, role):
             name = nm.group(1)
 
         name = _RE_TAG_STRIP.sub("", name)
-        name = _unescape_html(name).strip()
+        name = _clean_recipient_name(_unescape_html(name))
 
         is_co = (userlt == "2") or (userlt == "1")
 
