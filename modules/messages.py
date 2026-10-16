@@ -698,6 +698,41 @@ def _normalize_user_list(session, base, lst, role, old_list=None):
 # ============================================================
 # ROUTE — LIJST
 # ============================================================
+@bp.get("/debug-receivers/<msg_id>")
+@with_session
+def debug_receivers(msg_id, _session=None, _creds=None):
+    base = base_url(_creds)
+    results = {}
+
+    # Call 1: standaard (krijg waarschijnlijk 1 to)
+    r1 = _dispatch(_session, base, [
+        {"subsystem": "postboxes", "action": "show message",
+         "params": {"msgID": msg_id, "boxType": SCHEDULED_BOX,
+                    "limitList": "true"}},
+    ])
+    results["call1_raw_xml_snippet"] = r1.text[:3000]
+
+    # Call 2: limitList=false + limitListNr=501 (Smartschool's eigen truc)
+    r2 = _dispatch(_session, base, [
+        {"subsystem": "postboxes", "action": "show message",
+         "params": {"msgID": msg_id, "boxType": SCHEDULED_BOX,
+                    "limitList": "false", "limitListNr": "501"}},
+    ])
+    results["call2_raw_xml_snippet"] = r2.text[:3000]
+
+    # Tel hoeveel <to> tags in elke call
+    def _count(xml, tag):
+        return len(re.findall(rf"<{tag}>[^<]+</{tag}>", xml))
+
+    results["call1_to_count"] = _count(r1.text, "to")
+    results["call1_cc_count"] = _count(r1.text, "cc")
+    results["call1_bcc_count"] = _count(r1.text, "bcc")
+    results["call2_to_count"] = _count(r2.text, "to")
+    results["call2_cc_count"] = _count(r2.text, "cc")
+    results["call2_bcc_count"] = _count(r2.text, "bcc")
+
+    return jsonify(results)
+    
 @bp.get("")
 @with_session
 def messages_list(_session=None, _creds=None):
